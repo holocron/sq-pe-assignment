@@ -16,8 +16,9 @@ Do NOT guess API signatures — they changed in Spring Boot 4 / Spring AI 2.
 | Spring AI | **2.0.1** |
 | PostgreSQL | 17.11 on `localhost:5432`, db `caa`, user `caa`, password `caa` |
 | pgvector | 0.8.6, extension `vector` already created |
-| Chat model | `gpt-oss-120b` via `http://localhost:8001` (OpenAI-compatible, SSH tunnel to holominix) |
-| Embedding model | `Qwen3-Embedding-4B` via `http://localhost:8002`, **dimension = 2560** |
+| Model router | **lemonade** (`lemond`) on holominix, ONE OpenAI-compatible endpoint: `http://localhost:13305/api/v1` (single SSH tunnel). It routes by model id and manages the per-model llama-server backends itself — do NOT tunnel per-model ports. |
+| Chat model | model id `gpt-oss-120b-GGUF` (reasoning + native tool calling) |
+| Embedding model | model id `Qwen3-Embedding-4B-GGUF`, **dimension = 2560** |
 | Tool calling | Natively supported by the chat model — verified |
 
 Boot 4 renamed starters: `spring-boot-starter-webmvc` (not `-web`), `spring-boot-starter-flyway`,
@@ -34,7 +35,7 @@ This exact code was compiled and run successfully against the live model:
 // ToolCallingChatOptions.builder() result. This was hit and fixed during a spike.
 var options = OpenAiChatOptions.builder()
         .toolCallbacks(List.of(ToolCallbacks.from(toolsBean)))   // org.springframework.ai.support.ToolCallbacks
-        .model("gpt-oss-120b")
+        .model("gpt-oss-120b-GGUF")
         .maxTokens(2048)
         .build();
 
@@ -60,11 +61,13 @@ Note: the model emits `reasoning_content`; always allow generous `maxTokens` (>=
 
 Configuration (already the shape to use in `application.yml`):
 ```yaml
-spring.ai.openai.api-key: none            # local server needs no key, but the property must be present
-spring.ai.openai.chat.base-url: http://localhost:8001
-spring.ai.openai.chat.options.model: gpt-oss-120b
-spring.ai.openai.embedding.base-url: http://localhost:8002
-spring.ai.openai.embedding.options.model: Qwen3-Embedding-4B
+spring.ai.openai.api-key: none            # router needs no key, but the property must be present
+# ONE base-url for chat and embeddings — the lemonade router dispatches on model id.
+# Spring AI 2.x uses the official OpenAI Java SDK, which expects /v1 to be part of the base URL
+# (base-url without /v1 returns 404 — this was hit and fixed during a spike).
+spring.ai.openai.base-url: http://localhost:13305/api/v1
+spring.ai.openai.chat.options.model: gpt-oss-120b-GGUF
+spring.ai.openai.embedding.options.model: Qwen3-Embedding-4B-GGUF
 spring.ai.vectorstore.pgvector.dimensions: 2560
 ```
 
@@ -368,3 +371,13 @@ src/
 * Validation with `jakarta.validation` annotations on request bodies.
 * Tests: JUnit 5. Anything needing the live model must be tagged `@Tag("live")` and excluded by default.
 * `git` is initialised on `main` with remote `origin` → `git@github.com:holocron/sq-pe-assignment.git`.
+
+
+---
+
+## 9. Frontend visual identity
+
+This is an **internal Swissquote application**. Before doing any frontend styling work, read
+`docs/DESIGN_SYSTEM.md` — it carries Swissquote's real brand tokens (extracted from their
+production stylesheets), the typography stack, and the one hard rule separating brand colour from
+risk colour. The UI must look like a Swissquote internal tool.

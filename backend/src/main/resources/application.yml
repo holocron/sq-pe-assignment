@@ -23,16 +23,17 @@ spring:
   ai:
     openai:
       api-key: ${OPENAI_API_KEY:none}
+      # Single lemonade router on holominix (port 13305) fronts every model and routes by model id.
+      # Spring AI 2.x uses the official OpenAI SDK, which expects /v1 inside the base URL.
+      base-url: ${LLM_BASE_URL:http://localhost:13305/api/v1}
       chat:
-        base-url: ${LLM_CHAT_URL:http://localhost:8001}
         options:
-          model: ${LLM_CHAT_MODEL:gpt-oss-120b}
+          model: ${LLM_CHAT_MODEL:gpt-oss-120b-GGUF}
           temperature: 0.1
           max-tokens: 4096
       embedding:
-        base-url: ${LLM_EMBED_URL:http://localhost:8002}
         options:
-          model: ${LLM_EMBED_MODEL:Qwen3-Embedding-4B}
+          model: ${LLM_EMBED_MODEL:Qwen3-Embedding-4B-GGUF}
     vectorstore:
       pgvector:
         dimensions: 2560

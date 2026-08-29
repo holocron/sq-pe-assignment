@@ -20,12 +20,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 @SpringBootTest(properties = {
-        "spring.ai.openai.chat.base-url=http://localhost:8001",
-        "spring.ai.openai.embedding.base-url=http://localhost:8002",
+        "spring.ai.openai.base-url=http://localhost:13305/api/v1",
         "spring.ai.openai.api-key=none",
-        "spring.ai.openai.chat.options.model=gpt-oss-120b",
+        "spring.ai.openai.chat.options.model=gpt-oss-120b-GGUF",
         "spring.ai.openai.chat.options.temperature=0.1",
-        "spring.ai.openai.embedding.options.model=Qwen3-Embedding-4B",
+        "spring.ai.openai.embedding.options.model=Qwen3-Embedding-4B-GGUF",
         "spring.autoconfigure.exclude=org.springframework.ai.vectorstore.pgvector.autoconfigure.PgVectorStoreAutoConfiguration"
 })
 @Tag("live")
@@ -48,7 +47,7 @@ class SpikeToolLoopTest {
         Tools tools = new Tools();
         var options = OpenAiChatOptions.builder()
                 .toolCallbacks(List.of(ToolCallbacks.from(tools)))
-                .model("gpt-oss-120b")
+                .model("gpt-oss-120b-GGUF")
                 .maxTokens(2048)
                 .build();
 
