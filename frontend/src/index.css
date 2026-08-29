@@ -1,111 +1,563 @@
+@import "tailwindcss";
+
+/* Dark mode is driven by a class on <html> so the header toggle can switch it
+   at runtime (Tailwind v4 defaults to prefers-color-scheme only). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ===========================================================================
+   1. SWISSQUOTE BRAND PALETTE
+   ---------------------------------------------------------------------------
+   Raw, theme-independent constants taken from docs/DESIGN_SYSTEM.md (the
+   `--cws--*` tokens of Swissquote's production stylesheets). These never change
+   between light and dark — the semantic layer below decides how they are used.
+
+   They live in a plain :root rule (not in `@theme`) so they are always emitted
+   and can be referenced by the semantic tokens; `@theme inline` further down
+   republishes them as Tailwind utilities (`bg-sq-primary-500`, `text-sq-black`,
+   `border-sq-grey-300`, ...).
+   =========================================================================== */
 :root {
-  --text: #6b6375;
-  --text-h: #08060d;
-  --bg: #fff;
-  --border: #e5e4e7;
-  --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
-  --social-bg: rgba(244, 243, 236, 0.5);
-  --shadow:
-    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+  /* Brand ramp — #fa5b35 is THE Swissquote orange. */
+  --sq-primary-50: #ffebeb;
+  --sq-primary-100: #fdccc0;
+  --sq-primary-200: #fdb4a2;
+  --sq-primary-300: #fc9178;
+  --sq-primary-400: #fb7c5d;
+  --sq-primary-500: #fa5b35;
+  --sq-primary-600: #e45330;
+  --sq-primary-700: #b24126;
+  --sq-primary-800: #8a321d;
+  --sq-primary-900: #692616;
 
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --mono: ui-monospace, Consolas, monospace;
+  /* Swissquote black + white. */
+  --sq-black: #323232;
+  --sq-white: #ffffff;
 
-  font: 18px/145% var(--sans);
-  letter-spacing: 0.18px;
-  color-scheme: light dark;
-  color: var(--text);
-  background: var(--bg);
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  /* Swissquote grey scale. */
+  --sq-grey-50: #fafafa;
+  --sq-grey-100: #f9fafb;
+  --sq-grey-200: #f3f4f6;
+  --sq-grey-300: #e5e7eb;
+  --sq-grey-400: #98a2b3;
+  --sq-grey-500: #475467;
+  --sq-grey-600: #4b5563;
+  --sq-grey-700: #374151;
+  --sq-grey-800: #1f2937;
+  --sq-grey-900: #111827;
 
-  @media (max-width: 1024px) {
-    font-size: 16px;
+  /* Secondary blue — informational, non-risk emphasis only. */
+  --sq-blue-500: #3b82f6;
+  --sq-blue-600: #2563eb;
+  --sq-blue-700: #1d4ed8;
+  --sq-blue-900: #1e3a8a;
+
+  /* -------------------------------------------------------------------------
+     Risk scale. Deliberately its own ramp, kept away from the brand orange:
+     risk is DATA, the brand orange is CHROME, and the two never mix.
+     Light fills come verbatim from the design doc; the `-dark` values are the
+     same hues lightened for dark surfaces (hue is never changed).
+     ------------------------------------------------------------------------- */
+  --sq-risk-low: #047857; /* emerald-700 */
+  --sq-risk-medium: #b45309; /* amber-700  */
+  --sq-risk-high: #c2410c; /* orange-700 */
+  --sq-risk-critical: #9f1239; /* rose-800   */
+
+  --sq-risk-low-dark: #34d399;
+  --sq-risk-medium-dark: #fbbf24;
+  --sq-risk-high-dark: #fdba74;
+  --sq-risk-critical-dark: #fb7185;
+
+  --sq-risk-low-tint: #ecfdf5;
+  --sq-risk-medium-tint: #fffbeb;
+  --sq-risk-high-tint: #fff7ed;
+  --sq-risk-critical-tint: #fff1f2;
+
+  --sq-risk-low-shade: #052e21;
+  --sq-risk-medium-shade: #2a1a02;
+  --sq-risk-high-shade: #2b1205;
+  --sq-risk-critical-shade: #2d0512;
+
+  /* -------------------------------------------------------------------------
+     Functional (non-brand, non-risk) accents. Used for destructive controls
+     and for transaction-status chips, which are a different concept from risk.
+     `sq-red-*` is a pure red so a destructive button can never be mistaken for
+     the rose-800 risk-CRITICAL badge.
+     ------------------------------------------------------------------------- */
+  --sq-red-50: #fef2f2;
+  --sq-red-500: #ef4444;
+  --sq-red-600: #dc2626;
+  --sq-red-700: #b91c1c;
+  --sq-red-950: #400d0d;
+
+  --sq-amber-50: #fffbeb;
+  --sq-amber-500: #f59e0b;
+  --sq-amber-700: #b45309;
+  --sq-amber-950: #38240a;
+
+  --sq-teal-50: #f0fdfa;
+  --sq-teal-500: #14b8a6;
+  --sq-teal-700: #0f766e;
+  --sq-teal-950: #062f2b;
+
+  /* Shadow base colour — kept as a token so no component ever inlines black. */
+  --sq-shadow: #0b1220;
+}
+
+/* ===========================================================================
+   2. SEMANTIC LAYER — LIGHT
+   ---------------------------------------------------------------------------
+   Everything the components consume. Light values on :root, dark overrides on
+   .dark, so one class flip on <html> re-themes the whole application.
+   =========================================================================== */
+:root {
+  color-scheme: light;
+
+  /* Surfaces: grey-100 page, white content, hairline grey-300 borders. */
+  --app-bg: var(--sq-grey-100);
+  --app-surface: var(--sq-white);
+  --app-surface-2: var(--sq-grey-200);
+  --app-surface-3: var(--sq-grey-300);
+  --app-overlay: color-mix(in oklab, var(--sq-black) 55%, transparent);
+  --app-border: var(--sq-grey-300);
+  --app-border-strong: var(--sq-grey-400);
+
+  /* Text: Swissquote black for copy, grey-500/400 for the quieter levels. */
+  --app-fg: var(--sq-black);
+  --app-muted: var(--sq-grey-500);
+  --app-subtle: color-mix(in oklab, var(--sq-grey-500) 72%, var(--sq-grey-400));
+
+  /* Brand accent — chrome and interactive controls only, never risk.
+
+     Contrast policy for the brand orange (measured against #ffffff):
+       · as TEXT on a surface  -> use `--app-accent-strong` (#b24126, 5.7:1).
+         `--app-accent` itself is 3.2:1 and is only ever used for icons, rails,
+         meters and other graphics, where 3:1 is the requirement (1.4.11).
+       · as a FILL under white text -> 3.2:1. Kept for the primary CTA only,
+         at 14px semibold or larger, because that pairing IS the Swissquote
+         brand button. Darkening it far enough to clear 4.5:1 lands on
+         #c94a2b–#b24126, i.e. on top of the risk-HIGH fill (#c2410c), which
+         would break the one hard rule of this design system: brand chrome and
+         risk data must never be confusable. Smaller brand-marked controls
+         (segmented controls, chips, active nav) therefore use fg-on-surface
+         text with an orange rail instead of white-on-orange. */
+  --app-accent: var(--sq-primary-500);
+  --app-accent-hover: var(--sq-primary-400);
+  --app-accent-active: var(--sq-primary-600);
+  --app-accent-fg: var(--sq-white);
+  --app-accent-soft: var(--sq-primary-50);
+  --app-accent-soft-fg: var(--sq-primary-700);
+  /* Accessible on-surface brand tone: use for accent TEXT and links. */
+  --app-accent-strong: var(--sq-primary-700);
+  --app-ring: var(--sq-primary-500);
+
+  /* Sidebar chrome — Swissquote black in both themes. */
+  --app-sidebar: var(--sq-black);
+  --app-sidebar-fg: var(--sq-white);
+  --app-sidebar-muted: color-mix(in oklab, var(--sq-grey-300) 55%, var(--sq-grey-400));
+  --app-sidebar-subtle: var(--sq-grey-400);
+  --app-sidebar-hover: color-mix(in oklab, var(--sq-white) 8%, var(--sq-black));
+  --app-sidebar-active: color-mix(in oklab, var(--sq-white) 13%, var(--sq-black));
+  --app-sidebar-border: color-mix(in oklab, var(--sq-white) 16%, var(--sq-black));
+
+  /* Risk ramp — always rendered as a filled badge with a label and an icon. */
+  --app-risk-low: var(--sq-risk-low);
+  --app-risk-low-on: var(--sq-white);
+  --app-risk-low-soft: var(--sq-risk-low-tint);
+  --app-risk-low-fg: var(--sq-risk-low);
+  --app-risk-medium: var(--sq-risk-medium);
+  --app-risk-medium-on: var(--sq-white);
+  --app-risk-medium-soft: var(--sq-risk-medium-tint);
+  --app-risk-medium-fg: var(--sq-risk-medium);
+  --app-risk-high: var(--sq-risk-high);
+  --app-risk-high-on: var(--sq-white);
+  --app-risk-high-soft: var(--sq-risk-high-tint);
+  --app-risk-high-fg: var(--sq-risk-high);
+  --app-risk-critical: var(--sq-risk-critical);
+  --app-risk-critical-on: var(--sq-white);
+  --app-risk-critical-soft: var(--sq-risk-critical-tint);
+  --app-risk-critical-fg: var(--sq-risk-critical);
+
+  /* Non-risk semantics. Distinct hues from the risk ramp, and only ever used
+     on soft/tinted chips or on destructive controls — never on a filled pill
+     that could read as a verdict. */
+  --app-danger: var(--sq-red-600);
+  --app-danger-hover: var(--sq-red-500);
+  --app-danger-active: var(--sq-red-700);
+  --app-danger-on: var(--sq-white);
+  --app-danger-soft: var(--sq-red-50);
+  --app-danger-fg: var(--sq-red-700);
+  --app-warning: var(--sq-amber-500);
+  --app-warning-soft: var(--sq-amber-50);
+  --app-warning-fg: var(--sq-amber-700);
+  --app-success: var(--sq-teal-500);
+  --app-success-soft: var(--sq-teal-50);
+  --app-success-fg: var(--sq-teal-700);
+  --app-info: var(--sq-blue-500);
+  --app-info-soft: color-mix(in oklab, var(--sq-blue-500) 8%, var(--sq-white));
+  --app-info-fg: var(--sq-blue-700);
+
+  /* Elevation. Swissquote prefers hairlines, so these stay near-flat. */
+  --app-shadow-panel: 0 1px 1px 0 color-mix(in oklab, var(--sq-shadow) 5%, transparent);
+  --app-shadow-popover:
+    0 12px 28px -14px color-mix(in oklab, var(--sq-shadow) 26%, transparent),
+    0 2px 6px -3px color-mix(in oklab, var(--sq-shadow) 14%, transparent);
+}
+
+/* ===========================================================================
+   3. SEMANTIC LAYER — DARK
+   Surfaces move into the grey-800/900 range, the brand orange stays the
+   accent, and the risk fills are lightened (never re-hued) so their badges
+   keep their meaning and their contrast.
+   =========================================================================== */
+.dark {
+  color-scheme: dark;
+
+  --app-bg: var(--sq-grey-900);
+  --app-surface: var(--sq-grey-800);
+  --app-surface-2: color-mix(in oklab, var(--sq-grey-800) 60%, var(--sq-grey-700));
+  --app-surface-3: var(--sq-grey-700);
+  --app-overlay: color-mix(in oklab, var(--sq-grey-900) 72%, transparent);
+  --app-border: color-mix(in oklab, var(--sq-grey-700) 82%, var(--sq-grey-600));
+  --app-border-strong: var(--sq-grey-600);
+
+  --app-fg: var(--sq-grey-100);
+  --app-muted: var(--sq-grey-400);
+  --app-subtle: color-mix(in oklab, var(--sq-grey-400) 82%, var(--sq-grey-500));
+
+  --app-accent: var(--sq-primary-500);
+  --app-accent-hover: var(--sq-primary-400);
+  --app-accent-active: var(--sq-primary-600);
+  --app-accent-fg: var(--sq-white);
+  --app-accent-soft: color-mix(in oklab, var(--sq-primary-500) 22%, var(--sq-grey-900));
+  --app-accent-soft-fg: var(--sq-primary-200);
+  --app-accent-strong: var(--sq-primary-300);
+  --app-ring: var(--sq-primary-400);
+
+  --app-sidebar: color-mix(in oklab, var(--sq-black) 55%, var(--sq-grey-900));
+  --app-sidebar-fg: var(--sq-white);
+  --app-sidebar-muted: color-mix(in oklab, var(--sq-grey-300) 55%, var(--sq-grey-400));
+  --app-sidebar-subtle: var(--sq-grey-400);
+  --app-sidebar-hover: color-mix(in oklab, var(--sq-white) 8%, var(--sq-black));
+  --app-sidebar-active: color-mix(in oklab, var(--sq-white) 13%, var(--sq-black));
+  --app-sidebar-border: color-mix(in oklab, var(--sq-white) 16%, var(--sq-black));
+
+  --app-risk-low: var(--sq-risk-low-dark);
+  --app-risk-low-on: var(--sq-risk-low-shade);
+  --app-risk-low-soft: color-mix(in oklab, var(--sq-risk-low) 34%, var(--sq-grey-900));
+  --app-risk-low-fg: var(--sq-risk-low-dark);
+  --app-risk-medium: var(--sq-risk-medium-dark);
+  --app-risk-medium-on: var(--sq-risk-medium-shade);
+  --app-risk-medium-soft: color-mix(in oklab, var(--sq-risk-medium) 34%, var(--sq-grey-900));
+  --app-risk-medium-fg: var(--sq-risk-medium-dark);
+  --app-risk-high: var(--sq-risk-high-dark);
+  --app-risk-high-on: var(--sq-risk-high-shade);
+  --app-risk-high-soft: color-mix(in oklab, var(--sq-risk-high) 34%, var(--sq-grey-900));
+  --app-risk-high-fg: var(--sq-risk-high-dark);
+  --app-risk-critical: var(--sq-risk-critical-dark);
+  --app-risk-critical-on: var(--sq-risk-critical-shade);
+  --app-risk-critical-soft: color-mix(in oklab, var(--sq-risk-critical) 40%, var(--sq-grey-900));
+  --app-risk-critical-fg: var(--sq-risk-critical-dark);
+
+  --app-danger: var(--sq-red-600);
+  --app-danger-hover: var(--sq-red-500);
+  --app-danger-active: var(--sq-red-700);
+  --app-danger-on: var(--sq-white);
+  --app-danger-soft: var(--sq-red-950);
+  --app-danger-fg: color-mix(in oklab, var(--sq-red-500) 82%, var(--sq-white));
+  --app-warning: var(--sq-amber-500);
+  --app-warning-soft: var(--sq-amber-950);
+  --app-warning-fg: color-mix(in oklab, var(--sq-amber-500) 80%, var(--sq-white));
+  --app-success: var(--sq-teal-500);
+  --app-success-soft: var(--sq-teal-950);
+  --app-success-fg: color-mix(in oklab, var(--sq-teal-500) 80%, var(--sq-white));
+  --app-info: var(--sq-blue-500);
+  --app-info-soft: color-mix(in oklab, var(--sq-blue-500) 22%, var(--sq-grey-900));
+  --app-info-fg: color-mix(in oklab, var(--sq-blue-500) 55%, var(--sq-white));
+
+  --app-shadow-panel: 0 1px 1px 0 color-mix(in oklab, var(--sq-shadow) 24%, transparent);
+  --app-shadow-popover:
+    0 14px 32px -14px color-mix(in oklab, var(--sq-shadow) 64%, transparent),
+    0 2px 6px -3px color-mix(in oklab, var(--sq-shadow) 46%, transparent);
+}
+
+/* ===========================================================================
+   4. TAILWIND THEME — utilities generated from the tokens above.
+   =========================================================================== */
+@theme inline {
+  /* --- Swissquote palette utilities (bg-sq-primary-500, text-sq-black, ...) */
+  --color-sq-primary-50: var(--sq-primary-50);
+  --color-sq-primary-100: var(--sq-primary-100);
+  --color-sq-primary-200: var(--sq-primary-200);
+  --color-sq-primary-300: var(--sq-primary-300);
+  --color-sq-primary-400: var(--sq-primary-400);
+  --color-sq-primary-500: var(--sq-primary-500);
+  --color-sq-primary-600: var(--sq-primary-600);
+  --color-sq-primary-700: var(--sq-primary-700);
+  --color-sq-primary-800: var(--sq-primary-800);
+  --color-sq-primary-900: var(--sq-primary-900);
+
+  --color-sq-black: var(--sq-black);
+  --color-sq-white: var(--sq-white);
+
+  --color-sq-grey-50: var(--sq-grey-50);
+  --color-sq-grey-100: var(--sq-grey-100);
+  --color-sq-grey-200: var(--sq-grey-200);
+  --color-sq-grey-300: var(--sq-grey-300);
+  --color-sq-grey-400: var(--sq-grey-400);
+  --color-sq-grey-500: var(--sq-grey-500);
+  --color-sq-grey-600: var(--sq-grey-600);
+  --color-sq-grey-700: var(--sq-grey-700);
+  --color-sq-grey-800: var(--sq-grey-800);
+  --color-sq-grey-900: var(--sq-grey-900);
+
+  --color-sq-blue-500: var(--sq-blue-500);
+  --color-sq-blue-600: var(--sq-blue-600);
+  --color-sq-blue-700: var(--sq-blue-700);
+  --color-sq-blue-900: var(--sq-blue-900);
+
+  /* --- Semantic surfaces / text / borders */
+  --color-bg: var(--app-bg);
+  --color-surface: var(--app-surface);
+  --color-surface-2: var(--app-surface-2);
+  --color-surface-3: var(--app-surface-3);
+  --color-overlay: var(--app-overlay);
+  --color-border: var(--app-border);
+  --color-border-strong: var(--app-border-strong);
+  --color-fg: var(--app-fg);
+  --color-muted: var(--app-muted);
+  --color-subtle: var(--app-subtle);
+
+  /* --- Brand accent (chrome only) */
+  --color-accent: var(--app-accent);
+  --color-accent-hover: var(--app-accent-hover);
+  --color-accent-active: var(--app-accent-active);
+  --color-accent-fg: var(--app-accent-fg);
+  --color-accent-soft: var(--app-accent-soft);
+  --color-accent-soft-fg: var(--app-accent-soft-fg);
+  --color-accent-strong: var(--app-accent-strong);
+  --color-ring: var(--app-ring);
+
+  /* --- Sidebar chrome */
+  --color-sidebar: var(--app-sidebar);
+  --color-sidebar-fg: var(--app-sidebar-fg);
+  --color-sidebar-muted: var(--app-sidebar-muted);
+  --color-sidebar-subtle: var(--app-sidebar-subtle);
+  --color-sidebar-hover: var(--app-sidebar-hover);
+  --color-sidebar-active: var(--app-sidebar-active);
+  --color-sidebar-border: var(--app-sidebar-border);
+
+  /* --- Risk (data only) */
+  --color-risk-low: var(--app-risk-low);
+  --color-risk-low-on: var(--app-risk-low-on);
+  --color-risk-low-soft: var(--app-risk-low-soft);
+  --color-risk-low-fg: var(--app-risk-low-fg);
+  --color-risk-medium: var(--app-risk-medium);
+  --color-risk-medium-on: var(--app-risk-medium-on);
+  --color-risk-medium-soft: var(--app-risk-medium-soft);
+  --color-risk-medium-fg: var(--app-risk-medium-fg);
+  --color-risk-high: var(--app-risk-high);
+  --color-risk-high-on: var(--app-risk-high-on);
+  --color-risk-high-soft: var(--app-risk-high-soft);
+  --color-risk-high-fg: var(--app-risk-high-fg);
+  --color-risk-critical: var(--app-risk-critical);
+  --color-risk-critical-on: var(--app-risk-critical-on);
+  --color-risk-critical-soft: var(--app-risk-critical-soft);
+  --color-risk-critical-fg: var(--app-risk-critical-fg);
+
+  /* --- Non-risk semantics */
+  --color-danger: var(--app-danger);
+  --color-danger-hover: var(--app-danger-hover);
+  --color-danger-active: var(--app-danger-active);
+  --color-danger-on: var(--app-danger-on);
+  --color-danger-soft: var(--app-danger-soft);
+  --color-danger-fg: var(--app-danger-fg);
+  --color-warning: var(--app-warning);
+  --color-warning-soft: var(--app-warning-soft);
+  --color-warning-fg: var(--app-warning-fg);
+  --color-success: var(--app-success);
+  --color-success-soft: var(--app-success-soft);
+  --color-success-fg: var(--app-success-fg);
+  --color-info: var(--app-info);
+  --color-info-soft: var(--app-info-soft);
+  --color-info-fg: var(--app-info-fg);
+
+  /* --- Elevation */
+  --shadow-panel: var(--app-shadow-panel);
+  --shadow-popover: var(--app-shadow-popover);
+}
+
+@theme {
+  /* GT America first so a real Swissquote workstation renders the brand face;
+     everything else degrades to Inter / Helvetica Neue / Arial. */
+  --font-sans: "GT America", "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono: "GT America Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* Swissquote radius scale: xxs 2 · xs 4 · md 8 · xl 12 · 2xl 16.
+     `sm` and `lg` are pinned onto the same scale so no utility can land
+     between the official steps. */
+  --radius-xxs: 0.125rem;
+  --radius-xs: 0.25rem;
+  --radius-sm: 0.25rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+  --radius-2xl: 1rem;
+
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+
+  /* One tracking step for every uppercase micro-label (`tracking-caption`):
+     table headers, field labels, stat captions and section eyebrows. Small
+     caps need generous letterspacing to stay Swiss rather than cramped. */
+  --tracking-caption: 0.12em;
+
+  --animate-fade-in: fade-in 0.14s ease-out;
+  --animate-rise-in: rise-in 0.16s ease-out;
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  @keyframes rise-in {
+    from {
+      opacity: 0;
+      transform: translateY(6px) scale(0.99);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
   }
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --text: #9ca3af;
-    --text-h: #f3f4f6;
-    --bg: #16171d;
-    --border: #2e303a;
-    --code-bg: #1f2028;
-    --accent: #c084fc;
-    --accent-bg: rgba(192, 132, 252, 0.15);
-    --accent-border: rgba(192, 132, 252, 0.5);
-    --social-bg: rgba(47, 48, 58, 0.5);
-    --shadow:
-      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
+/* ===========================================================================
+   5. BASE
+   =========================================================================== */
+@layer base {
+  * {
+    border-color: var(--color-border);
   }
 
-  #social .button-icon {
-    filter: invert(1) brightness(2);
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100svh;
+    background-color: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    font-size: 0.875rem;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    /* Swiss typographic rule: every figure in the product is tabular, so
+       columns of money, scores and counts align on the digit. */
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  /* Form controls and tables do not inherit font settings on every engine. */
+  input,
+  select,
+  textarea,
+  button,
+  table,
+  th,
+  td {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+    border-radius: var(--radius-xs);
+  }
+
+  ::selection {
+    background-color: var(--color-accent);
+    color: var(--color-accent-fg);
+  }
+
+  ::placeholder {
+    color: var(--color-subtle);
+  }
+
+  /* Tight, confident headings — the Swiss part of the type system. */
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-weight: 600;
+    letter-spacing: -0.018em;
+    color: var(--color-fg);
+  }
+
+  h1 {
+    letter-spacing: -0.024em;
+  }
+
+  hr {
+    border-color: var(--color-border);
+  }
+
+  /* Unobtrusive scrollbars for dense data panes. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-border-strong) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--color-border-strong);
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 9999px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
   }
 }
 
-#root {
-  width: 1126px;
-  max-width: 100%;
-  margin: 0 auto;
-  text-align: center;
-  border-inline: 1px solid var(--border);
-  min-height: 100svh;
-  display: flex;
-  flex-direction: column;
-  box-sizing: border-box;
-}
-
-body {
-  margin: 0;
-}
-
-h1,
-h2 {
-  font-family: var(--heading);
-  font-weight: 500;
-  color: var(--text-h);
-}
-
-h1 {
-  font-size: 56px;
-  letter-spacing: -1.68px;
-  margin: 32px 0;
-  @media (max-width: 1024px) {
-    font-size: 36px;
-    margin: 20px 0;
+@layer utilities {
+  /* Reusable focus treatment for custom interactive elements. */
+  .focus-ring {
+    outline: 2px solid transparent;
+    outline-offset: 2px;
   }
-}
-h2 {
-  font-size: 24px;
-  line-height: 118%;
-  letter-spacing: -0.24px;
-  margin: 0 0 8px;
-  @media (max-width: 1024px) {
-    font-size: 20px;
+
+  .focus-ring:focus-visible {
+    outline-color: var(--color-ring);
   }
-}
-p {
-  margin: 0;
-}
 
-code,
-.counter {
-  font-family: var(--mono);
-  display: inline-flex;
-  border-radius: 4px;
-  color: var(--text-h);
-}
+  /* Explicit opt-in for figures inside elements that reset font-variant. */
+  .numeric {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
 
-code {
-  font-size: 15px;
-  line-height: 135%;
-  padding: 4px 8px;
-  background: var(--code-bg);
+  /* Swiss headline treatment for display numbers and page titles. */
+  .tracking-tight-swiss {
+    letter-spacing: -0.02em;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .motion-safe-only {
+      animation: none !important;
+      transition: none !important;
+    }
+  }
 }

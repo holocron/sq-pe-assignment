@@ -51,6 +51,14 @@ caa:
   agent:
     max-steps: 40
     max-coverage-reprompts: 3
+    # gpt-oss-120b advertises a 131072-token window, but the lemonade backend serving it was
+    # started with ctx_size=32768 - that is the limit actually enforced, and exceeding it fails
+    # the whole request with "500: Context size has been exceeded". A full analysis is ~30 turns
+    # of accumulating tool output, so the transcript is compacted to fit this number. Raise it
+    # only if the model backend is restarted with a larger window.
+    context-tokens: 32768
+    context-reserve-tokens: 1536
+    keep-recent-messages: 10
   cors:
     allowed-origins: http://localhost:5173
 

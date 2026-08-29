@@ -1,9 +1,22 @@
 #!/usr/bin/env bash
-# Drops and recreates the caa schema, so the next backend start replays every Flyway migration
+# Drops and recreates the schema so the next backend start replays every Flyway migration
 # (baseline -> app tables -> seed) against a clean database.
+#
+# Recreating `public` makes it owned by the superuser running this script, so ownership must be
+# handed back to the application role - otherwise Flyway fails with
+# "ERROR: no schema has been selected to create in".
 set -euo pipefail
 PSQL="${PSQL:-/opt/homebrew/opt/postgresql@17/bin/psql}"
+DB="${DB_NAME:-caa}"
+ROLE="${DB_ROLE:-caa}"
 
-"$PSQL" -d caa -v ON_ERROR_STOP=1 -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
-"$PSQL" -d caa -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS "uuid-ossp";'
+"$PSQL" -d "$DB" -v ON_ERROR_STOP=1 <<SQL
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+ALTER SCHEMA public OWNER TO ${ROLE};
+GRANT ALL ON SCHEMA public TO ${ROLE};
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+SQL
+
 echo "Database reset. Start the backend to re-apply migrations and seed data."
