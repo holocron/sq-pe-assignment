@@ -3,17 +3,18 @@ package com.sq.caa.agent;
 /**
  * Where a rule's verdict in an analysis run came from.
  *
- * <p>Persisted in the run's trace and surfaced on the analysis page so a reviewer can see, per rule,
- * whether the agent actually reasoned about it or whether the coverage backfill had to complete it.
+ * <p>There is exactly one origin now. {@code risk_rules.threshold_logic} holds the rule condition in
+ * prose, the agent reads it, gathers the evidence with its data tools and judges it; nothing else in
+ * the system produces a verdict, and nothing overrules the one the agent submitted. The enum is kept
+ * because the value is persisted in {@code analysis_runs.trace} and rendered per rule on the
+ * analysis page: a reviewer reading a stored run must be able to see, without inference, that what
+ * they are looking at is a model's judgement rather than a computation.
+ *
+ * <p>A rule the agent never judged has no verdict at all - it is not represented by another enum
+ * value, it is the reason the run is recorded as {@code FAILED}. See {@link RiskAgentLoop}.
  */
 public enum RuleVerdictSource {
 
-    /** The agent called {@code submit_rule_evaluation} for this rule. */
-    AGENT,
-
-    /**
-     * The agent never ruled on this rule, so the deterministic engine did after the loop ended. This
-     * is the mechanism that makes rule coverage 100% on every run.
-     */
-    DETERMINISTIC_FALLBACK
+    /** The agent read the rule condition, weighed the evidence and called {@code submit_rule_evaluation}. */
+    AGENT_JUDGED
 }

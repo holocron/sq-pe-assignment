@@ -1,5 +1,5 @@
 /**
- * Presentation metadata for the ReAct trace (BUILD_SPEC section 4).
+ * Presentation metadata for the ReAct trace.
  *
  * The wire format is deliberately terse — `{"n":1,"type":"tool_call",
  * "tool":"list_risk_rules","args":{},"result_preview":"...","ms":812}` — so
@@ -9,7 +9,6 @@
 import {
   BookOpen,
   Brain,
-  Calculator,
   ChartColumn,
   CircleAlert,
   ClipboardCheck,
@@ -24,11 +23,11 @@ import {
   Wrench,
   type LucideIcon,
 } from 'lucide-react'
-import type { JsonValue, TraceStep } from '../../api/types'
-import { humanizeToken } from '../../lib/format'
+import type { JsonValue, ToolCallTraceStep, TraceStep } from '../../api/types'
+import { formatAmount, humanizeToken, shortId } from '../../lib/format'
 
 /** What a tool call is for; drives the chip on the trace step. */
-export type ToolKind = 'evidence' | 'policy' | 'evaluate' | 'submit' | 'custom'
+export type ToolKind = 'evidence' | 'policy' | 'submit' | 'custom'
 
 export interface ToolMeta {
   /** Wire name, e.g. `list_risk_rules`. */
@@ -43,12 +42,14 @@ export interface ToolMeta {
 export const TOOL_KIND_LABELS: Record<ToolKind, string> = {
   evidence: 'Evidence',
   policy: 'Policy',
-  evaluate: 'Deterministic check',
   submit: 'Verdict',
   custom: 'Tool',
 }
 
-/** The nine agent tools from BUILD_SPEC section 4. */
+/**
+ * The eight agent tools. There is no tool that evaluates a rule: conditions are
+ * prose, so the agent gathers evidence and judges them itself.
+ */
 export const TOOL_META: Record<string, ToolMeta> = {
   get_customer_profile: {
     name: 'get_customer_profile',
@@ -82,7 +83,8 @@ export const TOOL_META: Record<string, ToolMeta> = {
   list_risk_rules: {
     name: 'list_risk_rules',
     label: 'Risk rules',
-    description: 'Loaded every rule that applies to this customer — the coverage set.',
+    description:
+      'Loaded every rule that applies to this customer — the coverage set, each condition in plain English for the agent to judge.',
     icon: SlidersHorizontal,
     kind: 'evidence',
   },
@@ -93,18 +95,11 @@ export const TOOL_META: Record<string, ToolMeta> = {
     icon: BookOpen,
     kind: 'policy',
   },
-  evaluate_rule_deterministically: {
-    name: 'evaluate_rule_deterministically',
-    label: 'Deterministic rule check',
-    description:
-      'Ran the rule DSL engine over the transactions, so the match set is exact rather than estimated.',
-    icon: Calculator,
-    kind: 'evaluate',
-  },
   submit_rule_evaluation: {
     name: 'submit_rule_evaluation',
     label: 'Submit rule verdict',
-    description: 'Recorded the verdict, score and rationale for one rule.',
+    description:
+      'Recorded the agent’s verdict, estimated score and rationale for one rule. The score is capped at the rule’s weight.',
     icon: ClipboardCheck,
     kind: 'submit',
   },
@@ -141,7 +136,6 @@ export type TraceStepTone = 'neutral' | 'info' | 'accent' | 'warning' | 'danger'
 const TOOL_KIND_TONES: Record<ToolKind, TraceStepTone> = {
   evidence: 'neutral',
   policy: 'info',
-  evaluate: 'info',
   submit: 'accent',
   custom: 'neutral',
 }
@@ -178,6 +172,14 @@ export function traceStepMeta(step: TraceStep): TraceStepMeta {
         icon: ShieldAlert,
         tone: 'warning',
       }
+    case 'coverage_failed':
+      return {
+        label: 'Coverage not met',
+        description:
+          'The loop ran out of steps with rules still unjudged, so the run was recorded as FAILED rather than reported as complete.',
+        icon: ShieldAlert,
+        tone: 'danger',
+      }
     case 'final':
       return {
         label: 'Final assessment',
@@ -213,19 +215,44 @@ export function coverageRepromptExplanation(missingCount: number): string {
   }
   const rules = missingCount === 1 ? 'rule was' : 'rules were'
   const them = missingCount === 1 ? 'it' : 'them'
-  return `The agent tried to conclude while ${missingCount} ${rules} still unevaluated — it was sent back to evaluate ${them} before it could finish.`
+  return `The agent tried to conclude while ${missingCount} ${rules} still unjudged — it was sent back to judge ${them} before it could finish.`
 }
 
-/** One-line "what is happening now" label for the live run panel. */
+/**
+ * Plain-language explanation of a `coverage_failed` step. Nothing closes a
+ * coverage gap any more, so this step is the reason the run is FAILED.
+ */
+export function coverageFailedExplanation(step: {
+  missing: readonly string[]
+  unjudgedRuleNames: readonly string[]
+  rulesTotal: number | null
+}): string {
+  const missing = step.missing.length || step.unjudgedRuleNames.length
+  const of = step.rulesTotal ? ` of ${step.rulesTotal}` : ''
+  const named = step.unjudgedRuleNames.length ? ` (${step.unjudgedRuleNames.join(', ')})` : ''
+  return `The loop ended with ${missing}${of} applicable rule(s) never judged${named}. There is nothing behind the agent to fill that in, so the run is recorded as FAILED and the verdicts it did reach are kept as a partial review.`
+}
+
+/**
+ * One-line "what is happening now" label for the live run panel.
+ *
+ * Named down to the rule where the step says which one: during the checklist
+ * phase every step is a `submit_rule_evaluation`, so "Calling Submit rule
+ * verdict" for two solid minutes tells an operator nothing.
+ */
 export function traceStepSummary(step: TraceStep | null | undefined): string {
   if (!step) return 'Waiting for the agent to take its first step.'
   switch (step.type) {
-    case 'tool_call':
-      return `Calling ${toolMeta(step.tool).label}`
+    case 'tool_call': {
+      const subject = traceStepIdentity(step).subject
+      return `Calling ${toolMeta(step.tool).label}${subject ? ` — ${subject}` : ''}`
+    }
     case 'assistant':
       return 'Reasoning about the evidence so far'
     case 'coverage_reprompt':
-      return `Coverage gate — ${step.missing.length} rule(s) still to evaluate`
+      return `Coverage gate — ${step.missing.length} rule(s) still to judge`
+    case 'coverage_failed':
+      return `Coverage not met — ${step.missing.length} rule(s) never judged`
     case 'final':
       return 'Writing the final assessment'
     case 'error':
@@ -300,4 +327,337 @@ export function hasJsonContent(value: JsonValue | null | undefined): boolean {
   if (Array.isArray(value)) return value.length > 0
   if (typeof value === 'object') return Object.keys(value).length > 0
   return true
+}
+
+/* -------------------------------------------------------------------------- */
+/* Step identity: what the step acted on, and how it came out                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The collapsed row's identity.
+ *
+ * A run with twelve rules produces two dozen steps whose tool name is the same,
+ * and the rule each one judged used to be visible only after expanding the
+ * arguments. Since a rule condition is prose and the agent's judgement *is* the
+ * verdict — nothing re-checks it — the row has to name the rule on its face.
+ */
+export interface TraceStepIdentity {
+  /** What the step acted on: a rule name, a transaction, a policy query. */
+  subject: string | null
+  /** The one-line result, e.g. `triggered +30.00`, `12 rules in scope`. */
+  outcome: string | null
+  /**
+   * Emphasis for the outcome chip. Deliberately only `neutral` and `accent`:
+   * per the design system the risk ramp means a risk level, and a triggered
+   * rule is not one (DESIGN_SYSTEM.md, "brand colour vs risk colour").
+   */
+  outcomeTone: 'neutral' | 'accent'
+  /** `rule 3/12` on a verdict step, when the run said how far it had got. */
+  progress: string | null
+}
+
+const EMPTY_IDENTITY: TraceStepIdentity = {
+  subject: null,
+  outcome: null,
+  outcomeTone: 'neutral',
+  progress: null,
+}
+
+/** Extra facts the viewer knows that one step does not carry on its own. */
+export interface TraceStepIdentityContext {
+  /** Resolves a rule id to its name, for a step whose result was not persisted. */
+  ruleNames?: ReadonlyMap<string, string>
+  /** 1-based position of this verdict among the run's verdicts. */
+  ruleOrdinal?: number
+  /** Size of the coverage set, when the step's own result does not say. */
+  ruleCount?: number
+}
+
+/** `12 rules`, `1 rule` — plural agreement without a formatter. */
+function countLabel(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? '' : 's'}`
+}
+
+/**
+ * Reads one top-level key out of a tool result preview.
+ *
+ * The preview is JSON that the backend truncated at 600 characters, so it
+ * cannot be parsed; every field read here is near the front of its payload by
+ * construction (record component order), and a miss simply leaves the row
+ * without that part of its label.
+ */
+function previewString(preview: string | null | undefined, key: string): string | null {
+  if (!preview) return null
+  const match = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`).exec(preview)
+  if (!match) return null
+  try {
+    return (JSON.parse(`"${match[1]}"`) as string).trim() || null
+  } catch {
+    return match[1].trim() || null
+  }
+}
+
+function previewNumber(preview: string | null | undefined, key: string): number | null {
+  if (!preview) return null
+  const match = new RegExp(`"${key}"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)`).exec(preview)
+  return match ? Number(match[1]) : null
+}
+
+/**
+ * Whether the preview carries a key at all.
+ *
+ * A tool that refused a call answers `{"error":"…","hint":"…"}`, and the message
+ * is long enough to be cut mid-string, so the row is recognised by the key
+ * being there rather than by reading its value.
+ */
+function previewHas(preview: string | null | undefined, key: string): boolean {
+  return !!preview && new RegExp(`"${key}"\\s*:`).test(preview)
+}
+
+function previewBoolean(preview: string | null | undefined, key: string): boolean | null {
+  if (!preview) return null
+  const match = new RegExp(`"${key}"\\s*:\\s*(true|false)`).exec(preview)
+  return match ? match[1] === 'true' : null
+}
+
+/** The tool arguments as an object, tolerating the JSON-in-a-string form. */
+function argsObject(value: JsonValue | null | undefined): Record<string, JsonValue> {
+  if (typeof value === 'string') {
+    try {
+      return argsObject(JSON.parse(value) as JsonValue)
+    } catch {
+      return {}
+    }
+  }
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+}
+
+function argString(args: Record<string, JsonValue>, key: string): string | null {
+  const value = args[key]
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function argNumber(args: Record<string, JsonValue>, key: string): number | null {
+  const value = args[key]
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function argBoolean(args: Record<string, JsonValue>, key: string): boolean | null {
+  const value = args[key]
+  return typeof value === 'boolean' ? value : null
+}
+
+/** The two label fields the backend records on the step, when they survived. */
+function wireIdentity(step: TraceStep): { subject: string | null; outcome: string | null } {
+  const wire = step as { subject?: unknown; outcome?: unknown }
+  return {
+    subject: typeof wire.subject === 'string' && wire.subject.trim() ? wire.subject.trim() : null,
+    outcome: typeof wire.outcome === 'string' && wire.outcome.trim() ? wire.outcome.trim() : null,
+  }
+}
+
+function verdictIdentity(
+  step: ToolCallTraceStep,
+  context: TraceStepIdentityContext,
+): TraceStepIdentity {
+  const preview = step.resultPreview
+  const args = argsObject(step.args)
+  const ruleId = previewString(preview, 'ruleId') ?? argString(args, 'rule_id')
+  // The result names the rule; a step whose result was not persisted still has
+  // the id it was called with, which the rule catalogue can name.
+  const fromCatalogue = ruleId ? (context.ruleNames?.get(ruleId) ?? null) : null
+  const fromId = ruleId ? `Rule ${shortId(ruleId)}` : null
+  const subject = previewString(preview, 'ruleName') ?? fromCatalogue ?? fromId
+
+  // The tool refuses a verdict that cites nothing, or an unknown rule; that row
+  // must not read like a recorded verdict.
+  if (previewHas(preview, 'error')) {
+    return { subject, outcome: 'call rejected', outcomeTone: 'neutral', progress: null }
+  }
+
+  const triggered = previewBoolean(preview, 'recordedAsTriggered') ?? argBoolean(args, 'triggered')
+  const score = previewNumber(preview, 'recordedScore') ?? argNumber(args, 'score')
+  const submitted = previewNumber(preview, 'verdictsSubmitted') ?? context.ruleOrdinal ?? null
+  const total = previewNumber(preview, 'rulesTotal') ?? context.ruleCount ?? null
+  const progress = submitted && total ? `rule ${submitted}/${total}` : null
+
+  if (triggered === null) {
+    return { subject, outcome: null, outcomeTone: 'neutral', progress }
+  }
+  const outcome = triggered
+    ? `triggered${score === null ? '' : ` +${formatAmount(score)}`}`
+    : 'not triggered'
+  return { subject, outcome, outcomeTone: triggered ? 'accent' : 'neutral', progress }
+}
+
+/** `PAYMENT 9,800.00 CHF on 2026-08-20` — enough to recognise the transaction. */
+function transactionSubject(step: ToolCallTraceStep): string | null {
+  const preview = step.resultPreview
+  const type = previewString(preview, 'activityType')
+  const amount = previewNumber(preview, 'amount')
+  const currency = previewString(preview, 'currency')
+  const day = previewString(preview, 'createdAt')?.slice(0, 10) ?? null
+  const money = amount === null ? null : `${formatAmount(amount)}${currency ? ` ${currency}` : ''}`
+  const head = [type, money].filter(Boolean).join(' ')
+  // The same wording the backend records, so a row reads alike either way.
+  const described = day ? `${head} on ${day}`.trim() : head
+  if (described) return described
+  const id = argString(argsObject(step.args), 'transaction_id')
+  return id ? `Transaction ${shortId(id)}` : null
+}
+
+function toolCallIdentity(
+  step: ToolCallTraceStep,
+  context: TraceStepIdentityContext,
+): TraceStepIdentity {
+  const preview = step.resultPreview
+  switch (step.tool) {
+    case 'submit_rule_evaluation':
+      return verdictIdentity(step, context)
+    case 'list_risk_rules': {
+      const total = previewNumber(preview, 'rulesTotal')
+      return total === null
+        ? EMPTY_IDENTITY
+        : { ...EMPTY_IDENTITY, outcome: `${countLabel(total, 'rule')} in scope` }
+    }
+    case 'get_transaction_details':
+      return {
+        ...EMPTY_IDENTITY,
+        subject: transactionSubject(step),
+        outcome: previewString(preview, 'status'),
+      }
+    case 'list_transactions': {
+      const returned = previewNumber(preview, 'returned')
+      const matching = previewNumber(preview, 'matchingTransactions')
+      return returned === null || matching === null
+        ? EMPTY_IDENTITY
+        : { ...EMPTY_IDENTITY, outcome: `${returned} of ${countLabel(matching, 'transaction')}` }
+    }
+    case 'search_policy_knowledge': {
+      const returned = previewNumber(preview, 'returned')
+      return {
+        ...EMPTY_IDENTITY,
+        subject: previewString(preview, 'query') ?? argString(argsObject(step.args), 'query'),
+        outcome: returned === null ? null : countLabel(returned, 'passage'),
+      }
+    }
+    case 'get_customer_profile':
+      return { ...EMPTY_IDENTITY, subject: previewString(preview, 'fullName') }
+    case 'get_customer_activity_summary': {
+      const total = previewNumber(preview, 'totalTransactions')
+      return total === null
+        ? EMPTY_IDENTITY
+        : { ...EMPTY_IDENTITY, outcome: countLabel(total, 'transaction') }
+    }
+    case 'submit_final_assessment': {
+      const accepted = previewBoolean(preview, 'accepted')
+      if (accepted === null) return EMPTY_IDENTITY
+      const outstanding = previewNumber(preview, 'verdictsStillRequired') ?? 0
+      return accepted
+        ? { ...EMPTY_IDENTITY, outcome: 'assessment accepted', outcomeTone: 'accent' }
+        : {
+            ...EMPTY_IDENTITY,
+            outcome: `rejected: ${countLabel(outstanding, 'rule')} unjudged`,
+          }
+    }
+    default:
+      return EMPTY_IDENTITY
+  }
+}
+
+/**
+ * What a step should say while collapsed.
+ *
+ * The backend records `subject` and `outcome` on the step itself; when they
+ * reach the viewer they are used verbatim, because they were written where the
+ * meaning was known. Otherwise — an older run, or a payload normalised without
+ * them — they are recovered from the call's own arguments and result preview,
+ * so the row is legible either way.
+ */
+export function traceStepIdentity(
+  step: TraceStep,
+  context: TraceStepIdentityContext = {},
+): TraceStepIdentity {
+  const derived =
+    step.type === 'tool_call'
+      ? toolCallIdentity(step, context)
+      : step.type === 'coverage_reprompt'
+        ? { ...EMPTY_IDENTITY, outcome: `${countLabel(step.missing.length, 'rule')} still unjudged` }
+        : step.type === 'coverage_failed'
+          ? {
+              ...EMPTY_IDENTITY,
+              outcome: step.rulesTotal
+                ? `${step.missing.length} of ${step.rulesTotal} never judged`
+                : `${countLabel(step.missing.length, 'rule')} never judged`,
+            }
+          : EMPTY_IDENTITY
+
+  const wire = wireIdentity(step)
+  if (!wire.subject && !wire.outcome) return derived
+  return {
+    ...derived,
+    subject: wire.subject ?? derived.subject,
+    outcome: wire.outcome ?? derived.outcome,
+    // The recorded outcome already carries its own progress counter.
+    progress: wire.outcome ? null : derived.progress,
+  }
+}
+
+/**
+ * The size of the coverage set, as the run itself reported it.
+ *
+ * Taken from the steps rather than from the rule catalogue on purpose: the
+ * catalogue holds every rule, while the coverage set is only the rules that
+ * apply to this customer, and "rule 3 of 12" must count the second.
+ */
+export function coverageSetSize(steps: readonly TraceStep[]): number | null {
+  for (const step of steps) {
+    if (step.type !== 'tool_call') continue
+    const total = previewNumber(step.resultPreview, 'rulesTotal')
+    if (total !== null && total > 0) return total
+  }
+  return null
+}
+
+/* -------------------------------------------------------------------------- */
+/* Grouping                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/** One timeline entry: a single step, or a run of consecutive rule verdicts. */
+export type TraceBlock =
+  | { kind: 'step'; step: TraceStep }
+  | { kind: 'verdicts'; steps: TraceStep[] }
+
+/** True when the step is the agent recording its judgement of one rule. */
+export function isVerdictStep(step: TraceStep): boolean {
+  return step.type === 'tool_call' && step.tool === 'submit_rule_evaluation'
+}
+
+/**
+ * Folds a run of consecutive verdict steps into one block.
+ *
+ * Twelve rules judged back to back are twelve rows either way, but as one block
+ * they read as one phase of the run — "the agent worked through the checklist"
+ * — instead of twelve unrelated markers down the timeline.
+ */
+export function groupTraceSteps(steps: readonly TraceStep[]): TraceBlock[] {
+  const blocks: TraceBlock[] = []
+  for (const step of steps) {
+    const last = blocks[blocks.length - 1]
+    if (isVerdictStep(step)) {
+      if (last?.kind === 'verdicts') {
+        last.steps.push(step)
+        continue
+      }
+      blocks.push({ kind: 'verdicts', steps: [step] })
+      continue
+    }
+    blocks.push({ kind: 'step', step })
+  }
+  // A lone verdict is not a phase; it stays an ordinary row.
+  return blocks.map((block) =>
+    block.kind === 'verdicts' && block.steps.length === 1
+      ? { kind: 'step', step: block.steps[0] }
+      : block,
+  )
 }

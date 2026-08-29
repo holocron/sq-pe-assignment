@@ -1,33 +1,31 @@
 /**
  * Rule-coverage arithmetic for the analysis page.
  *
- * BUILD_SPEC section 4 guarantees that one row lands in `risk_assessments` for
- * every rule in the coverage set — triggered or not, agent-evaluated or
- * deterministically backfilled. These helpers turn that guarantee into
- * something a reviewer can verify at a glance.
+ * The coverage guarantee is what these helpers make visible: one row lands in
+ * `risk_assessments` for every rule the agent judged, triggered or not, and a
+ * run may only reach COMPLETED when every applicable rule has a verdict. There
+ * is no engine behind the agent to close a gap, so an incomplete coverage set
+ * is not a footnote on a finished review — it is the reason the run was stored
+ * as FAILED, and the wording here says exactly that.
  */
 import type { AnalysisResult, AnalysisSummary, RuleEvaluation } from '../../api/types'
 
 export interface CoverageStats {
   /** Size of the coverage set (`analysis_runs.rules_total`). */
   total: number
-  /** Rules that have a persisted verdict. */
+  /** Rules that have a persisted agent verdict. */
   evaluated: number
   triggered: number
-  /** Verdicts produced by the agent itself. */
-  agentCount: number
-  /** Verdicts produced by the deterministic backfill. */
-  fallbackCount: number
-  /** Rules where the agent and the DSL engine disagreed. */
-  disagreements: number
+  /** Rules in the coverage set that never received a verdict. */
+  unjudged: number
   /** Every rule in the coverage set has a verdict. */
   complete: boolean
-  /** The agent covered everything without needing the deterministic backfill. */
-  agentComplete: boolean
   /** 0..100, for the coverage meter. */
   percent: number
   /** Sum of the persisted score contributions. */
   scoreFromRules: number
+  /** Verdicts whose score the model overstated and the backend capped. */
+  cappedCount: number
 }
 
 export type CoverageInput = Pick<
@@ -47,39 +45,34 @@ export function coverageStats(analysis: CoverageInput): CoverageStats {
   )
 
   const triggered = evaluations.filter((item) => item.triggered).length
-  const fallbackCount = evaluations.filter(
-    (item) => item.source === 'DETERMINISTIC_FALLBACK',
-  ).length
-  const agentCount = evaluations.filter((item) => item.source === 'AGENT').length
-  const disagreements = evaluations.filter((item) => item.disagreement === true).length
+  const cappedCount = evaluations.filter((item) => item.scoreClamped === true).length
   const scoreFromRules = evaluations.reduce(
     (sum, item) => sum + (Number.isFinite(item.score) ? item.score : 0),
     0,
   )
 
-  const complete = total > 0 && evaluated >= total
-  const agentComplete =
-    typeof analysis.coverageComplete === 'boolean'
-      ? analysis.coverageComplete
-      : complete && fallbackCount === 0
+  /* `coverage_complete` is the backend's own verdict and it is the column that
+     gates COMPLETED, so it wins whenever it is present; the count is only the
+     fallback for a summary row that does not carry it. */
+  const counted = total > 0 && evaluated >= total
+  const complete =
+    typeof analysis.coverageComplete === 'boolean' ? analysis.coverageComplete : counted
 
   return {
     total,
     evaluated,
     triggered,
-    agentCount,
-    fallbackCount,
-    disagreements,
+    unjudged: Math.max(0, total - evaluated),
     complete,
-    agentComplete,
     percent: total > 0 ? Math.min(100, Math.round((evaluated / total) * 100)) : 0,
     scoreFromRules,
+    cappedCount,
   }
 }
 
-/** `18 / 18 rules evaluated` — rendered as a single text node so it reads cleanly. */
+/** `18 / 18 rules judged` — rendered as a single text node so it reads cleanly. */
 export function coverageCountLabel(stats: CoverageStats): string {
-  return `${stats.evaluated} / ${stats.total} rules evaluated`
+  return `${stats.evaluated} / ${stats.total} rules judged`
 }
 
 export function coverageStatusLabel(stats: CoverageStats, running = false): string {
@@ -91,18 +84,16 @@ export function coverageStatusLabel(stats: CoverageStats, running = false): stri
 export function coverageExplanation(stats: CoverageStats, running = false): string {
   if (stats.total === 0) {
     return running
-      ? 'The coverage set is loaded at the start of the run; verdicts appear here as the agent submits them.'
+      ? 'The coverage set is fixed at the start of the run; verdicts appear here as the agent submits them.'
       : 'No applicable rules were recorded for this analysis.'
   }
   if (!stats.complete) {
+    const missing = stats.unjudged > 0 ? stats.unjudged : stats.total - stats.evaluated
     return running
-      ? `${stats.total - stats.evaluated} rule(s) still to evaluate. The loop cannot finish until every rule has a verdict.`
-      : `${stats.total - stats.evaluated} rule(s) have no recorded verdict. This should not happen — the deterministic backfill is meant to close the gap.`
+      ? `${missing} rule(s) still to judge. The loop cannot finish until every rule has a verdict.`
+      : `${missing} rule(s) were never judged, so this run was recorded as FAILED rather than reported as a complete review. The verdicts it did reach are kept below; re-run the analysis for a complete one.`
   }
-  if (stats.fallbackCount > 0) {
-    return `Every applicable rule has a verdict. ${stats.fallbackCount} of them were backfilled by the deterministic engine after the agent stopped short.`
-  }
-  return 'Every applicable rule was evaluated by the agent itself — no deterministic backfill was needed.'
+  return 'Every applicable rule was judged by the agent. Each verdict is its own reading of the rule condition against this customer’s activity, not a recomputation — running the analysis again can reach different scores.'
 }
 
 /**

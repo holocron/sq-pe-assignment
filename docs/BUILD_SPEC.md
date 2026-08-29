@@ -4,6 +4,14 @@
 Everything in the "Verified Environment Facts" section was empirically confirmed on this machine.
 Do NOT guess API signatures — they changed in Spring Boot 4 / Spring AI 2.
 
+> **Amended 2026-08-29 by stakeholder decision.** `risk_rules.threshold_logic` was originally
+> specified here as a machine-parseable JSON rule DSL evaluated by a deterministic engine. That
+> reading was overruled: **`threshold_logic` is natural language — effectively a prompt.** The ReAct
+> agent reads the condition, fetches the customer's data with its tools, and judges whether the rule
+> is triggered and what it contributes. The deterministic engine, the JSON grammar and the
+> deterministic backfill are gone. Sections 3, 4, 6 and 7 below are the amended text; no table or
+> column changed.
+
 ---
 
 ## 1. Verified Environment Facts (DO NOT DEVIATE)
@@ -147,31 +155,39 @@ The RAG agent MUST verify at runtime that `PgVectorSchemaValidator` accepts this
 
 ---
 
-## 3. Risk Rule DSL (shared contract — backend evaluator AND frontend visual editor)
+## 3. Rule conditions (shared contract — the agent reads them, the editor writes them)
 
-`risk_rules.threshold_logic` stores **JSON** in this exact shape:
+`risk_rules.threshold_logic` stores the rule condition **in natural language**. Nothing parses it.
+The agent is shown the text verbatim and judges it against the customer's activity.
 
-```json
-{
-  "op": "AND",
-  "conditions": [
-    { "field": "amount", "operator": "GT", "value": 10000 },
-    { "op": "OR", "conditions": [
-        { "field": "payment.receiver_bank_country", "operator": "IN", "value": ["IR","KP","SY","RU","AF"] },
-        { "field": "customer.country", "operator": "NEQ", "value": "US" }
-    ]}
-  ]
-}
+```text
+A payment with payment.payment_method of SWIFT, whose amount is above 75,000 and whose
+payment.receiver_bank_country is not CH.
+Why it matters: SWIFT is the correspondent-banking rail, and above 75,000 a wire has left the
+retail pattern entirely. Judge the set rather than the single transfer: several such wires to
+different countries within one month is far stronger evidence than one wire to a country the
+customer plainly trades with.
 ```
 
-* A **group** node has `op` (`AND` | `OR` | `NOT`) and `conditions[]`. Nesting is allowed.
-* A **leaf** node has `field`, `operator`, `value`.
-* Operators: `GT GTE LT LTE EQ NEQ IN NOT_IN CONTAINS NOT_CONTAINS BETWEEN IS_NULL NOT_NULL MATCHES`
-  (`BETWEEN` takes a 2-element array; `IS_NULL`/`NOT_NULL` take no value; `MATCHES` is a regex).
-* Unknown field or type mismatch ⇒ the leaf evaluates to **false** and the evaluation is flagged
-  `"degraded": true` — never throw during scoring.
+Contract for a condition:
 
-### Field catalog — served by `GET /api/rules/field-catalog` so the editor is data-driven
+* **Plain English.** A pasted `{"op":"AND",…}` document is **rejected** on write (400,
+  `application/problem+json`, `field: "thresholdLogic"`), because stored verbatim it would be fed to
+  the model as prose.
+* **20–2,000 characters**, control characters stripped, CRLF unified, trimmed. Rule name unique and
+  ≤ 160 characters; weight 0.01–999.99.
+* It should state **a concrete threshold, a time window, the fields it depends on, and why the
+  pattern matters** — the last part is what tells the agent how to score a marginal case.
+* It reaches the model **fenced as data** (`PromptSafety.fence("rule_condition", …)`) and can neither
+  close its own fence nor change the procedure. A rule's text can never excuse skipping a rule.
+* The score the agent returns for a rule is its **estimate**, clamped to `[0, weight]`, `0.00` when
+  not triggered.
+
+### Field catalog — served by `GET /api/rules/field-catalog`
+
+Reference material, not a grammar: it tells a rule author (and the reader of a condition) exactly
+which data the agent can fetch, so a condition names fields that exist. The editor renders it beside
+the condition box and inserts a field path on click.
 
 | field | type | notes |
 |---|---|---|
@@ -219,10 +235,9 @@ Package `com.sq.caa.agent`. Triggered by `POST /api/customers/{id}/analyses`, ru
 | `get_customer_activity_summary` | counts/sums per activity type, currencies, countries, velocity, failed ratio |
 | `list_transactions` | page of transactions, filterable by `activity_type`, `status`, `min_amount` |
 | `get_transaction_details` | one transaction incl. its CARD/PAYMENT/CRYPTO specifics |
-| `list_risk_rules` | every applicable rule: `rule_id`, `rule_name`, `applies_to`, `threshold_logic`, `weight` |
+| `list_risk_rules` | every applicable rule: `rule_id`, `rule_name`, `applies_to`, the condition (fenced as data), `weight`, how many transactions are in its scope, and whether it already has a verdict |
 | `search_policy_knowledge` | **RAG** — vector similarity search over the knowledge base; returns chunks with source + section |
-| `evaluate_rule_deterministically` | runs the DSL engine for one `rule_id` over the customer's transactions; returns exactly which transactions match. The agent is told to use this for every numeric/threshold rule rather than eyeballing |
-| `submit_rule_evaluation` | records the verdict for ONE rule: `rule_id`, `transaction_ids[]`, `triggered`, `score`, `rationale` |
+| `submit_rule_evaluation` | records the agent's verdict on ONE rule: `rule_id`, `transaction_ids[]`, `triggered`, `score`, `rationale`. Validates before it records: unknown rule, blank rationale, `triggered` with no evidence, or an id that is not this customer's or not in the rule's scope are all **refused** and nothing is stored. The score is clamped to the rule's weight and the raw claim is kept |
 | `submit_final_assessment` | terminal: `risk_level`, `summary`, `recommendations` |
 
 ### Rule-coverage gate — MANDATORY, this is a graded requirement
@@ -235,17 +250,22 @@ The loop **must not be able to finish with an unevaluated rule.**
 3. When the model stops calling tools (or calls `submit_final_assessment`) while
    `coverage_set - evaluated` is non-empty, **do not exit**. Append a `UserMessage` naming the exact
    missing `rule_id` / `rule_name` values and continue the loop. Log this as a `coverage_reprompt` step.
-4. Repeat up to `MAX_STEPS` (default 40, configurable).
-5. **Deterministic backfill:** any rule still unevaluated after the loop is evaluated by the DSL engine
-   and persisted with `source = DETERMINISTIC_FALLBACK`. Coverage is therefore *always* 100%.
-6. `analysis_runs.coverage_complete` records whether the agent itself covered everything
-   (true) or the fallback was needed (false). `rules_total` / `rules_evaluated` are persisted.
-7. A row is written to `risk_assessments` for **every** rule in the coverage set — triggered ones with
-   their score, non-triggered ones with `score_contribution = 0.00`.
+4. Repeat up to `MAX_STEPS` (default 40, configurable) and `max-coverage-reprompts` (default 3).
+5. **There is no backfill.** Nothing behind the agent can close a gap. If the loop runs out of steps
+   with rules still unjudged, the run is persisted **`FAILED`**, keeping the verdicts already
+   obtained, with `coverage_complete = false`, `rules_evaluated` = the verdicts actually reached, and
+   `analysis_runs.error` naming the rules that were never judged. A `coverage_failed` trace step
+   carries the same names. A partial review must never be reported as a complete one.
+6. `analysis_runs.coverage_complete` is therefore **`true` on every `COMPLETED` run**. It is derived
+   from the outcome set (`unjudged.isEmpty() && outcomes >= rulesTotal`), not asserted by a caller,
+   and the service restates the check before the single `COMPLETED` persist.
+7. A row is written to `risk_assessments` for **every (in-scope transaction, rule)** pair — triggered
+   rules with their distributed score, non-triggered ones with `score_contribution = 0.00`. "In
+   scope" is decided by `applies_to` alone. A rule with **no** verdict writes **no** rows: a `0.00`
+   row would be indistinguishable from "checked and cleared".
 
-Every rule evaluation is also cross-checked: if the agent says "not triggered" but the deterministic
-engine says "triggered", the **deterministic result wins** for scoring and the disagreement is recorded
-in the trace. This is the false-negative safety net the assignment asks for.
+The false-negative defence is now the gate plus the evidence rules on `submit_rule_evaluation`, not a
+second engine: the agent cannot skip a rule, and it cannot record a finding it cannot cite.
 
 ### Prompting posture
 The system prompt states the bank context and that this is **asymmetric-cost** work: a missed real risk
@@ -258,12 +278,23 @@ number that did not come from a tool.
 
 ### Trace format (`analysis_runs.trace` JSONB)
 ```json
-{"steps":[{"n":1,"type":"tool_call","tool":"list_risk_rules","args":{},"result_preview":"...","ms":812},
+{"steps":[{"n":1,"type":"tool_call","tool":"list_risk_rules","args":{},"result_preview":"...","ms":812,
+           "outcome":"12 rules in scope"},
           {"n":2,"type":"assistant","text":"..."},
-          {"n":3,"type":"coverage_reprompt","missing":["<rule_id>"]},
-          {"n":4,"type":"final","risk_level":"HIGH"}]}
+          {"n":3,"type":"tool_call","tool":"submit_rule_evaluation","args":{"rule_id":"..."},
+           "result_preview":"...","ms":1421,
+           "subject":"Structuring - repeated payments just below the reporting threshold",
+           "outcome":"triggered +30.00 (rule 3 of 12)"},
+          {"n":4,"type":"coverage_reprompt","missing":["<rule_id>"]},
+          {"n":5,"type":"coverage_failed","missing":["<rule_id>"],
+           "detail":{"rules_total":12,"unjudged_rule_names":["..."]}},
+          {"n":6,"type":"final","risk_level":"HIGH"}]}
 ```
-The UI renders this, so keep it stable.
+The UI renders this, so keep it stable. `subject` and `outcome` are **optional** one-line labels
+written where the meaning was known — the rule name and the verdict for `submit_rule_evaluation`, the
+transaction for `get_transaction_details`, and so on. They are omitted when empty, so a step written
+before they existed is byte-identical to a note-less step today. Without them twelve rule verdicts
+render as twelve identical rows, which is the whole reason they exist.
 
 ---
 
@@ -292,8 +323,12 @@ POST   /api/rules                             -> RiskRule             (ADMIN)
 PUT    /api/rules/{ruleId}                    -> RiskRule             (ADMIN)
 DELETE /api/rules/{ruleId}                    -> 204                  (ADMIN)
 GET    /api/rules/field-catalog               -> FieldCatalogEntry[]  (ADMIN)
-POST   /api/rules/test  {thresholdLogic, appliesTo, customerId?}
-                                              -> {matchedCount, sampleMatches[], degraded}  (ADMIN)
+POST   /api/rules/test  {ruleName, thresholdLogic, appliesTo, weight, customerId}
+                          -> {triggered, score, weight, rationale, matchedTransactions[],
+                              matchedCount, evaluatedTransactionCount, customerName, model,
+                              durationMs, notes[]}                                      (ADMIN)
+                          -> 504 TIMEOUT / 503 BUSY|UNAVAILABLE / 502 MODEL_ERROR|UNREADABLE_ANSWER,
+                             each problem+json with a `reason`. One model call, minutes long.
 
 GET    /api/knowledge/documents               -> KnowledgeDocument[]
 POST   /api/knowledge/documents  (multipart "file") -> KnowledgeDocument   (ADMIN, .docx/.pdf only)
@@ -322,8 +357,9 @@ JSON is camelCase (`customerId`, `riskLevel`, `scoreContribution`, `assessmentId
   * one with heavy crypto exposure to a mixer/privacy chain and no exchange name,
   * one with a burst of card declines then a large card-not-present success,
   * several ordinary, low-risk customers so LOW/MEDIUM outcomes are reachable.
-* **~10 risk rules** covering CARD / PAYMENT / CRYPTO / ALL, each with real `threshold_logic` JSON
-  in the DSL of section 3 and sensible `weight` values.
+* **~10 risk rules** covering CARD / PAYMENT / CRYPTO / ALL, each with a real natural-language
+  `threshold_logic` in the shape of section 3 — a concrete threshold, a window, the fields it needs
+  and why it matters — and sensible `weight` values.
 * **2-3 knowledge-base policy documents** (generate real .docx/.pdf under `docs/sample-knowledge/`)
   covering AML thresholds, sanctioned jurisdictions, and crypto risk policy, so RAG returns something.
 
@@ -351,13 +387,19 @@ src/
 * `vite.config.ts` proxies `/api` to `http://localhost:8080`.
 * Tailwind 4 is configured via the `@tailwindcss/vite` plugin + `@import "tailwindcss";` in `index.css`
   (there is no `tailwind.config.js` init step in v4).
-* **Rule editor** is a real visual builder: nested AND/OR/NOT groups, add/remove condition rows,
-  field dropdown driven by `/api/rules/field-catalog`, operator list filtered by the field's type,
-  value input typed to the field (number / text / multi-select for `IN` / date), a weight slider,
-  an `applies_to` selector, a live JSON preview pane, and a "Test rule" button hitting `/api/rules/test`.
-* The per-rule results table on the analysis page must visibly show **coverage**:
-  every applicable rule listed, triggered ones highlighted, and the source of each verdict
-  (`AGENT` vs `DETERMINISTIC_FALLBACK`) so a reviewer can see nothing was skipped.
+* **Rule editor** is an authoring surface for prose: an auto-growing condition textarea with a live
+  character counter and blocking validation (empty, < 20, > 2,000, pasted JSON), worked example
+  conditions, an advisory checklist (names a threshold / states a window / refers to data the agent
+  can fetch), a weight control that shows what the weight is worth against the whole catalogue, an
+  `applies_to` selector, the field catalog as a searchable reference panel that inserts a field path
+  at the caret, and a "Test rule" button hitting `/api/rules/test`. The test panel makes the wait
+  legible (it is a minutes-long model call) and states that the verdict is a judgement, not a
+  calculation.
+* The per-rule results table on the analysis page must visibly show **coverage**: every applicable
+  rule listed with its verdict, score and the agent's rationale, triggered ones highlighted, and the
+  count `N / N rules judged` so a reviewer can see nothing was skipped. Every verdict carries
+  `source = AGENT_JUDGED`; an incomplete coverage set is the reason a run is `FAILED`, and the table
+  says so rather than presenting it as a footnote.
 * Role-aware nav: admin-only sections hidden for operators and enforced server-side too.
 
 ---

@@ -101,7 +101,7 @@ export function AnalysisHistoryPage() {
   const elevated = rows.filter(
     (row) => row.riskLevel === 'HIGH' || row.riskLevel === 'CRITICAL',
   ).length
-  const agentComplete = completedRows.filter((row) => row.coverageComplete === true).length
+  const fullyJudged = completedRows.filter((row) => row.coverageComplete === true).length
   const customerName = customerQuery.data
     ? fullName(customerQuery.data.firstName, customerQuery.data.lastName)
     : null
@@ -180,9 +180,9 @@ export function AnalysisHistoryPage() {
             {row.coverageComplete === false ? (
               <Badge
                 tone="warning"
-                title="The deterministic engine backfilled at least one rule the agent left unevaluated."
+                title="The agent left at least one applicable rule unjudged, so this run is not a complete review."
               >
-                Backfilled
+                Incomplete
               </Badge>
             ) : null}
           </span>
@@ -306,9 +306,9 @@ export function AnalysisHistoryPage() {
           loading={loading}
         />
         <StatCard
-          label="Agent-complete coverage"
-          value={`${agentComplete} / ${completedRows.length}`}
-          hint="Runs needing no deterministic backfill"
+          label="Full rule coverage"
+          value={`${fullyJudged} / ${completedRows.length}`}
+          hint="Completed runs with every rule judged"
           icon={<ShieldCheck className="size-3.5" />}
           numeric
           loading={loading}

@@ -14,7 +14,6 @@ import com.sq.caa.domain.PaymentActivity;
 import com.sq.caa.domain.Transaction;
 import com.sq.caa.rules.AggregateSnapshot;
 import com.sq.caa.rules.EvaluationBatch;
-import com.sq.caa.rules.RuleEvaluator;
 import com.sq.caa.web.dto.CustomerDtos.CustomerActivitySummary;
 import com.sq.caa.web.dto.CustomerDtos.DailyAmount;
 import java.math.BigDecimal;
@@ -40,7 +39,7 @@ import org.springframework.context.annotation.Import;
  * The customer summary payload: its velocity block and its query budget.
  *
  * <p>Two things are pinned here. First, the six {@code agg.*} figures the operator reads must be the
- * ones the rule engine scores on - a divergence would have the UI contradict the verdict. Second,
+ * ones the agent reads through its tools - a divergence would have the UI contradict the verdict. Second,
  * the endpoint must issue a fixed number of statements: it used to load the timeline as entities,
  * which cost three extra selects per transaction because the nullable inverse to-one detail rows
  * cannot be proxied.
@@ -49,7 +48,7 @@ import org.springframework.context.annotation.Import;
         "spring.jpa.hibernate.ddl-auto=validate",
         "spring.jpa.properties.hibernate.generate_statistics=true"})
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
-@Import({CustomerService.class, RiskRuleService.class, ActivitySummaryService.class, RuleEvaluator.class})
+@Import({CustomerService.class, RiskRuleService.class, ActivitySummaryService.class})
 class ActivitySummaryServiceTest {
 
     /**

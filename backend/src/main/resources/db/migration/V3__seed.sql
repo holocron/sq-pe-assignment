@@ -905,57 +905,80 @@ INSERT INTO crypto_activity (transaction_id, blockchain, wallet_address_from, wa
 -- -----------------------------------------------------------------------------
 -- risk_rules
 --
--- threshold_logic is the shared rule DSL of the build spec: a group node has
--- {op, conditions[]}, a leaf has {field, operator, value}. Every field name below
--- comes from GET /api/rules/field-catalog, so all twelve rules parse strictly and
--- evaluate without degradation against the seeded activity.
+-- threshold_logic is NATURAL LANGUAGE - it is a prompt, not a program. The ReAct
+-- agent reads the condition, fetches the customer's activity with its tools and
+-- judges for itself whether the rule is triggered and what it should contribute.
+-- Nothing in the backend parses this text.
+--
+-- Each condition therefore has two jobs. It states WHAT to look for, in terms of
+-- the fields the agent can actually see (GET /api/rules/field-catalog is the
+-- authoritative list), with concrete thresholds and time windows so that two
+-- runs reach the same reading of the rule. And it states WHY the pattern is
+-- suspicious, because that is what lets the model judge a borderline case the
+-- way a compliance officer would rather than by matching keywords.
+--
+-- weight is the ceiling: the agent's score for a rule is its own estimate and is
+-- capped at the weight. Scores are consequently NOT reproducible run to run.
 -- -----------------------------------------------------------------------------
 INSERT INTO risk_rules (rule_id, rule_name, applies_to, threshold_logic, weight) VALUES
   ('7115e643-31c1-5552-82cb-fe870c7a3a6a', 'Large payment at or above the 10,000 reporting threshold', 'PAYMENT',
-   '{"op":"AND","conditions":[{"field":"amount","operator":"GTE","value":10000},{"field":"payment.payment_method","operator":"IN","value":["ACH","Wire","SWIFT"]}]}',
+   'A single payment whose amount is 10,000 or more, in the currency of the transaction, sent on one of the reportable rails - payment.payment_method of ACH, Wire or SWIFT. P2P transfers are out of scope for this rule.
+Why it matters: 10,000 is the reporting threshold in most jurisdictions, so a payment at or above it has to be documented and explained rather than merely processed. One declared large payment is ordinary business for a customer who has an obvious reason for it, so score near the full weight only when there are several, or when the beneficiary country or the receiving account look unrelated to anything else the customer does.',
    15.00);
 INSERT INTO risk_rules (rule_id, rule_name, applies_to, threshold_logic, weight) VALUES
   ('52ef4206-fff0-5637-85e0-e5d472d17c8a', 'Structuring - repeated payments just below the reporting threshold', 'PAYMENT',
-   '{"op":"AND","conditions":[{"field":"amount","operator":"BETWEEN","value":[8000,9999.99]},{"field":"agg.tx_count_24h","operator":"GTE","value":3},{"field":"agg.amount_sum_24h","operator":"GTE","value":20000}]}',
+   'Three or more payments, each between 8,000 and 9,999.99, inside any rolling 24-hour window, together totalling at least 20,000. Read the created_at timestamps and amounts of the payments themselves to confirm the window; agg.tx_count_24h and agg.amount_sum_24h are a useful hint but they count activity of every type, and this rule is about the payments only.
+Why it matters: this is structuring - one large transfer split into amounts that each stay under the 10,000 reporting threshold so that none of them is reported. The tell is the clustering just below the threshold within hours, not the total: a single payment of 9,500 is nothing, four of them in one afternoon is a deliberate attempt to stay invisible. Cite every payment in the cluster, and treat a pattern that repeats on several separate days as the clearest form of the offence.',
    30.00);
 INSERT INTO risk_rules (rule_id, rule_name, applies_to, threshold_logic, weight) VALUES
   ('abccb190-a26a-50bb-a093-97a441461415', 'Payment to a sanctioned or high-risk jurisdiction', 'PAYMENT',
-   '{"op":"OR","conditions":[{"field":"payment.receiver_bank_country","operator":"IN","value":["IR","KP","SY","RU","BY","AF","CU","MM","VE"]},{"op":"AND","conditions":[{"field":"payment.receiver_bank_country","operator":"IN","value":["PA","KY","SC","VG","BS","BZ"]},{"field":"amount","operator":"GT","value":25000}]}]}',
+   'Either of the following:
+(a) any payment, at any amount, whose payment.receiver_bank_country is IR, KP, SY, RU, BY, AF, CU, MM or VE;
+(b) a payment above 25,000 whose payment.receiver_bank_country is an offshore secrecy jurisdiction: PA, KY, SC, VG, BS or BZ.
+Why it matters: a transfer to a comprehensively sanctioned jurisdiction is a potential sanctions breach whatever its size, and it is the one finding that must never be missed - so (a) has no amount floor. Offshore secrecy centres are perfectly legal but obscure who ultimately receives the money, so they only become material at size, which is what (b) captures. Score at or near the full weight for the sanctioned list, especially where the payments repeat or are large; score lower for a single mid-size offshore payment.',
    35.00);
 INSERT INTO risk_rules (rule_id, rule_name, applies_to, threshold_logic, weight) VALUES
   ('7c52346c-90dd-5a06-8a66-e0b3697c2a52', 'High-value cross-border SWIFT wire', 'PAYMENT',
-   '{"op":"AND","conditions":[{"field":"payment.payment_method","operator":"EQ","value":"SWIFT"},{"field":"amount","operator":"GT","value":75000},{"field":"payment.receiver_bank_country","operator":"NEQ","value":"CH"}]}',
+   'A payment with payment.payment_method of SWIFT, whose amount is above 75,000 and whose payment.receiver_bank_country is not CH.
+Why it matters: SWIFT is the correspondent-banking rail, and above 75,000 a wire has left the retail pattern entirely. Cross-border means the funds pass beyond the reach of the sending bank, which combined with size is the classic layering step in a laundering chain. Judge the set rather than the single transfer: several such wires to different countries within one month is far stronger evidence than one wire to a country the customer plainly trades with.',
    25.00);
 INSERT INTO risk_rules (rule_id, rule_name, applies_to, threshold_logic, weight) VALUES
   ('319e3f9e-cb53-5658-ba38-ea8a88d1e170', 'Cross-border payment fan-out across many jurisdictions', 'PAYMENT',
-   '{"op":"AND","conditions":[{"field":"agg.distinct_countries_30d","operator":"GTE","value":5},{"field":"payment.payment_method","operator":"IN","value":["SWIFT","Wire"]},{"field":"amount","operator":"GT","value":10000}]}',
+   'A payment above 10,000 sent by SWIFT or Wire at a point where the customer has paid beneficiary banks in five or more distinct countries within the preceding 30 days. agg.distinct_countries_30d reports that count at each transaction; confirm it by listing the receiver bank countries of the payments in the window yourself before you rely on it.
+Why it matters: a retail customer normally pays into a small and stable set of countries. A fan-out across many jurisdictions inside a single month, at size, is how funds are layered - every individual hop is defensible and the pattern only exists across them. The finding is the spread, so cite the payments that establish it rather than only the newest one.',
    15.00);
 INSERT INTO risk_rules (rule_id, rule_name, applies_to, threshold_logic, weight) VALUES
   ('9b39a470-0727-599d-973e-da349a6818f9', 'Card-not-present success immediately after a decline burst', 'CARD',
-   '{"op":"AND","conditions":[{"field":"card.card_present","operator":"EQ","value":false},{"field":"status","operator":"EQ","value":"Completed"},{"field":"amount","operator":"GT","value":3000},{"field":"agg.failed_count_24h","operator":"GTE","value":4}]}',
+   'A completed card authorisation above 3,000 that was card-not-present (card.card_present is false) and that follows four or more failed authorisations by the same customer inside the preceding 24 hours. agg.failed_count_24h gives that count at the successful authorisation.
+Why it matters: a run of declines followed by a success is the signature of card testing - an attacker varies the amount, the card or the credentials until one authorisation goes through, and the one that goes through is the actual loss. Card-not-present matters because the card itself was never physically read, so the presence of the card proves nothing about the presence of its owner. Score the successful authorisation; the declines themselves are covered by the decline-velocity rule, so do not count them twice.',
    30.00);
 INSERT INTO risk_rules (rule_id, rule_name, applies_to, threshold_logic, weight) VALUES
   ('d4eb7c39-fc53-5d6e-b722-ea9a151075f8', 'Declined card authorisation velocity', 'CARD',
-   '{"op":"AND","conditions":[{"field":"card.decline_reason","operator":"NOT_NULL"},{"field":"agg.failed_count_24h","operator":"GTE","value":5}]}',
+   'Five or more failed card authorisations by the same customer inside any rolling 24-hour window. Failed authorisations carry status Failed and a populated card.decline_reason; agg.failed_count_24h counts them at each transaction.
+Why it matters: repeated declines mean somebody keeps presenting a card that the issuer keeps refusing. One or two isolated declines across three months are ordinary life; five within an afternoon are not. A run of different decline reasons - insufficient funds, do not honour, invalid CVV2, card velocity exceeded, suspected fraud - against the same merchant is the strongest form, because it shows the presenter working through the failure modes rather than hitting one limit. Judge the burst once and cite the declined authorisations that make it up.',
    20.00);
 INSERT INTO risk_rules (rule_id, rule_name, applies_to, threshold_logic, weight) VALUES
   ('291ce109-008c-5989-98b9-3289632b1656', 'High-risk merchant category spend', 'CARD',
-   '{"op":"AND","conditions":[{"field":"card.mcc_code","operator":"IN","value":["7995","6051","7273","4829","6211"]},{"field":"amount","operator":"GT","value":1000}]}',
+   'A card authorisation above 1,000 at a merchant whose category code (card.mcc_code) is 7995 (betting and wagering), 6051 (quasi-cash, money orders and crypto kiosks), 7273 (dating and escort services), 4829 (money transfer) or 6211 (securities brokers and dealers).
+Why it matters: these categories turn card credit into cash, or into instruments that are hard to follow afterwards, which is why they carry the highest chargeback and laundering rates in the scheme rules. The category on its own is not misconduct - people do gamble and do buy shares - so weigh the amount, whether the authorisation was card-not-present, and whether it is isolated or repeats. A single card-present bet is weak evidence; repeated card-not-present quasi-cash purchases are not.',
    15.00);
 INSERT INTO risk_rules (rule_id, rule_name, applies_to, threshold_logic, weight) VALUES
   ('a8553949-223d-528e-8eff-51fe15a604c4', 'Privacy-chain or mixer transfer with no attributed exchange', 'CRYPTO',
-   '{"op":"AND","conditions":[{"op":"OR","conditions":[{"field":"crypto.blockchain","operator":"IN","value":["XMR","ZEC","DASH"]},{"field":"crypto.wallet_address_to","operator":"IN","value":["0x8589427373D6D84E98730D7795D8f6f8731FDA16","0x722122dF12D4e14e13Ac3b6895a86e84145b6967","0xDD4c48C0B24039969fC16D1cdF626eaB821d3384","bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h"]}]},{"field":"crypto.exchange_name","operator":"IS_NULL"}]}',
+   'A crypto transfer that has no counterparty exchange recorded (crypto.exchange_name is empty) and that either settles on a privacy chain - crypto.blockchain of XMR, ZEC or DASH - or has a crypto.wallet_address_to that is one of these known mixer addresses: 0x8589427373D6D84E98730D7795D8f6f8731FDA16, 0x722122dF12D4e14e13Ac3b6895a86e84145b6967, 0xDD4c48C0B24039969fC16D1cdF626eaB821d3384, bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h.
+Why it matters: a privacy coin is engineered so that the flow of funds cannot be followed, and a mixer exists for no purpose other than to break the link between where money came from and where it went. With no regulated exchange on the other side, there is also nobody who has identified the counterparty. Together that removes every means of tracing the money, which is why this is the heaviest rule in the set. Repeated transfers, and repeated transfers to the same unattributed destination, deserve the full weight; a single small privacy-chain transfer deserves less.',
    40.00);
 INSERT INTO risk_rules (rule_id, rule_name, applies_to, threshold_logic, weight) VALUES
   ('7dfddeca-4497-52bf-a1fa-5fcb6e3941fc', 'Concentrated high-value crypto exposure', 'CRYPTO',
-   '{"op":"AND","conditions":[{"field":"agg.crypto_ratio_30d","operator":"GTE","value":0.7},{"field":"amount","operator":"GT","value":5000}]}',
+   'A crypto transfer above 5,000 by a customer whose recent activity is dominated by crypto - agg.crypto_ratio_30d of 0.70 or more, meaning at least 70 percent of the transactions in the preceding 30 days were crypto.
+Why it matters: concentration is not itself wrongdoing, but a customer whose relationship with the bank is almost entirely crypto has no ordinary card and payment activity to be compared against, so the usual behavioural baselines do not apply and every other signal has to be read more strictly. Score this modestly on its own: it is the context that makes the other crypto findings heavier, not a finding in its own right.',
    20.00);
 INSERT INTO risk_rules (rule_id, rule_name, applies_to, threshold_logic, weight) VALUES
   ('d86aeeaa-1ea6-50a1-ac6b-5362543b42f8', 'High-value activity outside normal business hours', 'ALL',
-   '{"op":"AND","conditions":[{"field":"hour_of_day","operator":"BETWEEN","value":[0,5]},{"field":"amount","operator":"GT","value":15000}]}',
+   'Any transaction, of any activity type, above 15,000 that was booked between 00:00 and 05:59 UTC. hour_of_day gives the UTC hour of each transaction.
+Why it matters: payments and large transfers are normally instructed during the working day of the customer who instructs them. A five-figure transfer in the small hours is either automated or timed for when the desk that would query it is closed. Crypto markets genuinely run around the clock, so an off-hours crypto transfer is weaker evidence than an off-hours wire; say which it is in your reasoning, and note the customer country when the hour looks unremarkable in their own time zone.',
    10.00);
 INSERT INTO risk_rules (rule_id, rule_name, applies_to, threshold_logic, weight) VALUES
   ('9210f1fa-98e4-59f4-bcc8-dc0d967e14bb', 'Transaction velocity and value spike within 24 hours', 'ALL',
-   '{"op":"AND","conditions":[{"field":"agg.tx_count_24h","operator":"GTE","value":8},{"field":"agg.amount_sum_24h","operator":"GT","value":40000}]}',
+   'Eight or more transactions of any type by the same customer inside a rolling 24-hour window, where the total amount across that same window is also above 40,000. Both parts must hold at the same transaction: agg.tx_count_24h of 8 or more together with agg.amount_sum_24h above 40,000.
+Why it matters: a burst of activity that is also a large sum is a change of behaviour rather than a busy day, and it is what an account being emptied, or used as a pass-through, looks like from the outside. The two halves are needed together - eight small card purchases are not a spike, and one large wire on a quiet day is the business of other rules. Cite the transactions in the window, and say which day it was.',
    20.00);
-

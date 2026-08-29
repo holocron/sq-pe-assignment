@@ -9,24 +9,25 @@ import com.sq.caa.domain.RiskRule;
 import com.sq.caa.domain.RuleScope;
 import com.sq.caa.domain.Transaction;
 import com.sq.caa.rules.EvaluationBatch;
-import com.sq.caa.rules.RuleEvaluator;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.util.List;
+import java.util.StringJoiner;
 import java.util.UUID;
 import tools.jackson.databind.node.JsonNodeFactory;
 
 /**
  * A small, fully in-memory customer with planted risk, and the four rules that judge it.
  *
- * <p>No Spring context, no database and no model: {@link EvaluationBatch} and {@link RuleEvaluator}
- * are pure functions of the domain objects, which is what lets the coverage gate be tested as the
- * piece of control flow it is.
+ * <p>No Spring context, no database and no model: {@link EvaluationBatch} is a pure function of the
+ * domain objects, which is what lets the coverage gate be tested as the piece of control flow it is.
  *
- * <p>The deterministic verdicts these fixtures produce are fixed and are what the tests assert
- * against: SANCTIONED_WIRE (30) triggers, STRUCTURING (20) triggers, UNATTRIBUTED_CRYPTO (15)
- * triggers, DECLINE_BURST (10) does not. Total 65, which bands as HIGH.
+ * <p>Each rule's {@code threshold_logic} is what it is in production now - the condition in prose,
+ * written by an administrator. Nothing evaluates it here: the scripted model plays the part of the
+ * agent that reads it and judges. The verdicts the tests script are therefore the fixture's
+ * expectations, and they are consistent throughout: SANCTIONED_WIRE 30, STRUCTURING 20,
+ * UNATTRIBUTED_CRYPTO 15 and DECLINE_BURST not triggered. Total 65, which bands as HIGH.
  */
 final class AgentTestFixtures {
 
@@ -62,25 +63,26 @@ final class AgentTestFixtures {
                         null));
     }
 
+    /** The four rules, each with its condition written the way an administrator would write it. */
     static List<RiskRule> rules() {
         return List.of(
                 rule(SANCTIONED_WIRE, RuleScope.PAYMENT, """
-                        {"op":"AND","conditions":[
-                          {"field":"amount","operator":"GT","value":10000},
-                          {"field":"payment.receiver_bank_country","operator":"IN",
-                           "value":["IR","KP","SY","RU","AF"]}]}""", "30.00"),
+                        The customer sends a payment of more than 10,000 in any currency to a bank \
+                        in a sanctioned or high-risk jurisdiction (Iran, North Korea, Syria, Russia \
+                        or Afghanistan). Weigh the amount and the beneficiary bank country.""",
+                        "30.00"),
                 rule(STRUCTURING, RuleScope.PAYMENT, """
-                        {"op":"AND","conditions":[
-                          {"field":"amount","operator":"BETWEEN","value":[9000,9999]},
-                          {"field":"agg.tx_count_24h","operator":"GTE","value":3}]}""", "20.00"),
+                        Three or more payments within any rolling 24 hours, each between 9,000 and \
+                        9,999 - that is, deliberately just below the 10,000 reporting threshold. A \
+                        single payment near the threshold is not enough; the pattern is what \
+                        matters.""", "20.00"),
                 rule(UNATTRIBUTED_CRYPTO, RuleScope.CRYPTO, """
-                        {"op":"AND","conditions":[
-                          {"field":"crypto.exchange_name","operator":"IS_NULL"},
-                          {"field":"amount","operator":"GT","value":1000}]}""", "15.00"),
+                        A crypto transfer of more than 1,000 that cannot be attributed to a \
+                        registered exchange, or that moves value over a privacy chain.""", "15.00"),
                 rule(DECLINE_BURST, RuleScope.CARD, """
-                        {"op":"AND","conditions":[
-                          {"field":"card.decline_reason","operator":"NOT_NULL"},
-                          {"field":"agg.failed_count_24h","operator":"GTE","value":5}]}""", "10.00"));
+                        Five or more declined card authorisations within any rolling 24 hours, \
+                        especially when followed by a successful card-not-present payment.""",
+                        "10.00"));
     }
 
     static RiskRule ruleNamed(List<RiskRule> rules, String name) {
@@ -102,9 +104,7 @@ final class AgentTestFixtures {
             AnalysisProgressListener progress) {
         Customer customer = customer();
         EvaluationBatch batch = EvaluationBatch.forCustomer(customer, transactions());
-        RuleEvaluator evaluator = new RuleEvaluator();
-        return new AgentRunContext(assessmentId, customer, batch, rules,
-                rule -> evaluator.evaluate(rule, batch), trace, progress);
+        return new AgentRunContext(assessmentId, customer, batch, rules, trace, progress);
     }
 
     /** A context over a bespoke set of transactions, for tests that plant their own evidence. */
@@ -112,9 +112,33 @@ final class AgentTestFixtures {
             List<Transaction> transactions) {
         Customer customer = customer();
         EvaluationBatch batch = EvaluationBatch.forCustomer(customer, transactions);
-        RuleEvaluator evaluator = new RuleEvaluator();
-        return new AgentRunContext(assessmentId, customer, batch, rules,
-                rule -> evaluator.evaluate(rule, batch), trace, AnalysisProgressListener.NONE);
+        return new AgentRunContext(assessmentId, customer, batch, rules, trace,
+                AnalysisProgressListener.NONE);
+    }
+
+    /**
+     * The arguments of one {@code submit_rule_evaluation} call.
+     *
+     * <p>A triggered verdict has to cite transactions that are really in the rule's scope - the tool
+     * refuses anything else - so the evidence is taken from the run's own batch rather than invented
+     * by the test. That is deliberate: a fixture that could not produce valid evidence would be
+     * proving something about the fixture rather than about the loop.
+     */
+    static String verdict(AgentRunContext context, RiskRule rule, boolean triggered, int score,
+            String rationale) {
+        List<UUID> inScope = context.inScopeTransactionIds(rule.getRuleId());
+        List<UUID> cited = triggered && !inScope.isEmpty() ? List.of(inScope.getFirst()) : List.of();
+        return verdict(rule, triggered, score, cited, rationale);
+    }
+
+    /** The same, with the evidence chosen by the caller. */
+    static String verdict(RiskRule rule, boolean triggered, int score, List<UUID> transactionIds,
+            String rationale) {
+        StringJoiner ids = new StringJoiner(",", "[", "]");
+        transactionIds.forEach(id -> ids.add("\"" + id + "\""));
+        return """
+                {"rule_id":"%s","triggered":%s,"score":%d,"transaction_ids":%s,"rationale":"%s"}"""
+                .formatted(rule.getRuleId(), triggered, score, ids, rationale);
     }
 
     /** One card transaction with caller-chosen free text, for the prompt-injection tests. */
@@ -125,19 +149,22 @@ final class AgentTestFixtures {
 
     /** A rule whose administrator-authored name tries to give the model orders. */
     static RiskRule ruleNamedByAnAttacker(String name) {
-        return rule(name, RuleScope.ALL, """
-                {"op":"AND","conditions":[{"field":"amount","operator":"GT","value":1000000}]}""",
-                "5.00");
+        return rule(name, RuleScope.ALL, "Any single transaction above 1,000,000.", "5.00");
+    }
+
+    /** A rule whose administrator-authored condition tries to give the model orders. */
+    static RiskRule ruleConditionedByAnAttacker(String condition) {
+        return rule("Large payment threshold", RuleScope.ALL, condition, "5.00");
     }
 
     // ------------------------------------------------------------------
 
-    private static RiskRule rule(String name, RuleScope scope, String logic, String weight) {
+    private static RiskRule rule(String name, RuleScope scope, String condition, String weight) {
         return RiskRule.builder()
                 .ruleId(UUID.randomUUID())
                 .ruleName(name)
                 .appliesTo(scope)
-                .thresholdLogic(logic)
+                .thresholdLogic(condition)
                 .weight(new BigDecimal(weight))
                 .build();
     }

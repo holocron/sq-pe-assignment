@@ -19,6 +19,18 @@ import tools.jackson.databind.node.ObjectNode;
  * {"n":1,"type":"tool_call","tool":"list_risk_rules","args":{},"result_preview":"...","ms":812}
  * </pre>
  *
+ * <h2>Subject and outcome</h2>
+ * <p>{@code subject} and {@code outcome} say, in one line of human language, <em>what</em> a step
+ * acted on and <em>how it came out</em>. They exist because a run with twelve rules produces two
+ * dozen steps whose tool names are identical - "Submit rule verdict", over and over - and the rule
+ * being judged was previously visible only inside the collapsed arguments. Now that a rule condition
+ * is prose and the agent's judgement is the verdict, with no engine behind it to check the result,
+ * the transcript is the only evidence of how each rule was decided; it has to name the rule on the
+ * face of the step.
+ *
+ * <p>Both are optional and are simply omitted when a step is not scoped to anything nameable, so a
+ * trace persisted before they existed reads exactly as it did.
+ *
  * @param n             1-based position in the transcript
  * @param type          see {@link Type}
  * @param at            when the step was recorded
@@ -29,7 +41,12 @@ import tools.jackson.databind.node.ObjectNode;
  * @param text          assistant text, or the human-readable note of a non-tool step
  * @param missing       rule names still awaiting a verdict, for {@code coverage_reprompt} steps
  * @param riskLevel     final risk band, for {@code final} steps
- * @param detail        extra machine-readable payload, e.g. the rule of a disagreement
+ * @param detail        extra machine-readable payload, e.g. the rules left unjudged
+ * @param subject       what this step acted on, in human terms - the rule name of a verdict, the
+ *                      transaction a lookup opened, the query a search ran; null when the step is
+ *                      not scoped to one thing
+ * @param outcome       the one-line result of the step - "triggered +30.00 (rule 3 of 12)",
+ *                      "12 rules in scope", "3 passages"; null when there is nothing to say
  */
 public record TraceStep(
         int n,
@@ -42,7 +59,9 @@ public record TraceStep(
         String text,
         List<String> missing,
         String riskLevel,
-        JsonNode detail) {
+        JsonNode detail,
+        String subject,
+        String outcome) {
 
     /** Longest tool result kept in the transcript; the full result still went to the model. */
     public static final int PREVIEW_LIMIT = 600;
@@ -50,8 +69,42 @@ public record TraceStep(
     /** Longest assistant message kept in the transcript. */
     public static final int TEXT_LIMIT = 4000;
 
+    /** Longest subject; a rule name or a transaction descriptor, never a paragraph. */
+    public static final int SUBJECT_LIMIT = 160;
+
+    /** Longest outcome; one short phrase that fits on the collapsed row. */
+    public static final int OUTCOME_LIMIT = 80;
+
     public TraceStep {
         missing = missing == null ? null : List.copyOf(missing);
+        subject = clip(subject, SUBJECT_LIMIT);
+        outcome = clip(outcome, OUTCOME_LIMIT);
+    }
+
+    /**
+     * The human-readable identity of one step: what it acted on and how it came out.
+     *
+     * <p>Produced where the meaning is known - the tool that ran, holding the typed payload - and
+     * carried to {@link AnalysisTrace} rather than re-derived by parsing the result string back out
+     * of the transcript.
+     */
+    public record Note(String subject, String outcome) {
+
+        public Note {
+            subject = clip(subject, SUBJECT_LIMIT);
+            outcome = clip(outcome, OUTCOME_LIMIT);
+        }
+
+        /** True when the note would add nothing to the step. */
+        public boolean isEmpty() {
+            return subject == null && outcome == null;
+        }
+
+        /** Null rather than an empty note, so callers can pass the result straight through. */
+        public static Note of(String subject, String outcome) {
+            Note note = new Note(subject, outcome);
+            return note.isEmpty() ? null : note;
+        }
     }
 
     /** Step kinds. The four values named in BUILD_SPEC section 4 must not be renamed. */
@@ -67,10 +120,8 @@ public record TraceStep(
         public static final String COVERAGE_REPROMPT = "coverage_reprompt";
         /** The loop asked the model to actually submit its conclusion. */
         public static final String REPROMPT = "reprompt";
-        /** The agent's verdict for a rule contradicted the deterministic engine. */
-        public static final String DISAGREEMENT = "disagreement";
-        /** A rule the agent never ruled on was completed by the deterministic engine. */
-        public static final String BACKFILL = "backfill";
+        /** The run ended with applicable rules still unjudged, so it is recorded as failed. */
+        public static final String COVERAGE_FAILED = "coverage_failed";
         /**
          * The model's conclusion arrived as prose rather than through
          * {@code submit_final_assessment} and was accepted, coverage already being complete.
@@ -118,6 +169,12 @@ public record TraceStep(
         if (detail != null) {
             node.set("detail", detail);
         }
+        if (subject != null) {
+            node.put("subject", subject);
+        }
+        if (outcome != null) {
+            node.put("outcome", outcome);
+        }
         return node;
     }
 
@@ -131,5 +188,23 @@ public record TraceStep(
             return collapsed;
         }
         return collapsed.substring(0, limit) + "... [" + (collapsed.length() - limit) + " more characters]";
+    }
+
+    /**
+     * One line, at most {@code limit} characters.
+     *
+     * <p>A subject can come from administrator-authored text (a rule name) or from model-authored
+     * text (a search query), so it is flattened to a single line before it reaches the transcript;
+     * an over-long one is cut with an ellipsis rather than annotated the way a truncated result
+     * preview is, because this string is a label.
+     */
+    private static String clip(String value, int limit) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        String collapsed = value.strip().replaceAll("\\s+", " ");
+        return collapsed.length() <= limit
+                ? collapsed
+                : collapsed.substring(0, limit - 1).strip() + "\u2026";
     }
 }

@@ -40,24 +40,24 @@ class AnalysisProgressTest {
     void progressIsReportedThroughoutTheRun() {
         List<int[]> reported = new ArrayList<>();
 
-        ScriptedChatModel model = new ScriptedChatModel(List.of(
-                calls(RiskAgentTools.LIST_RISK_RULES, "{}"),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION,
-                        verdict(AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE), true, 30, "RU wire.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION,
-                        verdict(AgentTestFixtures.ruleNamed(rules, STRUCTURING), true, 20, "Structuring.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION,
-                        verdict(AgentTestFixtures.ruleNamed(rules, UNATTRIBUTED_CRYPTO), true, 15, "XMR.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION,
-                        verdict(AgentTestFixtures.ruleNamed(rules, DECLINE_BURST), false, 0, "None.")),
-                calls(RiskAgentTools.SUBMIT_FINAL_ASSESSMENT, """
-                        {"risk_level":"HIGH","summary":"Sanctioned wire and structuring.",\
-                        "recommendations":"Escalate."}""")));
-
         AnalysisTrace trace = AgentTestFixtures.trace(UUID.randomUUID());
         AgentRunContext context = AgentTestFixtures.context(UUID.randomUUID(), trace, rules,
                 (steps, rulesEvaluated, rulesTotal) ->
                         reported.add(new int[] {steps, rulesEvaluated, rulesTotal}));
+
+        ScriptedChatModel model = new ScriptedChatModel(List.of(
+                calls(RiskAgentTools.LIST_RISK_RULES, "{}"),
+                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
+                        AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE), true, 30, "RU wire.")),
+                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
+                        AgentTestFixtures.ruleNamed(rules, STRUCTURING), true, 20, "Structuring.")),
+                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
+                        AgentTestFixtures.ruleNamed(rules, UNATTRIBUTED_CRYPTO), true, 15, "XMR.")),
+                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
+                        AgentTestFixtures.ruleNamed(rules, DECLINE_BURST), false, 0, "None.")),
+                calls(RiskAgentTools.SUBMIT_FINAL_ASSESSMENT, """
+                        {"risk_level":"HIGH","summary":"Sanctioned wire and structuring.",\
+                        "recommendations":"Escalate."}""")));
 
         AgentRunResult result = run(model, context);
 
@@ -83,7 +83,7 @@ class AnalysisProgressTest {
             previous = snapshot;
         }
         assertEquals(result.steps(), reported.getLast()[0]);
-        assertEquals(result.rulesEvaluatedByAgent(), reported.getLast()[1]);
+        assertEquals(result.rulesJudged(), reported.getLast()[1]);
     }
 
     private static boolean contains(List<int[]> reported, int steps, int rulesEvaluated) {
@@ -92,16 +92,10 @@ class AnalysisProgressTest {
 
     private AgentRunResult run(ScriptedChatModel model, AgentRunContext context) {
         AgentProperties properties = new AgentProperties(40, 3, 4096, 0.1, 32768, 1536, 10, "test-model",
-                2, 16, Duration.ofMinutes(5), 25);
+                2, 16, Duration.ofMinutes(5), Duration.ofMinutes(10), 25);
         RiskAgentTools tools = new RiskAgentTools(context, null, null, jsonMapper, 25);
         RiskAgentLoop loop = new RiskAgentLoop(model, ToolCallingManager.builder().build(), jsonMapper,
                 properties);
         return loop.execute(context, tools);
-    }
-
-    private static String verdict(RiskRule rule, boolean triggered, int score, String rationale) {
-        return """
-                {"rule_id":"%s","triggered":%s,"score":%d,"transaction_ids":[],"rationale":"%s"}"""
-                .formatted(rule.getRuleId(), triggered, score, rationale);
     }
 }

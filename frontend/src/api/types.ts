@@ -1,9 +1,14 @@
 /**
  * Wire types for the Customer Activity Analytics REST API.
  *
- * These mirror BUILD_SPEC.md section 5 (REST contract), section 3 (risk rule
- * DSL) and section 4 (ReAct trace). JSON is camelCase, ids are UUID strings and
- * timestamps are ISO-8601 UTC strings unless noted otherwise.
+ * These mirror the REST contract and the ReAct trace. JSON is camelCase, ids
+ * are UUID strings and timestamps are ISO-8601 UTC strings unless noted
+ * otherwise.
+ *
+ * `threshold_logic` holds natural language: the agent reads the rule condition,
+ * fetches the customer's data with its tools and judges it. Nothing parses that
+ * column and nothing recomputes a verdict, so every score on these pages is a
+ * model's estimate, capped at the rule's weight.
  *
  * Anything that arrives in a shape the backend may serialise differently
  * (Spring `Page`, the trace JSONB, the per-type activity detail) has a `*Wire`
@@ -53,8 +58,15 @@ export type TransactionStatus = (typeof TRANSACTION_STATUSES)[number]
 export const ANALYSIS_STATUSES = ['RUNNING', 'COMPLETED', 'FAILED'] as const
 export type AnalysisStatus = (typeof ANALYSIS_STATUSES)[number]
 
-/** Where a rule verdict came from — rendered on the coverage table. */
-export const EVALUATION_SOURCES = ['AGENT', 'DETERMINISTIC_FALLBACK'] as const
+/**
+ * Where a rule verdict came from — rendered on the coverage table.
+ *
+ * There is exactly one origin: `threshold_logic` is natural language, the agent
+ * reads it, fetches the evidence and judges it. Nothing recomputes or overrules
+ * that verdict, so the value is kept (and shown) to tell a reviewer plainly that
+ * what they are reading is a model's judgement rather than a calculation.
+ */
+export const EVALUATION_SOURCES = ['AGENT_JUDGED'] as const
 export type EvaluationSource = (typeof EVALUATION_SOURCES)[number]
 
 export const KNOWLEDGE_DOCUMENT_STATUSES = [
@@ -168,7 +180,7 @@ export interface Customer {
   fullName?: string | null
   dob: IsoDate | null
   country: string
-  /** Derived server-side from `dob` (also exposed as `customer.age` in the DSL). */
+  /** Derived server-side from `dob`; also a field of the rule-editor catalog. */
   age?: number | null
   transactionCount?: number | null
   analysisCount?: number | null
@@ -289,12 +301,13 @@ export interface ActivitySummaryWire {
   distinctCurrencies: number
   distinctCounterpartyCountries: number
   /**
-   * The same `agg.*` values the rule engine scores on, taken verbatim from the
-   * customer's evaluation batch. Each is the PEAK of its rolling window over
-   * the customer's whole history (the server folds every per-transaction
-   * snapshot with `max`), which is the figure a threshold rule was measured
-   * against. They are not readings for the last 24 hours or 30 days, and there
-   * is no single instant they are "as of" — the UI must label them as peaks.
+   * The same `agg.*` values the agent reads through its tools, taken verbatim
+   * from the customer's evaluation batch. Each is the PEAK of its rolling window
+   * over the customer's whole history (the server folds every per-transaction
+   * snapshot with `max`), which is the figure a rule condition naming a
+   * threshold is judged against. They are not readings for the last 24 hours or
+   * 30 days, and there is no single instant they are "as of" — the UI must label
+   * them as peaks.
    */
   txCount24h: number
   amountSum24h: number
@@ -408,163 +421,195 @@ export interface ActivityQueryParams extends PageParams {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Risk rules and the threshold DSL (BUILD_SPEC section 3)                     */
+/* Risk rules — `threshold_logic` is natural language                          */
 /* -------------------------------------------------------------------------- */
 
-export const RULE_GROUP_OPS = ['AND', 'OR', 'NOT'] as const
-export type RuleGroupOp = (typeof RULE_GROUP_OPS)[number]
-
-export const RULE_OPERATORS = [
-  'GT',
-  'GTE',
-  'LT',
-  'LTE',
-  'EQ',
-  'NEQ',
-  'IN',
-  'NOT_IN',
-  'CONTAINS',
-  'NOT_CONTAINS',
-  'BETWEEN',
-  'IS_NULL',
-  'NOT_NULL',
-  'MATCHES',
-] as const
-export type RuleOperator = (typeof RULE_OPERATORS)[number]
-
-export type RuleScalar = string | number | boolean
-/** `IN`/`NOT_IN` take a list, `BETWEEN` a 2-element list, `IS_NULL`/`NOT_NULL` nothing. */
-export type RuleValue = RuleScalar | RuleScalar[] | null
-
-/** Leaf node: `{ field, operator, value }`. */
-export interface RuleCondition {
-  field: string
-  operator: RuleOperator
-  value?: RuleValue
-}
-
-/** Group node: `{ op, conditions[] }`. Nesting is unbounded. */
-export interface RuleGroup {
-  op: RuleGroupOp
-  conditions: RuleNode[]
-}
-
 /**
- * Recursive discriminated union backing the visual rule editor. Narrow with
- * `isRuleGroup(node)` / `isRuleCondition(node)` from `lib/rules`.
+ * `risk_rules.threshold_logic` is prose, not a machine-parseable expression.
+ * The ReAct agent reads it verbatim, fetches the customer's data with its tools
+ * and judges whether the rule is triggered and what score it contributes.
+ *
+ * Two consequences the UI must never hide:
+ *  - the score for a rule is the agent's *estimate*, capped at `weight`;
+ *  - two runs over identical data may reach different verdicts.
  */
-export type RuleNode = RuleGroup | RuleCondition
-
 export interface RiskRule {
   ruleId: UUID
   ruleName: string
   appliesTo: RuleScope
-  thresholdLogic: RuleNode
+  /** The rule condition in plain English, exactly as the agent receives it. */
+  thresholdLogic: string
   weight: number
 }
 
-/** `thresholdLogic` may arrive as a JSON string because the column is TEXT. */
+/** `weight` is DECIMAL(5,2), so Jackson may serialise it as a string. */
 export interface RiskRuleWire {
   ruleId: UUID
   ruleName: string
   appliesTo: RuleScope
-  thresholdLogic: RuleNode | string | null
+  thresholdLogic?: string | null
   weight: number | string
 }
 
 export interface RiskRuleInput {
   ruleName: string
   appliesTo: RuleScope
-  thresholdLogic: RuleNode
+  thresholdLogic: string
   weight: number
 }
 
-export const FIELD_TYPES = [
-  'number',
-  'string',
-  'enum',
-  'boolean',
-  'datetime',
-  'date',
-] as const
-/** Editor-side field type. Lowercase — see `FieldCatalogEntryWire.type`. */
-export type FieldType = (typeof FIELD_TYPES)[number]
+/** `risk_rules.rule_name` is VARCHAR(160). */
+export const RULE_NAME_MAX_LENGTH = 160
 
 /**
- * `GET /api/rules/field-catalog` exactly as the backend serialises it
- * (`RuleDtos.FieldCatalogEntry`). Verified live: 26 entries, `type` is the Java
- * enum name in UPPER CASE (`NUMBER | STRING | ENUM | BOOLEAN | DATETIME`), the
- * allowed enum members arrive under `options` (not `values`), the prose is
- * `description` (not `notes`), and every entry carries the authoritative list
- * of `operators` the backend will accept for that field.
+ * Character budget for a condition. The column is TEXT, so these mirror the
+ * backend's `@Size(min = 20, max = 2000)` on `RuleUpsertRequest` rather than a
+ * storage limit — the editor counts against them locally and still surfaces the
+ * server's own field error if the two ever drift apart.
  *
- * `normalizeFieldCatalogEntry` in `api/rules` maps this onto the editor shape.
+ * The minimum is not pedantry: a one-word condition is not something a model can
+ * judge, and it would still count against a run's coverage.
+ */
+export const RULE_CONDITION_MAX_LENGTH = 2000
+export const RULE_CONDITION_MIN_LENGTH = 20
+
+/** `weight` is DECIMAL(5,2), and the backend rejects anything outside this. */
+export const RULE_WEIGHT_MIN = 0.01
+export const RULE_WEIGHT_MAX = 999.99
+
+/* -------------------------------------------------------------------------- */
+/* Field catalog — GET /api/rules/field-catalog                                */
+/* -------------------------------------------------------------------------- */
+
+export const FIELD_TYPES = ['number', 'string', 'enum', 'boolean', 'datetime', 'date'] as const
+/** Editor-side field type, lowercase — see `FieldCatalogEntryWire.type`. */
+export type FieldType = (typeof FIELD_TYPES)[number]
+
+/** Reference-panel grouping, in the order the panel renders them. */
+export const FIELD_CATEGORIES = [
+  'transaction',
+  'customer',
+  'card',
+  'payment',
+  'crypto',
+  'aggregate',
+] as const
+export type FieldCategory = (typeof FIELD_CATEGORIES)[number]
+
+/**
+ * `GET /api/rules/field-catalog` as it arrives on the wire
+ * (`RuleDtos.FieldCatalogEntry`).
+ *
+ * Every key except `field` is optional here on purpose: a reference panel that
+ * renders a field with a missing label is far better than one that crashes.
+ * `type` arrives as the Java enum name in UPPER CASE and `category` as a
+ * lower-case string; when the category is missing `api/rules` derives it from
+ * the field path (`agg.*` -> aggregate, `card.*` -> card, ...).
  */
 export interface FieldCatalogEntryWire {
   field: string
   label?: string | null
-  type: string
+  type?: string | null
+  category?: string | null
   appliesTo?: RuleScope | null
-  operators?: string[] | null
+  /** Known values of an enumerated field; empty when it is free-form. */
   options?: string[] | null
-  optionsClosed?: boolean | null
   nullable?: boolean | null
   description?: string | null
+  /** A short sample value, e.g. `12500.00`. */
+  example?: string | null
 }
 
-/** Normalised catalog entry — what the visual rule editor consumes. */
+/** Normalised catalog entry — what the "available data" panel renders. */
 export interface FieldCatalogEntry {
   field: string
+  /** Human label; falls back to a title-cased form of the field path. */
+  label: string
   type: FieldType
-  /** Human label; falls back to the field path when absent. */
-  label?: string | null
-  /** Prose description of the field (wire: `description`). */
-  notes?: string | null
-  /** Allowed values for `enum` fields (wire: `options`). */
-  values?: string[] | null
-  /** True when `values` is exhaustive, so free text must be rejected. */
-  valuesClosed?: boolean | null
-  /** The operators the backend accepts for this field — authoritative. */
-  operators?: RuleOperator[] | null
-  /** Activity scope the field is available on. */
-  appliesTo?: RuleScope | null
-  nullable?: boolean | null
-  /** Optional grouping hint, e.g. `card`, `payment`, `agg`. */
-  group?: string | null
+  category: FieldCategory
+  /** Activity scope the field exists on; `ALL` when it is always available. */
+  appliesTo: RuleScope
+  description: string | null
+  /** Allowed or suggested values; empty when the field is free-form. */
+  options: string[]
+  nullable: boolean
+  example: string | null
 }
 
+/* -------------------------------------------------------------------------- */
+/* Rule test — POST /api/rules/test                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A dry run of one draft rule against one customer. The backend answers by
+ * asking the model to judge the condition, so this is a slow call (tens of
+ * seconds) and a customer is mandatory — there is nothing to judge without one.
+ */
 export interface RuleTestRequest {
-  thresholdLogic: RuleNode
+  ruleName: string
+  thresholdLogic: string
   appliesTo: RuleScope
-  customerId?: UUID | null
+  weight: number
+  customerId: UUID
+}
+
+export interface RuleTestMatchWire {
+  transactionId: UUID
+  activityType?: ActivityType | null
+  amount?: number | string | null
+  currency?: string | null
+  status?: string | null
+  createdAt?: IsoDateTime | null
+  /** The model's note on why it counted this transaction. */
+  reason?: string | null
 }
 
 export interface RuleTestMatch {
   transactionId: UUID
-  customerId?: UUID
-  customerName?: string | null
-  activityType?: ActivityType
-  amount?: number
-  currency?: string
-  status?: string
-  createdAt?: IsoDateTime
-  /** Per-leaf trace of why the row matched, e.g. `(amount=12500 GT 10000 [true])`. */
-  explanation?: string | null
+  activityType: ActivityType | null
+  amount: number | null
+  currency: string | null
+  status: string | null
+  createdAt: IsoDateTime | null
+  reason: string | null
 }
 
-/** `POST /api/rules/test` — `RuleDtos.RuleTestResponse`. */
+/**
+ * `RuleDtos.RuleTestResponse`. `matchedCount` is the number of transactions the
+ * model cited, which can exceed `matchedTransactions` when the backend truncates
+ * the evidence it returns — the panel says so rather than under-reporting.
+ */
+export interface RuleTestResultWire {
+  triggered?: boolean | null
+  /** The model's estimated contribution, capped at the rule's weight. */
+  score?: number | string | null
+  weight?: number | string | null
+  rationale?: string | null
+  matchedTransactions?: RuleTestMatchWire[] | null
+  matchedCount?: number | null
+  evaluatedTransactionCount?: number | null
+  customerName?: string | null
+  model?: string | null
+  durationMs?: number | null
+  /** Corrections and caveats: evidence truncated, ids dropped, score capped. */
+  notes?: string[] | null
+}
+
+/** Canonical verdict handed to the tester panel. */
 export interface RuleTestResult {
+  triggered: boolean
+  score: number | null
+  weight: number | null
+  rationale: string | null
+  matches: RuleTestMatch[]
   matchedCount: number
-  sampleMatches: RuleTestMatch[]
-  /** True when a leaf could not be evaluated (unknown field / type mismatch). */
-  degraded: boolean
-  evaluatedCount?: number | null
-  customerCount?: number | null
-  /**
-   * The concrete degradation reasons the evaluator collected, e.g.
-   * `"'card.decline_reason' has no value on at least one transaction"`.
-   * Always present (possibly empty) whenever `degraded` is true.
-   */
+  /** Transactions in scope for the rule, when the backend reports it. */
+  evaluatedCount: number | null
+  /** True when the backend returned fewer evidence rows than it counted. */
+  evidenceTruncated: boolean
+  customerName: string | null
+  model: string | null
+  durationMs: number | null
   notes: string[]
 }
 
@@ -615,22 +660,17 @@ export interface RuleEvaluation {
   /** `risk_assessments.score_contribution` — 0.00 when not triggered. */
   score: number
   source: EvaluationSource
-  /** How many transactions the rule was run against. */
+  /** How many of the customer's transactions were in the rule's scope. */
   evaluatedTransactionCount?: number | null
   matchedCount?: number | null
-  /** The transactions that satisfied the rule. Empty, never absent. */
+  /** The transactions the agent cited as evidence. Empty, never absent. */
   matchedTransactionIds: UUID[]
-  /** True when a leaf could not be evaluated; see `degradationNotes`. */
-  degraded?: boolean | null
-  degradationNotes?: string[] | null
-  /** The DSL engine's own account of the verdict. */
-  explanation?: string | null
-  /** The agent's narrative justification. */
+  /** The agent's reasoning — the only account there is of why it decided this. */
   rationale?: string | null
-  agentTriggered?: boolean | null
-  agentScore?: number | null
-  /** True when the agent verdict differed from the deterministic engine. */
-  disagreement?: boolean | null
+  /** What the model asked for before the backend capped it at the rule's weight. */
+  claimedScore?: number | null
+  /** True when `claimedScore` exceeded the weight and `score` is the capped value. */
+  scoreClamped?: boolean | null
 }
 
 export interface ToolCallTraceStep {
@@ -640,6 +680,15 @@ export interface ToolCallTraceStep {
   args?: JsonValue
   resultPreview?: string | null
   ms?: number | null
+  /**
+   * What the call was about, recorded by the backend where the meaning was
+   * known - the rule name for a verdict, the customer for a profile lookup.
+   * Absent on runs stored before the labels existed, and on calls that have
+   * nothing to name.
+   */
+  subject?: string | null
+  /** How the call ended - `triggered +30.00 (rule 3 of 12)`, `2 of 4 transactions`. */
+  outcome?: string | null
 }
 
 export interface AssistantTraceStep {
@@ -653,6 +702,21 @@ export interface CoverageRepromptTraceStep {
   type: 'coverage_reprompt'
   n: number
   missing: string[]
+  ms?: number | null
+}
+
+/**
+ * The run ran out of steps with rules still unjudged, so it was recorded FAILED
+ * rather than reported as a complete review. `missing` carries the rule ids and
+ * `unjudgedRuleNames` the names, both taken from the step's `detail`.
+ */
+export interface CoverageFailedTraceStep {
+  type: 'coverage_failed'
+  n: number
+  missing: string[]
+  unjudgedRuleNames: string[]
+  rulesTotal: number | null
+  text: string
   ms?: number | null
 }
 
@@ -683,6 +747,7 @@ export type TraceStep =
   | ToolCallTraceStep
   | AssistantTraceStep
   | CoverageRepromptTraceStep
+  | CoverageFailedTraceStep
   | FinalTraceStep
   | ErrorTraceStep
   | UnknownTraceStep
@@ -693,14 +758,13 @@ export interface AnalysisTrace {
 
 /** Coverage counters the backend derives; rendered by the coverage panel. */
 interface AnalysisCoverageCounters {
-  /** Rules the agent itself submitted a verdict for. */
-  rulesEvaluatedByAgent?: number | null
-  /** Rules closed by the deterministic backfill. */
-  rulesBackfilled?: number | null
+  /** Share of the coverage set that ended with a verdict; 100 on every COMPLETED run. */
   coveragePercent?: number | null
   triggeredRuleCount?: number | null
-  disagreementCount?: number | null
-  /** The level the agent proposed, before the deterministic scoring won. */
+  /**
+   * The band the model itself proposed, kept alongside `riskLevel` (which is the
+   * sum of its own per-rule scores, banded) so the two can be compared.
+   */
   agentRiskLevel?: RiskLevel | null
 }
 

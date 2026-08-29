@@ -19,9 +19,11 @@ import org.hibernate.type.SqlTypes;
 /**
  * A configurable risk rule. Maps the assignment table {@code risk_rules}.
  *
- * <p>{@link #thresholdLogic} holds the rule condition as JSON in the shared rule DSL (nested
- * AND/OR/NOT groups over leaf conditions), which both the backend evaluator and the admin visual
- * editor understand.
+ * <p>{@link #thresholdLogic} holds the rule condition in natural language. It is a prompt, not a
+ * program: the ReAct agent is shown the sentence verbatim, fetches the customer's data with its
+ * tools and judges whether the rule is triggered and what it should score. Nothing parses this
+ * column, so it must be written for a reader - a concrete threshold, a time window, and why the
+ * pattern matters.
  */
 @Entity
 @Table(name = "risk_rules")
@@ -45,7 +47,7 @@ public class RiskRule {
     @Column(name = "applies_to", nullable = false, columnDefinition = "rule_scope")
     private RuleScope appliesTo;
 
-    /** Rule condition as JSON in the rule DSL. */
+    /** Rule condition in natural language, shown to the agent exactly as stored. */
     @Column(name = "threshold_logic", nullable = false, columnDefinition = "text")
     private String thresholdLogic;
 

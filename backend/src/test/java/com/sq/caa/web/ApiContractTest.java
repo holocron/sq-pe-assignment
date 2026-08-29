@@ -1,5 +1,6 @@
 package com.sq.caa.web;
 
+import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.user;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -266,18 +267,25 @@ class ApiContractTest {
             mockMvc.perform(post("/api/rules")
                             .contentType(MediaType.APPLICATION_JSON)
                             .content("{\"ruleName\":\"nope\",\"appliesTo\":\"ALL\",\"weight\":5,"
-                                    + "\"thresholdLogic\":{\"field\":\"amount\",\"operator\":\"GT\",\"value\":1}}"))
+                                    + "\"thresholdLogic\":\"Any payment above 10,000 sent by wire.\"}"))
                     .andExpect(status().isForbidden());
         }
 
         @Test
         @WithMockUser(roles = "ADMIN")
-        @DisplayName("the field catalog drives the rule editor")
+        @DisplayName("the field catalog is the rule editor's reference, not a grammar")
         void adminCanReadFieldCatalog() throws Exception {
             mockMvc.perform(get("/api/rules/field-catalog"))
                     .andExpect(status().isOk())
                     .andExpect(jsonPath("$[0].field").value("amount"))
-                    .andExpect(jsonPath("$[0].operators").isArray());
+                    .andExpect(jsonPath("$[0].label").isString())
+                    .andExpect(jsonPath("$[0].type").isString())
+                    .andExpect(jsonPath("$[0].category").isString())
+                    .andExpect(jsonPath("$[0].description").isString())
+                    .andExpect(jsonPath("$[0].options").isArray())
+                    // A grammar is exactly what the catalog no longer is: conditions are prose, so
+                    // no operator list is published for an author to build an expression from.
+                    .andExpect(jsonPath("$[0].operators").doesNotExist());
         }
 
         @Test
@@ -328,15 +336,32 @@ class ApiContractTest {
 
         @Test
         @WithMockUser(roles = "ADMIN")
-        @DisplayName("an invalid rule DSL is 400 and names the offending path")
-        void invalidRuleDsl() throws Exception {
-            mockMvc.perform(post("/api/rules/test")
+        @DisplayName("a rule condition pasted as the old JSON DSL is 400 and names the field")
+        void ruleConditionPastedAsJsonDsl() throws Exception {
+            mockMvc.perform(post("/api/rules")
                             .contentType(MediaType.APPLICATION_JSON)
-                            .content("{\"thresholdLogic\":{\"field\":\"amont\",\"operator\":\"GT\",\"value\":1},"
-                                    + "\"appliesTo\":\"ALL\"}"))
+                            .content("{\"ruleName\":\"Pasted DSL\",\"appliesTo\":\"ALL\","
+                                    + "\"weight\":5,\"thresholdLogic\":\"{\\\"op\\\":\\\"AND\\\","
+                                    + "\\\"conditions\\\":[{\\\"field\\\":\\\"amount\\\",\\\"operator\\\":"
+                                    + "\\\"GT\\\",\\\"value\\\":1000}]}\"}"))
                     .andExpect(status().isBadRequest())
                     .andExpect(content().contentTypeCompatibleWith(PROBLEM))
-                    .andExpect(jsonPath("$.path").value("$"));
+                    .andExpect(jsonPath("$.status").value(400))
+                    .andExpect(jsonPath("$.field").value("thresholdLogic"))
+                    .andExpect(jsonPath("$.detail").value(containsString("plain English")));
+        }
+
+        @Test
+        @WithMockUser(roles = "ADMIN")
+        @DisplayName("a rule condition too short to judge is 400 and names the field")
+        void ruleConditionTooShort() throws Exception {
+            mockMvc.perform(post("/api/rules")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"ruleName\":\"Too terse\",\"appliesTo\":\"ALL\","
+                                    + "\"weight\":5,\"thresholdLogic\":\"big payments\"}"))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(content().contentTypeCompatibleWith(PROBLEM))
+                    .andExpect(jsonPath("$.status").value(400));
         }
     }
 }

@@ -1,351 +1,164 @@
 package com.sq.caa.rules;
 
-import com.sq.caa.domain.RuleScope;
 import java.math.BigDecimal;
-import java.time.Instant;
-import java.util.EnumSet;
-import java.util.List;
+import java.math.RoundingMode;
 import java.util.Locale;
-import java.util.Optional;
-import java.util.Set;
-import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 
 /**
- * Write-time semantic validation of a parsed rule.
+ * Write-time validation of a rule.
  *
- * <p>The evaluator is deliberately forgiving - a condition it cannot resolve is false and degraded,
- * never an exception. That forgiveness is exactly why writes must be strict: a rule saved with a
- * typo would otherwise sit in the table forever, quietly never matching. Everything checkable up
- * front is therefore checked here and rejected with the pointer of the offending node.
+ * <p>{@code threshold_logic} is a prompt now, not a program, so there is nothing structural left to
+ * check: no field names to resolve, no operators to type-check, no unsatisfiable conjunctions to
+ * refuse. What can still be checked is that the text is <em>something a model can judge</em>, and
+ * that is what this class does.
  *
- * <p>"Quietly never matching" is the whole point, so the checks go beyond well-formedness. A rule is
- * also refused when it is <em>structurally incapable of firing</em>:
  * <ul>
- *   <li>a leaf reading a field of another activity type than the rule's own scope, which resolves to
- *       "not applicable" on every transaction the rule will ever see;
- *   <li>an {@code AND} whose branches need two different activity types at once, which no single
- *       transaction can satisfy;
- *   <li>a degenerate text operand - a blank {@code CONTAINS} needle matches every value, a blank
- *       {@code MATCHES} pattern matches every value - which fires the rule on all activity or none
- *       regardless of the data.
+ *   <li><b>Present.</b> A blank condition would leave the rule in the coverage set with nothing to
+ *       decide, so every run would either stall on it or invent a verdict.
+ *   <li><b>Long enough</b> ({@value #MIN_CONDITION_LENGTH} characters). A rule that says only
+ *       "large payments" gives the model no threshold, and two runs would not agree. The bound is
+ *       deliberately low - it catches the empty-ish paste, not a terse but complete sentence.
+ *   <li><b>Short enough</b> ({@value #MAX_CONDITION_LENGTH} characters). Every applicable rule is
+ *       carried in the agent's prompt for the whole run; a rule that is an essay crowds out the
+ *       evidence and pushes the conversation towards the context limit.
+ *   <li><b>Prose, not the old JSON DSL.</b> A pasted {@code {"op":"AND",...}} document is refused
+ *       with a message that says what changed, because it would otherwise be stored happily and
+ *       then read out to the model as gibberish.
  * </ul>
+ *
+ * <p>Text is normalised, not just checked: line endings are unified, control characters are dropped
+ * and trailing whitespace is stripped, so the column holds exactly what the model will be shown.
  */
 public final class RuleValidator {
+
+    /** Shortest condition accepted, in characters, after normalisation. */
+    public static final int MIN_CONDITION_LENGTH = 20;
+
+    /** Longest condition accepted, in characters, after normalisation. */
+    public static final int MAX_CONDITION_LENGTH = 2000;
+
+    /** Longest rule name accepted; {@code risk_rules.rule_name} is {@code VARCHAR(160)}. */
+    public static final int MAX_RULE_NAME_LENGTH = 160;
+
+    /** Smallest weight accepted; {@code risk_rules.weight} is {@code DECIMAL(5,2)}. */
+    public static final BigDecimal MIN_WEIGHT = new BigDecimal("0.01");
+
+    /** Largest weight accepted. */
+    public static final BigDecimal MAX_WEIGHT = new BigDecimal("999.99");
+
+    private static final String FIELD_CONDITION = "thresholdLogic";
+    private static final String FIELD_NAME = "ruleName";
+    private static final String FIELD_WEIGHT = "weight";
 
     private RuleValidator() {
     }
 
     /**
-     * Validates a whole rule against the scope it will be evaluated with, throwing
-     * {@link RuleValidationException} on the first problem.
+     * Validates and normalises a rule condition.
      *
-     * @param scope the rule's {@code applies_to}; {@code null} is read as {@link RuleScope#ALL}
+     * @return the exact text to store, which is the exact text the agent will be shown
+     * @throws RuleValidationException when the text is unusable as a rule condition
      */
-    public static void validate(RuleNode node, RuleScope scope) {
-        validateNode(node, "$", scope == null ? RuleScope.ALL : scope);
+    public static String normaliseCondition(String thresholdLogic) {
+        if (thresholdLogic == null) {
+            throw new RuleValidationException(FIELD_CONDITION, "is required");
+        }
+        String text = normaliseText(thresholdLogic);
+        if (text.isEmpty()) {
+            throw new RuleValidationException(FIELD_CONDITION,
+                    "is empty; a rule condition is the sentence the agent judges the customer's "
+                            + "activity against, so it cannot be blank");
+        }
+        if (looksLikeJsonDsl(text)) {
+            throw new RuleValidationException(FIELD_CONDITION,
+                    "looks like the old JSON rule DSL. Rule conditions are now plain English: "
+                            + "describe what to look for, with concrete thresholds and time "
+                            + "windows, and why it is suspicious. The agent reads the sentence, "
+                            + "fetches the data and judges it");
+        }
+        if (text.length() < MIN_CONDITION_LENGTH) {
+            throw new RuleValidationException(FIELD_CONDITION, "is only " + text.length()
+                    + " characters long; at least " + MIN_CONDITION_LENGTH + " are needed. State "
+                    + "what to look for and the threshold or window that makes it suspicious - a "
+                    + "condition the agent has to guess at will not be judged the same way twice");
+        }
+        if (text.length() > MAX_CONDITION_LENGTH) {
+            throw new RuleValidationException(FIELD_CONDITION, "is " + text.length()
+                    + " characters long, the maximum is " + MAX_CONDITION_LENGTH + ". Every "
+                    + "applicable rule is carried in the agent's prompt for the whole analysis, so "
+                    + "an over-long condition crowds out the evidence it is meant to be judged "
+                    + "against; split it into two rules instead");
+        }
+        return text;
     }
 
-    /** Validates a rule with no scope restriction, i.e. as if it were {@code ALL}-scoped. */
-    public static void validate(RuleNode node) {
-        validate(node, RuleScope.ALL);
+    /** Validates and trims a rule name. Uniqueness is enforced separately, against the table. */
+    public static String normaliseName(String ruleName) {
+        if (ruleName == null) {
+            throw new RuleValidationException(FIELD_NAME, "is required");
+        }
+        String text = normaliseText(ruleName).replace('\n', ' ').trim();
+        if (text.isEmpty()) {
+            throw new RuleValidationException(FIELD_NAME, "is blank; a rule is named by the coverage "
+                    + "gate when the agent has not yet ruled on it, so it needs a name a reader "
+                    + "recognises");
+        }
+        if (text.length() > MAX_RULE_NAME_LENGTH) {
+            throw new RuleValidationException(FIELD_NAME, "is " + text.length()
+                    + " characters long, the maximum is " + MAX_RULE_NAME_LENGTH);
+        }
+        return text;
     }
 
-    private static void validateNode(RuleNode node, String path, RuleScope scope) {
-        switch (node) {
-            case RuleGroup group -> {
-                if (group.conditions().isEmpty()) {
-                    throw fail(path, node, "group '" + group.op() + "' needs at least one child condition");
-                }
-                int index = 0;
-                for (RuleNode child : group.conditions()) {
-                    validateNode(child, path + ".conditions[" + index + "]", scope);
-                    index++;
-                }
-                validateSatisfiable(group, path);
-            }
-            case RuleCondition condition -> validateCondition(condition, path, scope);
+    /** Validates a weight and returns it at the scale the column stores. */
+    public static BigDecimal normaliseWeight(BigDecimal weight) {
+        if (weight == null) {
+            throw new RuleValidationException(FIELD_WEIGHT, "is required; it is the ceiling on what "
+                    + "this rule may contribute to the risk score");
         }
-    }
-
-    private static void validateCondition(RuleCondition condition, String path, RuleScope scope) {
-        FieldDefinition definition = FieldCatalog.find(condition.field())
-                .orElseThrow(() -> fail(path, condition,
-                        "unknown field '" + condition.field() + "'" + suggestion(condition.field())));
-
-        if (!definition.availableIn(scope)) {
-            throw fail(path, condition, "field '" + definition.field() + "' exists only on "
-                    + definition.appliesTo() + " activity, but this rule is scoped to " + scope
-                    + ", so the condition could never match; use a field available on " + scope
-                    + " activity, or set the rule scope to " + definition.appliesTo() + " or ALL");
+        BigDecimal scaled = weight.setScale(2, RoundingMode.HALF_UP);
+        if (scaled.compareTo(MIN_WEIGHT) < 0 || scaled.compareTo(MAX_WEIGHT) > 0) {
+            throw new RuleValidationException(FIELD_WEIGHT, "must be between " + MIN_WEIGHT + " and "
+                    + MAX_WEIGHT + ", was " + scaled);
         }
-
-        RuleOperator operator = condition.operator();
-        if (!definition.type().supports(operator)) {
-            throw fail(path, condition, "operator " + operator + " is not valid for "
-                    + definition.type().name().toLowerCase(Locale.ROOT) + " field '" + definition.field()
-                    + "'; allowed operators are " + names(definition.allowedOperators()));
-        }
-
-        Object value = condition.value();
-        switch (operator.arity()) {
-            case NONE -> {
-                if (value != null) {
-                    throw fail(path, condition, "operator " + operator + " takes no value");
-                }
-            }
-            case SINGLE -> {
-                if (value == null) {
-                    throw fail(path, condition, "operator " + operator + " requires a value");
-                }
-                if (Values.isList(value)) {
-                    throw fail(path, condition, "operator " + operator + " requires a single value, not an array");
-                }
-                validateOperand(value, definition, condition, path);
-            }
-            case PAIR -> {
-                if (!Values.isList(value) || Values.asList(value).size() != 2) {
-                    throw fail(path, condition,
-                            "operator BETWEEN requires an array of exactly two values");
-                }
-                List<Object> bounds = Values.asList(value);
-                for (Object bound : bounds) {
-                    if (bound == null) {
-                        throw fail(path, condition, "operator BETWEEN does not accept null bounds");
-                    }
-                    validateOperand(bound, definition, condition, path);
-                }
-                validateBoundOrder(bounds, definition, condition, path);
-            }
-            case LIST -> {
-                if (!Values.isList(value)) {
-                    throw fail(path, condition, "operator " + operator + " requires an array of values");
-                }
-                List<Object> elements = Values.asList(value);
-                if (elements.isEmpty()) {
-                    throw fail(path, condition, "operator " + operator + " requires a non-empty array");
-                }
-                for (Object element : elements) {
-                    if (element == null) {
-                        throw fail(path, condition, "operator " + operator + " does not accept null elements");
-                    }
-                    validateOperand(element, definition, condition, path);
-                }
-            }
-        }
-
-        switch (operator) {
-            case CONTAINS, NOT_CONTAINS -> validateNeedle(value, operator, condition, path);
-            case MATCHES -> validateRegex(value, condition, path);
-            default -> {
-                // No operand-shape rule beyond the type checks above.
-            }
-        }
+        return scaled;
     }
 
     /**
-     * Rejects an {@code AND} that cannot be true for any transaction because its branches need two
-     * different activity types at once. Only reachable for {@code ALL}-scoped rules: on a narrower
-     * scope the offending leaf is already refused by {@link FieldDefinition#availableIn(RuleScope)}.
-     */
-    private static void validateSatisfiable(RuleGroup group, String path) {
-        if (group.op() != LogicalOp.AND) {
-            return;
-        }
-        Set<RuleScope> required = requiredScopes(group);
-        if (required.size() > 1) {
-            throw fail(path, group, "these conditions require "
-                    + String.join(" and ", required.stream().map(Enum::name).sorted().toList())
-                    + " activity on the same transaction, which cannot happen - a transaction has "
-                    + "exactly one activity type, so this group could never match");
-        }
-    }
-
-    /**
-     * Activity types a node needs in order to be able to hold at all.
+     * Unifies line endings, drops control characters and strips trailing whitespace.
      *
-     * <p>A leaf on an activity-specific field reads as "not applicable" - and therefore false - on
-     * every other activity type, so it requires its own. {@code IS_NULL} is the exception: absence is
-     * exactly what it accepts. {@code AND} needs all of its children's requirements, {@code OR} only
-     * what all of its branches require in common, and {@code NOT} requires nothing because it holds
-     * precisely where its body does not.
+     * <p>Control characters are removed rather than rejected: they arrive from copy-paste, they are
+     * invisible to whoever pasted them, and refusing the write with "character U+0007" would help
+     * nobody. Paragraph structure is preserved, because a rule that lists its conditions on separate
+     * lines reads better both to the model and in the editor.
      */
-    private static Set<RuleScope> requiredScopes(RuleNode node) {
-        return switch (node) {
-            case RuleCondition condition -> {
-                FieldDefinition definition = FieldCatalog.find(condition.field()).orElse(null);
-                if (condition.operator() == RuleOperator.IS_NULL || definition == null
-                        || definition.appliesTo() == RuleScope.ALL) {
-                    yield Set.of();
+    private static String normaliseText(String raw) {
+        StringBuilder out = new StringBuilder(raw.length());
+        for (int index = 0; index < raw.length(); index++) {
+            char character = raw.charAt(index);
+            if (character == '\r') {
+                if (index + 1 < raw.length() && raw.charAt(index + 1) == '\n') {
+                    continue;
                 }
-                yield EnumSet.of(definition.appliesTo());
-            }
-            case RuleGroup group -> switch (group.op()) {
-                case AND -> {
-                    Set<RuleScope> union = EnumSet.noneOf(RuleScope.class);
-                    for (RuleNode child : group.conditions()) {
-                        union.addAll(requiredScopes(child));
-                    }
-                    yield union;
-                }
-                case OR -> {
-                    Set<RuleScope> common = null;
-                    for (RuleNode child : group.conditions()) {
-                        Set<RuleScope> childScopes = requiredScopes(child);
-                        if (common == null) {
-                            common = EnumSet.noneOf(RuleScope.class);
-                            common.addAll(childScopes);
-                        } else {
-                            common.retainAll(childScopes);
-                        }
-                        if (common.isEmpty()) {
-                            break;
-                        }
-                    }
-                    yield common == null ? Set.of() : common;
-                }
-                case NOT -> Set.of();
-            };
-        };
-    }
-
-    private static void validateOperand(Object operand, FieldDefinition definition,
-            RuleCondition condition, String path) {
-        switch (definition.type()) {
-            case NUMBER -> {
-                if (Values.toDecimal(operand).isEmpty()) {
-                    throw fail(path, condition, "value " + RuleFormatter.value(operand)
-                            + " is not a number, but '" + definition.field() + "' is numeric");
-                }
-            }
-            case DATETIME -> {
-                if (Values.toInstant(operand).isEmpty()) {
-                    throw fail(path, condition, "value " + RuleFormatter.value(operand)
-                            + " is not an ISO-8601 date or date-time, but '" + definition.field()
-                            + "' is a timestamp");
-                }
-            }
-            case BOOLEAN -> {
-                if (Values.toBoolean(operand).isEmpty()) {
-                    throw fail(path, condition, "value " + RuleFormatter.value(operand)
-                            + " is not a boolean, but '" + definition.field() + "' is a boolean");
-                }
-            }
-            case ENUM -> {
-                if (definition.optionsClosed() && !matchesOption(definition, operand)) {
-                    throw fail(path, condition, "value " + RuleFormatter.value(operand)
-                            + " is not one of the allowed values of '" + definition.field() + "': "
-                            + String.join(", ", definition.options()));
-                }
-            }
-            case STRING -> {
-                if (Values.isList(operand)) {
-                    throw fail(path, condition, "value of '" + definition.field()
-                            + "' must be a single text value");
-                }
+                out.append('\n');
+            } else if (character == '\n') {
+                out.append('\n');
+            } else if (character == '\t') {
+                out.append(' ');
+            } else if (!Character.isISOControl(character)) {
+                out.append(character);
             }
         }
+        return out.toString().strip();
     }
 
-    private static void validateBoundOrder(List<Object> bounds, FieldDefinition definition,
-            RuleCondition condition, String path) {
-        if (definition.type() == FieldType.NUMBER) {
-            Optional<BigDecimal> low = Values.toDecimal(bounds.get(0));
-            Optional<BigDecimal> high = Values.toDecimal(bounds.get(1));
-            if (low.isPresent() && high.isPresent() && low.get().compareTo(high.get()) > 0) {
-                throw fail(path, condition, "BETWEEN bounds are inverted: "
-                        + RuleFormatter.value(bounds.get(0)) + " is greater than "
-                        + RuleFormatter.value(bounds.get(1)));
-            }
-        } else if (definition.type() == FieldType.DATETIME) {
-            Optional<Instant> low = Values.toInstant(bounds.get(0));
-            Optional<Instant> high = Values.toInstant(bounds.get(1));
-            if (low.isPresent() && high.isPresent() && low.get().isAfter(high.get())) {
-                throw fail(path, condition, "BETWEEN bounds are inverted: "
-                        + RuleFormatter.value(bounds.get(0)) + " is after "
-                        + RuleFormatter.value(bounds.get(1)));
-            }
-        }
-    }
-
-    /**
-     * A {@code CONTAINS} / {@code NOT_CONTAINS} needle must carry information. A blank one is
-     * contained in every string, so it does not filter anything: it fires the rule on all activity or
-     * on none, whichever way round the operator points, and it is invisible in the rendered rule.
-     */
-    private static void validateNeedle(Object value, RuleOperator operator, RuleCondition condition,
-            String path) {
-        String needle = Values.toText(value);
-        if (needle == null || needle.isBlank()) {
-            throw fail(path, condition, "operator " + operator + " requires a non-blank text value; "
-                    + "every value contains a blank needle, so this condition would "
-                    + (operator == RuleOperator.CONTAINS ? "match every" : "never match a")
-                    + " transaction of '" + condition.field() + "' regardless of the data");
-        }
-    }
-
-    /** Bounded by {@link Regexes}: non-blank, at most {@code MAX_PATTERN_LENGTH}, and compilable. */
-    private static void validateRegex(Object value, RuleCondition condition, String path) {
-        if (!(value instanceof String regex)) {
-            throw fail(path, condition, "operator MATCHES requires a regular expression string");
-        }
-        Optional<Regexes.Outcome> rejection = Regexes.reject(regex);
-        if (rejection.isEmpty()) {
-            return;
-        }
-        throw switch (rejection.get()) {
-            case BLANK -> fail(path, condition, "operator MATCHES requires a non-blank regular "
-                    + "expression; an empty pattern matches every value, and a whitespace-only one "
-                    + "is almost always a paste accident - write it explicitly, e.g. '\\s{2,}'");
-            case TOO_LONG -> fail(path, condition, "regular expression is " + regex.length()
-                    + " characters long, the maximum is " + Regexes.MAX_PATTERN_LENGTH);
-            default -> fail(path, condition,
-                    "value is not a valid regular expression: " + syntaxProblem(regex));
-        };
-    }
-
-    private static String syntaxProblem(String regex) {
-        try {
-            Pattern.compile(regex);
-            return "the pattern was refused";
-        } catch (PatternSyntaxException e) {
-            return e.getDescription();
-        }
-    }
-
-    private static boolean matchesOption(FieldDefinition definition, Object operand) {
-        String text = Values.toText(operand);
-        if (text == null) {
+    /** A pasted DSL document: a JSON object carrying one of the keys the old grammar used. */
+    private static boolean looksLikeJsonDsl(String text) {
+        if (!text.startsWith("{") || !text.endsWith("}")) {
             return false;
         }
-        for (String option : definition.options()) {
-            if (option.equalsIgnoreCase(text.trim())) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static String suggestion(String field) {
-        if (field == null || field.isBlank()) {
-            return "";
-        }
-        String needle = field.trim().toLowerCase(Locale.ROOT);
-        String bare = needle.contains(".") ? needle.substring(needle.lastIndexOf('.') + 1) : needle;
-        for (String candidate : FieldCatalog.fieldNames()) {
-            String lower = candidate.toLowerCase(Locale.ROOT);
-            if (lower.equals(needle) || lower.endsWith("." + bare) || lower.equals(bare)) {
-                return "; did you mean '" + candidate + "'?";
-            }
-        }
-        return "; see GET /api/rules/field-catalog for the available fields";
-    }
-
-    private static String names(List<RuleOperator> operators) {
-        return operators.stream().map(Enum::name).reduce((a, b) -> a + ", " + b).orElse("");
-    }
-
-    private static RuleValidationException fail(String path, RuleNode node, String message) {
-        return new RuleValidationException(path, RuleParser.compact(node), message);
+        String lower = text.toLowerCase(Locale.ROOT);
+        return lower.contains("\"op\"") || lower.contains("\"operator\"")
+                || lower.contains("\"conditions\"");
     }
 }

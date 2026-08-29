@@ -2,7 +2,6 @@ package com.sq.caa.agent;
 
 import com.sq.caa.domain.RiskLevel;
 import com.sq.caa.domain.RiskRule;
-import com.sq.caa.rules.RuleEvaluationResult;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.ArrayList;
@@ -41,25 +40,29 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * class drives the loop itself. That is what makes the gate possible: nothing between the model and
  * the database gets to decide when the analysis is over except the code below.
  *
- * <h2>The rule-coverage gate</h2>
+ * <h2>The rule-coverage guarantee</h2>
+ * <p>The agent is the only source of verdicts: a rule condition is prose, the model reads it, uses
+ * its data tools and judges it. There is no engine left to quietly close a rule the model skipped,
+ * so coverage is guaranteed by refusing to call such a run finished rather than by filling the gap.
  * <ol>
  *   <li>The coverage set is fixed in the {@link AgentRunContext} before the first turn.</li>
  *   <li>{@code submit_rule_evaluation} is the only way into the evaluated set.</li>
  *   <li>If the model tries to conclude - by calling {@code submit_final_assessment} or simply by
- *       answering without any tool call - while a rule is still unevaluated, the loop does
- *       <b>not</b> exit. It records a {@code coverage_reprompt} step, appends a user message naming
- *       every outstanding rule by name and id, and continues.</li>
- *   <li>Reprompts are bounded by {@code caa.agent.max-coverage-reprompts} so a stubborn model cannot
- *       burn the entire step budget; exhausting them ends the loop, never the coverage.</li>
- *   <li>{@link #settle} then closes every rule of the coverage set against the deterministic engine:
- *       rules the agent skipped are evaluated outright and marked
- *       {@link RuleVerdictSource#DETERMINISTIC_FALLBACK}, rules it did rule on are cross-checked.
- *       Coverage is therefore 100% on every run, and {@code coverage_complete} records whether the
- *       agent got there by itself.</li>
+ *       answering without any tool call - while a rule is still unjudged, the loop does <b>not</b>
+ *       exit. It records a {@code coverage_reprompt} step, appends a user message naming every
+ *       outstanding rule by name and id, and continues.</li>
+ *   <li>Reprompts are bounded by {@code caa.agent.max-coverage-reprompts} and turns by
+ *       {@code caa.agent.max-steps}, so a stubborn model cannot burn the whole budget arguing.</li>
+ *   <li>{@link #settle} then builds one outcome per rule the agent judged. If any rule is left over,
+ *       {@link #execute} throws {@link AgentRunFailedException} carrying that partial result and an
+ *       {@link IncompleteRuleCoverageException} naming the unjudged rules: the caller persists the
+ *       run as {@code FAILED}, keeping every verdict that was obtained. A partial analysis is never
+ *       reported as {@code COMPLETED}.</li>
  * </ol>
  *
- * <p>On disagreement the deterministic engine wins for scoring and the disagreement is written into
- * the trace: the model can add context, never remove risk.
+ * <p>The cost of this design is stated rather than hidden: scores are the model's estimates, so two
+ * runs of the same customer can differ. What does not vary is the coverage claim - a
+ * {@code COMPLETED} run has a verdict for every applicable rule, or it is not {@code COMPLETED}.
  */
 @Component
 public class RiskAgentLoop {
@@ -98,25 +101,41 @@ public class RiskAgentLoop {
     }
 
     /**
-     * Runs the whole ReAct conversation and settles the coverage set. Blocking and slow by nature -
-     * the caller must already be off the request thread.
+     * Runs the whole ReAct conversation. Blocking and slow by nature - the caller must already be off
+     * the request thread.
+     *
+     * @return the settled run, only ever with every applicable rule judged
+     * @throws AgentRunFailedException when the conversation broke, or when it ended with rules still
+     *                                 unjudged; {@link AgentRunFailedException#result()} carries
+     *                                 everything the agent did establish
      */
     public AgentRunResult execute(AgentRunContext context, RiskAgentTools tools) {
         long startedAt = System.currentTimeMillis();
         String model = modelId();
         context.trace().started(model, context.customer().getFullName(), context.ruleCount());
-        int steps = 0;
+        int steps;
         try {
             steps = converse(context, tools, model);
         } catch (RuntimeException e) {
             // The conversation died - but everything the agent had already submitted is still in the
             // context, so the run is settled from it rather than thrown away. The caller marks the
-            // run FAILED with this cause; it does not have to re-do the work deterministically.
-            int completed = context.stepsTaken();
-            AgentRunResult partial = settle(context, completed, System.currentTimeMillis() - startedAt);
+            // run FAILED with this cause and keeps the verdicts that were obtained.
+            AgentRunResult partial = settle(context, context.stepsTaken(),
+                    System.currentTimeMillis() - startedAt);
             throw new AgentRunFailedException(partial, e);
         }
-        return settle(context, steps, System.currentTimeMillis() - startedAt);
+        AgentRunResult result = settle(context, steps, System.currentTimeMillis() - startedAt);
+        if (!result.coverageComplete()) {
+            // The gate's last line. The loop is out of turns or out of reprompts and rules are still
+            // unjudged; there is no backfill to close them, so this run must not be reported as a
+            // finished analysis.
+            log.warn("Analysis {}: {} of {} rule(s) never received a verdict; the run is recorded as "
+                            + "FAILED with the {} verdict(s) it did obtain", context.assessmentId(),
+                    result.unjudgedRules().size(), result.rulesTotal(), result.rulesJudged());
+            throw new AgentRunFailedException(result, new IncompleteRuleCoverageException(
+                    result.rulesTotal(), result.unjudgedRules(), result.unjudgedRuleNames()));
+        }
+        return result;
     }
 
     // ------------------------------------------------------------------
@@ -133,6 +152,14 @@ public class RiskAgentLoop {
                 .model(model)
                 .maxTokens(properties.maxTokens())
                 .temperature(properties.temperature())
+                // Not optional. OpenAiChatModel copies the options' timeout and retry count into the
+                // SDK's per-request options, and this builder defaults them to 60 seconds and three
+                // retries - which silently overrides spring.ai.openai.timeout for every call that
+                // supplies its own options. A turn of this model routinely needs more than a minute,
+                // so the default cut every long turn short and retried it, and the run died with
+                // "OpenAIIoException: Request failed" having judged nothing.
+                .timeout(properties.requestTimeout())
+                .maxRetries(1)
                 .build();
 
         List<Message> history = new ArrayList<>();
@@ -185,7 +212,7 @@ public class RiskAgentLoop {
                 }
                 ToolExecutionResult execution = toolCallingManager.executeToolCalls(prompt, response);
                 List<Message> updated = new ArrayList<>(execution.conversationHistory());
-                recordToolCalls(context, assistant, updated);
+                recordToolCalls(context, tools, assistant, updated);
                 history = updated;
 
                 if (context.consumeConclusionRejected()) {
@@ -200,7 +227,8 @@ public class RiskAgentLoop {
                         // the conclusion instead.
                         if (++conclusionReprompts > properties.maxCoverageReprompts()) {
                             context.trace().reprompt("The model kept concluding before its own last "
-                                    + "verdict landed; the deterministic scores stand on their own.");
+                                    + "verdict landed; every rule has a verdict, so the summary is "
+                                    + "generated from the verdicts themselves.");
                             break;
                         }
                         context.trace().reprompt("The final assessment was rejected because a rule was "
@@ -230,7 +258,7 @@ public class RiskAgentLoop {
             if (!missing.isEmpty()) {
                 context.trace().coverageReprompt(
                         missing.stream().map(rule -> rule.getRuleId().toString()).toList(),
-                        missing.stream().map(RiskRule::getRuleName).toList());
+                        missing.stream().map(RiskAgentLoop::displayName).toList());
                 if (++coverageReprompts > properties.maxCoverageReprompts()) {
                     logExhausted(context);
                     break;
@@ -258,8 +286,9 @@ public class RiskAgentLoop {
                     break;
                 }
                 if (++conclusionReprompts > properties.maxCoverageReprompts()) {
-                    context.trace().reprompt("The model stopped without submitting an assessment; the "
-                            + "deterministic scores stand on their own.");
+                    context.trace().reprompt("The model stopped without submitting an assessment; "
+                            + "every rule has a verdict, so the summary is generated from the "
+                            + "verdicts themselves.");
                     break;
                 }
                 context.trace().reprompt("Every rule has a verdict but no assessment was submitted; "
@@ -347,14 +376,20 @@ public class RiskAgentLoop {
     }
 
     private void logExhausted(AgentRunContext context) {
-        log.warn("Analysis {}: coverage reprompt budget exhausted with {} rule(s) still unevaluated; "
-                        + "the deterministic backfill will complete them",
-                context.assessmentId(), context.missingRules().size());
+        log.warn("Analysis {}: coverage reprompt budget exhausted with {} rule(s) still unjudged; the "
+                        + "run will be recorded as failed", context.assessmentId(),
+                context.missingRules().size());
     }
 
-    /** Turns one round of executed tool calls into {@code tool_call} trace steps. */
-    private void recordToolCalls(AgentRunContext context, AssistantMessage assistant,
-            List<Message> conversation) {
+    /**
+     * Turns one round of executed tool calls into {@code tool_call} trace steps.
+     *
+     * <p>Each step takes the note the tool left for it - the rule it judged and the verdict, the
+     * transaction it opened, the query it ran - so a transcript of twelve rules reads as twelve
+     * named verdicts instead of two dozen rows all labelled "Submit rule verdict".
+     */
+    private void recordToolCalls(AgentRunContext context, RiskAgentTools tools,
+            AssistantMessage assistant, List<Message> conversation) {
         if (assistant == null || assistant.getToolCalls() == null) {
             return;
         }
@@ -369,7 +404,7 @@ public class RiskAgentLoop {
         for (AssistantMessage.ToolCall call : assistant.getToolCalls()) {
             Long ms = context.takeTiming(call.name());
             context.trace().toolCall(call.name(), readJson(call.arguments()), results.get(call.id()),
-                    ms == null ? 0L : ms);
+                    ms == null ? 0L : ms, tools.takeNote(call.name()));
         }
     }
 
@@ -385,73 +420,73 @@ public class RiskAgentLoop {
     }
 
     // ------------------------------------------------------------------
-    // Settling the coverage set
+    // Settling the run
     // ------------------------------------------------------------------
 
     /**
-     * Closes the coverage set: every rule ends with a verdict here. Rules the agent submitted are
-     * cross-checked against the deterministic engine, rules it skipped are evaluated by the engine
-     * outright. Called after every loop, and on its own when a run failed before the loop could
-     * finish.
+     * Turns the agent's verdicts into the run's result: one {@link RuleOutcome} per rule it judged,
+     * the total score, the band, and the list of rules it never judged.
+     *
+     * <p>Nothing is invented here. A rule with no verdict produces no outcome and therefore no
+     * {@code risk_assessments} row - writing "not triggered, 0.00" for a rule nobody looked at would
+     * be a false record - and it is instead named in {@link AgentRunResult#unjudgedRules()}, which is
+     * what makes the run fail.
+     *
+     * <p>Called after every loop, and on its own when the conversation broke part-way.
      */
     public AgentRunResult settle(AgentRunContext context, int steps, long durationMs) {
-        boolean coverageComplete = context.coverageComplete();
-        int evaluatedByAgent = context.evaluatedCount();
         List<RuleOutcome> outcomes = new ArrayList<>(context.ruleCount());
+        List<UnjudgedRule> unjudged = new ArrayList<>();
         BigDecimal total = ZERO;
-        int disagreements = 0;
 
         for (RiskRule rule : context.rules()) {
             UUID ruleId = rule.getRuleId();
-            RuleEvaluationResult engine = context.deterministic(ruleId);
             AgentRuleVerdict verdict = context.verdict(ruleId);
-            RuleVerdictSource source = verdict == null
-                    ? RuleVerdictSource.DETERMINISTIC_FALLBACK
-                    : RuleVerdictSource.AGENT;
-
             if (verdict == null) {
-                context.trace().backfill(ruleId, rule.getRuleName(), engine.triggered());
+                unjudged.add(new UnjudgedRule(ruleId, displayName(rule)));
+                continue;
             }
-            boolean disagreement = verdict != null && verdict.triggered() != engine.triggered();
-            if (disagreement) {
-                disagreements++;
-                context.trace().disagreement(ruleId, rule.getRuleName(), verdict.triggered(),
-                        engine.triggered());
-            }
-
-            BigDecimal score = engine.triggered() ? scale(engine.score()) : ZERO;
+            List<UUID> inScope = context.inScopeTransactionIds(ruleId);
+            // Every matched id was checked against this rule's scope by submit_rule_evaluation
+            // before the verdict was recorded, so the rows written from here cannot name a
+            // transaction the rule does not apply to.
+            List<UUID> matched = verdict.transactionIds();
+            BigDecimal score = verdict.triggered() ? scale(verdict.score()) : ZERO;
             total = total.add(score);
             outcomes.add(new RuleOutcome(
                     ruleId,
                     rule.getRuleName(),
-                    engine.appliesTo(),
+                    rule.getAppliesTo(),
                     scale(rule.getWeight()),
-                    engine.triggered(),
+                    verdict.triggered(),
                     score,
-                    source,
-                    engine.evaluatedTransactionCount(),
-                    engine.matchedCount(),
-                    engine.matchedTransactionIds(),
-                    context.batch().transactionIdsFor(rule.getAppliesTo()),
-                    engine.degraded(),
-                    engine.degradationNotes(),
-                    engine.explanation(),
-                    verdict == null ? null : verdict.rationale(),
-                    verdict == null ? null : verdict.triggered(),
-                    verdict == null ? null : verdict.score(),
-                    disagreement));
+                    RuleVerdictSource.AGENT_JUDGED,
+                    inScope.size(),
+                    matched.size(),
+                    matched,
+                    inScope,
+                    verdict.rationale(),
+                    verdict.claimedScore(),
+                    verdict.scoreClamped()));
+        }
+
+        if (!unjudged.isEmpty()) {
+            context.trace().coverageFailed(context.ruleCount(),
+                    unjudged.stream().map(rule -> rule.ruleId().toString()).toList(),
+                    unjudged.stream().map(UnjudgedRule::ruleName).toList());
         }
 
         RiskLevel banded = RiskLevel.forScore(total);
         FinalAssessment conclusion = context.finalAssessment();
         String summary = conclusion != null && conclusion.summary() != null
                 ? conclusion.summary()
-                : fallbackSummary(context, outcomes, total, banded);
+                : fallbackSummary(context, outcomes, unjudged, total, banded);
         String recommendations = conclusion != null && conclusion.recommendations() != null
                 ? conclusion.recommendations()
-                : fallbackRecommendations(outcomes, banded);
+                : fallbackRecommendations(outcomes, unjudged, banded);
 
-        context.trace().finalStep(banded.name(), summary, total, context.ruleCount(), coverageComplete);
+        context.trace().finalStep(banded.name(), summary, total, context.ruleCount(),
+                unjudged.isEmpty());
 
         return new AgentRunResult(
                 context.assessmentId(),
@@ -462,38 +497,64 @@ public class RiskAgentLoop {
                 recommendations,
                 outcomes,
                 context.ruleCount(),
-                evaluatedByAgent,
-                coverageComplete,
-                disagreements,
+                unjudged,
                 steps,
                 modelId(),
                 durationMs);
     }
 
     /**
-     * Narrative used when the model never submitted one. The run is still complete and scored - the
-     * deterministic engine covered every rule - so it is reported rather than discarded.
+     * Narrative used when the model never wrote one - because it ran out of turns, or because the
+     * conversation broke after it had already judged rules. It reports what the verdicts say and,
+     * when rules were left unjudged, says so first: a summary that read like a completed review
+     * would be the exact failure this design refuses to make.
      */
     private static String fallbackSummary(AgentRunContext context, List<RuleOutcome> outcomes,
-            BigDecimal total, RiskLevel banded) {
+            List<UnjudgedRule> unjudged, BigDecimal total, RiskLevel banded) {
+        StringBuilder summary = new StringBuilder();
+        if (!unjudged.isEmpty()) {
+            StringJoiner names = new StringJoiner(", ");
+            unjudged.forEach(rule -> names.add("\"" + rule.ruleName() + "\""));
+            summary.append("INCOMPLETE ANALYSIS: ").append(unjudged.size()).append(" of ")
+                    .append(context.ruleCount())
+                    .append(" applicable rule(s) never received a verdict (").append(names)
+                    .append("), so this run was recorded as failed and must be repeated. ");
+        }
+        summary.append("The AI analyst did not submit a written assessment, so this summary was "
+                + "generated from the ").append(outcomes.size()).append(" rule verdict(s) it did "
+                + "submit. ");
         List<RuleOutcome> triggered = outcomes.stream().filter(RuleOutcome::triggered).toList();
-        StringJoiner names = new StringJoiner(", ");
-        triggered.forEach(outcome -> names.add(outcome.ruleName()));
-        String body = triggered.isEmpty()
-                ? "No applicable rule was breached."
-                : triggered.size() + " of " + outcomes.size() + " applicable rules were breached: "
-                        + names + ".";
-        return "The AI analyst did not submit a written assessment, so this summary was generated from "
-                + "the deterministic rule engine. " + body + " Total score " + total.toPlainString()
-                + ", banded " + banded + ". All " + context.ruleCount()
-                + " applicable rules were evaluated, so the coverage below is complete.";
+        if (outcomes.isEmpty()) {
+            summary.append("No rule was judged at all, so there is no finding to report.");
+        } else if (triggered.isEmpty()) {
+            summary.append("None of the rules judged was found to be breached.");
+        } else {
+            StringJoiner names = new StringJoiner(", ");
+            triggered.forEach(outcome -> names.add(outcome.ruleName()));
+            summary.append(triggered.size()).append(" of ").append(outcomes.size())
+                    .append(" judged rules were found to be breached: ").append(names).append('.');
+        }
+        summary.append(" Total score ").append(total.toPlainString()).append(", banded ")
+                .append(banded).append(", from the analyst's own per-rule estimates.");
+        return summary.toString();
     }
 
-    private static String fallbackRecommendations(List<RuleOutcome> outcomes, RiskLevel banded) {
+    private static String fallbackRecommendations(List<RuleOutcome> outcomes,
+            List<UnjudgedRule> unjudged, RiskLevel banded) {
+        String rerun = unjudged.isEmpty() ? "" : "Re-run this analysis: " + unjudged.size()
+                + " rule(s) were never judged, so the review is not complete.\n";
         if (outcomes.stream().noneMatch(RuleOutcome::triggered)) {
-            return "No action required beyond the standard periodic review.";
+            if (unjudged.isEmpty()) {
+                return rerun + "No action required beyond the standard periodic review.";
+            }
+            // "No breach was found" would be a reassurance the run has not earned when nothing at
+            // all was judged; the only honest line then is that there is nothing to report on.
+            return rerun + (outcomes.isEmpty()
+                    ? "Nothing was judged, so this run says nothing about the customer either way."
+                    : "No breach was found among the " + outcomes.size()
+                            + " rule(s) that were judged, but the review is not complete.");
         }
-        return switch (banded) {
+        return rerun + switch (banded) {
             case CRITICAL -> "Escalate to the money laundering reporting officer immediately and "
                     + "consider restricting the account.\n"
                     + "Review every transaction listed against the triggered rules.\n"
@@ -505,6 +566,12 @@ public class RiskAgentLoop {
                     + "Re-assess after the next 30 days of activity.";
             case LOW -> "Record the triggered rule and keep the customer on standard monitoring.";
         };
+    }
+
+    /** The administrator-authored rule name, safe to show in a trace or a prompt. */
+    private static String displayName(RiskRule rule) {
+        String name = PromptSafety.inline(rule.getRuleName());
+        return name == null ? "(unnamed rule)" : name;
     }
 
     private static BigDecimal scale(BigDecimal value) {

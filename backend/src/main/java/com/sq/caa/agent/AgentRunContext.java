@@ -3,20 +3,20 @@ package com.sq.caa.agent;
 import com.sq.caa.domain.Customer;
 import com.sq.caa.domain.RiskRule;
 import com.sq.caa.rules.EvaluationBatch;
-import com.sq.caa.rules.RuleEvaluationResult;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -27,12 +27,12 @@ import org.slf4j.LoggerFactory;
  * turn; {@code verdicts} only ever grows through {@code submit_rule_evaluation}; and
  * {@link #missingRules()} is the difference the loop refuses to finish with. Nothing here can widen
  * or shrink the coverage set once the run has started, so the gate cannot be talked out of by the
- * model.
+ * model - not by a rule whose prose asks to be skipped, and not by a conclusion that arrives early.
  *
- * <p>Deterministic evaluations are memoised: the agent typically calls
- * {@code evaluate_rule_deterministically} for a rule and the post-loop cross-check needs the same
- * verdict, and every evaluation runs against one immutable {@link EvaluationBatch}, so re-running it
- * could only waste CPU, never change the answer.
+ * <p>The scope of a rule is resolved here too, once per rule, from the run's single
+ * {@link EvaluationBatch}: which of the customer's transactions a rule applies to is a fact about
+ * the activity type, not a judgement, and it is what {@code submit_rule_evaluation} checks the
+ * agent's cited evidence against before a verdict is accepted.
  *
  * <p>All mutable collections are concurrent because tool execution order is decided by the model and
  * the framework, not by this class.
@@ -47,11 +47,10 @@ public final class AgentRunContext {
     private final Map<UUID, RiskRule> coverageSet;
     /** Coverage-set order, fixed at construction so every listing and every reprompt agrees. */
     private final List<UUID> orderedRuleIds;
-    private final Function<RiskRule, RuleEvaluationResult> evaluator;
     private final AnalysisTrace trace;
     private final AnalysisProgressListener progress;
 
-    private final Map<UUID, RuleEvaluationResult> deterministic = new ConcurrentHashMap<>();
+    private final Map<UUID, Scope> scopes = new ConcurrentHashMap<>();
     private final Map<UUID, AgentRuleVerdict> verdicts = new ConcurrentHashMap<>();
     private final Queue<ToolTiming> timings = new ConcurrentLinkedQueue<>();
     private final AtomicReference<FinalAssessment> finalAssessment = new AtomicReference<>();
@@ -60,18 +59,16 @@ public final class AgentRunContext {
     private final AtomicInteger stepsTaken = new AtomicInteger();
 
     public AgentRunContext(UUID assessmentId, Customer customer, EvaluationBatch batch,
-            Collection<RiskRule> coverageSet, Function<RiskRule, RuleEvaluationResult> evaluator,
-            AnalysisTrace trace) {
-        this(assessmentId, customer, batch, coverageSet, evaluator, trace, AnalysisProgressListener.NONE);
+            Collection<RiskRule> coverageSet, AnalysisTrace trace) {
+        this(assessmentId, customer, batch, coverageSet, trace, AnalysisProgressListener.NONE);
     }
 
     public AgentRunContext(UUID assessmentId, Customer customer, EvaluationBatch batch,
-            Collection<RiskRule> coverageSet, Function<RiskRule, RuleEvaluationResult> evaluator,
-            AnalysisTrace trace, AnalysisProgressListener progress) {
+            Collection<RiskRule> coverageSet, AnalysisTrace trace,
+            AnalysisProgressListener progress) {
         this.assessmentId = assessmentId;
         this.customer = customer;
         this.batch = batch;
-        this.evaluator = evaluator;
         this.trace = trace;
         this.progress = progress == null ? AnalysisProgressListener.NONE : progress;
         Map<UUID, RiskRule> rules = new LinkedHashMap<>();
@@ -116,6 +113,45 @@ public final class AgentRunContext {
     }
 
     // ------------------------------------------------------------------
+    // Rule scope
+    // ------------------------------------------------------------------
+
+    /**
+     * The transactions one rule applies to: those whose activity type matches its {@code applies_to}
+     * scope, or all of them for an {@code ALL}-scoped rule. Resolved from the run's snapshot and
+     * memoised, because the answer cannot change during a run.
+     */
+    public List<UUID> inScopeTransactionIds(UUID ruleId) {
+        Scope scope = scope(ruleId);
+        return scope == null ? List.of() : scope.ids();
+    }
+
+    /** How many of the customer's transactions the rule applies to. */
+    public int inScopeCount(UUID ruleId) {
+        return inScopeTransactionIds(ruleId).size();
+    }
+
+    /**
+     * Whether one transaction is in a rule's scope. This is the check that stops a hallucinated or
+     * out-of-scope transaction id from being recorded as evidence for a rule.
+     */
+    public boolean isInScope(UUID ruleId, UUID transactionId) {
+        Scope scope = scope(ruleId);
+        return scope != null && transactionId != null && scope.set().contains(transactionId);
+    }
+
+    private Scope scope(UUID ruleId) {
+        RiskRule rule = rule(ruleId);
+        if (rule == null) {
+            return null;
+        }
+        return scopes.computeIfAbsent(ruleId, key -> {
+            List<UUID> ids = batch.transactionIdsFor(rule.getAppliesTo());
+            return new Scope(List.copyOf(ids), Set.copyOf(new LinkedHashSet<>(ids)));
+        });
+    }
+
+    // ------------------------------------------------------------------
     // Coverage tracking
     // ------------------------------------------------------------------
 
@@ -150,24 +186,6 @@ public final class AgentRunContext {
 
     public AgentRuleVerdict verdict(UUID ruleId) {
         return verdicts.get(ruleId);
-    }
-
-    // ------------------------------------------------------------------
-    // Deterministic engine
-    // ------------------------------------------------------------------
-
-    /** Runs (or replays) the deterministic engine for one rule of the coverage set. */
-    public RuleEvaluationResult deterministic(UUID ruleId) {
-        RiskRule rule = coverageSet.get(ruleId);
-        if (rule == null) {
-            return null;
-        }
-        return deterministic.computeIfAbsent(ruleId, key -> evaluator.apply(rule));
-    }
-
-    /** Whether the agent already asked the engine about this rule. */
-    public boolean hasDeterministic(UUID ruleId) {
-        return deterministic.containsKey(ruleId);
     }
 
     // ------------------------------------------------------------------
@@ -257,5 +275,9 @@ public final class AgentRunContext {
     }
 
     private record ToolTiming(String tool, long ms) {
+    }
+
+    /** One rule's scope, kept as both a list (for row writing) and a set (for the id check). */
+    private record Scope(List<UUID> ids, Set<UUID> set) {
     }
 }

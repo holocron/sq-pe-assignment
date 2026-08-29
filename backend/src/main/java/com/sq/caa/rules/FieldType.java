@@ -1,42 +1,26 @@
 package com.sq.caa.rules;
 
-import java.util.List;
-
 /**
- * Value type of a catalog field. The type decides which operators the editor may offer and how the
- * evaluator coerces the right-hand side of a condition.
+ * Value type of a catalog field.
+ *
+ * <p>Purely descriptive since rule conditions became prose: it tells a rule author (and the reader
+ * of the reference panel) what kind of value a field holds, so a condition asks something the data
+ * can actually answer - a threshold on a {@link #NUMBER}, an exact value on an {@link #ENUM}.
  */
 public enum FieldType {
 
-    NUMBER(List.of(RuleOperator.GT, RuleOperator.GTE, RuleOperator.LT, RuleOperator.LTE,
-            RuleOperator.EQ, RuleOperator.NEQ, RuleOperator.BETWEEN, RuleOperator.IN,
-            RuleOperator.NOT_IN, RuleOperator.IS_NULL, RuleOperator.NOT_NULL)),
+    /** Decimal or integral number. */
+    NUMBER,
 
-    STRING(List.of(RuleOperator.EQ, RuleOperator.NEQ, RuleOperator.IN, RuleOperator.NOT_IN,
-            RuleOperator.CONTAINS, RuleOperator.NOT_CONTAINS, RuleOperator.MATCHES,
-            RuleOperator.IS_NULL, RuleOperator.NOT_NULL)),
+    /** Free text. */
+    STRING,
 
-    ENUM(List.of(RuleOperator.EQ, RuleOperator.NEQ, RuleOperator.IN, RuleOperator.NOT_IN,
-            RuleOperator.IS_NULL, RuleOperator.NOT_NULL)),
+    /** Text drawn from a known set of values, listed in {@link FieldDefinition#options()}. */
+    ENUM,
 
-    BOOLEAN(List.of(RuleOperator.EQ, RuleOperator.NEQ, RuleOperator.IS_NULL, RuleOperator.NOT_NULL)),
+    /** True or false. */
+    BOOLEAN,
 
-    DATETIME(List.of(RuleOperator.GT, RuleOperator.GTE, RuleOperator.LT, RuleOperator.LTE,
-            RuleOperator.BETWEEN, RuleOperator.EQ, RuleOperator.NEQ, RuleOperator.IS_NULL,
-            RuleOperator.NOT_NULL));
-
-    private final List<RuleOperator> allowedOperators;
-
-    FieldType(List<RuleOperator> allowedOperators) {
-        this.allowedOperators = List.copyOf(allowedOperators);
-    }
-
-    /** Operators the editor may offer for this type, in display order. */
-    public List<RuleOperator> allowedOperators() {
-        return allowedOperators;
-    }
-
-    public boolean supports(RuleOperator operator) {
-        return operator != null && allowedOperators.contains(operator);
-    }
+    /** Instant, always presented to the model in UTC ISO-8601. */
+    DATETIME
 }

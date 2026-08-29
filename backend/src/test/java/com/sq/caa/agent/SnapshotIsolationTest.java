@@ -32,11 +32,12 @@ import tools.jackson.databind.json.JsonMapper;
 /**
  * The single-snapshot property of an analysis run, tested against the real database.
  *
- * <p>An analysis loads the customer's activity once into an {@link EvaluationBatch} and both the
- * rule engine and the agent's tools read from it. The property that matters is not that the reads
- * are cheap but that they are <em>the same evidence</em>: if a tool went back to the database
- * mid-run, the model could quote a status, an amount or a merchant that the rule engine never
- * scored, and the engine-versus-agent cross-check would be comparing two different worlds.
+ * <p>An analysis loads the customer's activity once into an {@link EvaluationBatch} and every tool
+ * reads from it. The property that matters is not that the reads are cheap but that they are
+ * <em>one body of evidence</em>: the agent is the sole judge now, so if a tool went back to the
+ * database mid-run the model could quote a status, an amount or a merchant that no longer matches
+ * the transaction whose id its verdict cites - and the row written to {@code risk_assessments} would
+ * evidence something other than what the rationale describes.
  *
  * <p>So the row is deliberately moved underneath a live run: the transaction's status, amount and
  * merchant are updated in the database after the batch is built, and the persistence context is
@@ -109,7 +110,7 @@ class SnapshotIsolationTest {
                 transactions.findAllForCustomerWithDetails(customer.getCustomerId()));
         UUID assessmentId = UUID.randomUUID();
         AgentRunContext context = new AgentRunContext(assessmentId, customer, batch, List.of(),
-                rule -> null, AgentTestFixtures.trace(assessmentId));
+                AgentTestFixtures.trace(assessmentId));
         return new RiskAgentTools(context, null, null, JsonMapper.builder().build(), 25);
     }
 

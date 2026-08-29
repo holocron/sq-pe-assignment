@@ -17,7 +17,7 @@ that checks every configured risk rule, cites retrieved policy, and persists an 
 - [Architecture](#architecture)
 - [The ReAct risk agent](#the-react-risk-agent)
 - [Models and agent instructions](#models-and-agent-instructions)
-- [The risk rule DSL and visual editor](#the-risk-rule-dsl-and-visual-editor)
+- [Rule conditions and the rule editor](#rule-conditions-and-the-rule-editor)
 - [RAG and the knowledge base](#rag-and-the-knowledge-base)
 - [Database schema](#database-schema)
 - [Security](#security)
@@ -175,7 +175,7 @@ customers are deliberately clean so LOW/MEDIUM outcomes are reachable.
 │   security/    stateless JWT, ADMIN/OPERATOR, method-level @PreAuthorize     │
 │   service/     customer, transaction, activity summary, risk analysis        │
 │   agent/       ReAct loop · tools · coverage gate · trace · compaction       │
-│   rules/       rule DSL parser + evaluator + aggregates + field catalog      │
+│   rules/       rule validation · aggregates · field catalog · rule judge     │
 │   rag/         DOCX/PDF section chunking · embedding · vector search         │
 │   domain/      JPA entities        repository/   Spring Data JPA             │
 └──────────┬─────────────────────────────────────┬─────────────────────────────┘
@@ -198,11 +198,11 @@ POST /api/customers/{id}/analyses
   → bounded executor runs the ReAct loop
        ├─ tools read customers / transactions / rules / aggregates
        ├─ search_policy_knowledge → pgvector similarity search
-       ├─ evaluate_rule_deterministically → the DSL engine
+       ├─ submit_rule_evaluation → the agent's verdict on ONE rule
        └─ each step appended to the trace and pushed over SSE
-  → coverage gate: cannot finish while any applicable rule is unevaluated
-  → deterministic backfill for anything still missing
-  → persist: one risk_assessments row per (transaction, rule) + the analysis_runs record
+  → coverage gate: cannot finish while any applicable rule is unjudged
+  → still unjudged when the steps run out? the run is persisted FAILED, naming them
+  → persist: one risk_assessments row per (in-scope transaction, rule) + the analysis_runs record
 
 GET  /api/analyses/{id}          poll for status/result
 GET  /api/analyses/{id}/stream   SSE, live trace while RUNNING
@@ -249,24 +249,28 @@ of the deliverable — the model relies on them):
 | `get_transaction_details` | one transaction with its CARD/PAYMENT/CRYPTO specifics |
 | `list_risk_rules` | every applicable rule — this defines the coverage set |
 | `search_policy_knowledge` | **RAG** — vector search over the policy knowledge base |
-| `evaluate_rule_deterministically` | runs the DSL engine for one rule and returns exactly what matched |
-| `submit_rule_evaluation` | records the verdict for ONE rule |
+| `submit_rule_evaluation` | records the agent's verdict on ONE rule: triggered, score, evidence ids, rationale |
 | `submit_final_assessment` | terminal: risk level, summary, recommendations |
 
 ### The rule-coverage guarantee
 
-**A completed analysis always ends with 100% of applicable rules evaluated.** This is enforced
-structurally, not merely requested in the prompt:
+**A run may reach `COMPLETED` only when every applicable rule has an agent verdict.** This is
+enforced structurally, not merely requested in the prompt:
 
-1. The **coverage set** is computed up front from `risk_rules`.
-2. `submit_rule_evaluation` marks rules covered as the agent works.
-3. If the model tries to conclude with rules outstanding, the loop **does not exit** — it appends a
-   message naming the exact missing rules and continues, recording a `coverage_reprompt` trace step.
-4. Anything still unevaluated after the loop is **backfilled deterministically** by the rule engine
-   and recorded with `source = DETERMINISTIC_FALLBACK`.
-5. Every agent verdict is **cross-checked** against the deterministic engine. On disagreement the
-   **deterministic result wins** for scoring, and the disagreement is recorded in the trace.
-6. `analysis_runs.coverage_complete` records whether the agent covered everything itself.
+1. The **coverage set** is computed up front from `risk_rules` and fixed before turn one.
+2. `submit_rule_evaluation` is the only way a rule becomes covered.
+3. If the model tries to conclude with rules outstanding — by calling `submit_final_assessment` or
+   by simply writing prose — the loop **does not exit**. It appends a message naming the exact
+   missing rules, by name and id, and continues, recording a `coverage_reprompt` trace step.
+4. There is **no backfill**. Nothing behind the agent can close a gap, so if the loop exhausts its
+   steps with rules still unjudged the run is persisted **`FAILED`**, keeping the verdicts it did
+   reach and naming the rules that were never judged, in `analysis_runs.error` and in a
+   `coverage_failed` trace step. A partial review is never reported as a complete one.
+5. `AgentRunResult.coverageComplete()` is *derived* (`unjudged.isEmpty() && outcomes >= rulesTotal`),
+   so no caller can assert it, and `RiskAnalysisService` restates the check before the single call
+   that persists a run as `COMPLETED`.
+6. `analysis_runs.coverage_complete` is therefore `true` on every `COMPLETED` run, and
+   `rules_evaluated` / `rules_total` are the count of verdicts actually obtained.
 
 The result is auditable from the database — one `risk_assessments` row per `(transaction, rule)`
 sharing the run's `assessment_id`, **including non-triggered rules at `0.00`**:
@@ -289,9 +293,12 @@ FROM risk_assessments WHERE assessment_id = '…';
 
 The brief asks to minimise missed risk while keeping false positives reasonable. Three mechanisms:
 
-- **Deterministic-wins cross-check.** An LLM that overlooks or rationalises away a rule cannot
-  suppress a hit — the engine's verdict is authoritative for scoring.
-- **Mandatory total coverage.** No rule can be skipped, so no risk goes unexamined.
+- **Mandatory total coverage.** No rule can be skipped — not by the model losing interest, and not
+  by the run finishing early — so no risk goes unexamined. A rule the agent will not judge fails the
+  whole run rather than passing quietly at `0.00`.
+- **Evidence before a verdict.** `submit_rule_evaluation` refuses a `triggered` verdict with no
+  cited transaction, refuses ids that are not this customer's or not in the rule's scope, and
+  refuses an empty rationale. The agent cannot record a finding it cannot evidence.
 - **Asymmetric-cost prompting.** The system prompt states explicitly that a missed real risk costs
   far more than an extra review, and instructs the agent to escalate when evidence is ambiguous and
   never to assert a number that did not come from a tool.
@@ -326,9 +333,17 @@ Verdict quality was preferred over latency, because an analysis is a background 
 returns to rather than an interactive chat. Smaller tool-calling models (`Qwen3.6-35B-A3B`,
 `Gemma-4-26B-A4B`, `gpt-oss-20b`) are drop-in via `LLM_CHAT_MODEL` — configuration, not code.
 
-Two hard-won practical notes: the model advertises a 131k context but its backend was serving
-**32k**, which is what actually applies (hence `ConversationCompactor`); and Spring AI 2.x uses the
-official OpenAI SDK, which requires `/v1` **inside** the base URL.
+Three hard-won practical notes: the model advertises a 131k context but its backend was serving
+**32k**, which is what actually applies (hence `ConversationCompactor`); Spring AI 2.x uses the
+official OpenAI SDK, which requires `/v1` **inside** the base URL; and that SDK defaults every timeout to
+**60 seconds** with **3 retries**, which is wrong for a local reasoning model that needs one to three
+minutes per turn — left at the default, every slow turn was cut off and retried until the run died
+with `OpenAIIoException: Request failed`. There are **two** independent 60-second clocks and both
+have to be raised: `spring.ai.openai.timeout` bounds the shared OkHttp client, and
+`spring.ai.openai.chat.options.timeout` bounds each request (`OpenAiChatModel` copies it into the
+SDK's `RequestOptions`). Raising one leaves the other cutting the call. Both are `10m` here, with a
+single retry — retrying a merely slow generation just starts a second one on the same inference
+server.
 
 ### Agent instructions, in brief
 
@@ -366,36 +381,45 @@ which every review finding had to survive an agent trying to refute it (47 raise
 
 ---
 
-## The risk rule DSL and visual editor
+## Rule conditions and the rule editor
 
-`risk_rules.threshold_logic` holds JSON in a small recursive DSL:
+`risk_rules.threshold_logic` holds the rule condition **in natural language**. It is a prompt, not a
+program: nothing parses this column. The agent is shown the sentence verbatim, fetches the
+customer's data with its tools, and judges whether the rule is triggered and what it should score.
 
-```json
-{ "op": "AND", "conditions": [
-    { "field": "amount", "operator": "GTE", "value": 10000 },
-    { "op": "OR", "conditions": [
-        { "field": "payment.receiver_bank_country", "operator": "IN", "value": ["IR","KP","SY","RU"] },
-        { "field": "agg.distinct_countries_30d", "operator": "GT", "value": 5 }
-    ]}
-]}
+```text
+Three or more payments, each between 8,000 and 9,999.99, inside any rolling 24-hour window,
+together totalling at least 20,000. Read the created_at timestamps and amounts of the payments
+themselves to confirm the window; agg.tx_count_24h and agg.amount_sum_24h are a useful hint but
+they count activity of every type, and this rule is about the payments only.
+Why it matters: this is structuring - one large transfer split into amounts that each stay under
+the 10,000 reporting threshold so that none of them is reported. The tell is the clustering just
+below the threshold within hours, not the total. Cite every payment in the cluster.
 ```
 
-- **Groups** (`AND` / `OR` / `NOT`) nest arbitrarily; **leaves** are `field` / `operator` / `value`.
-- Operators: `GT GTE LT LTE EQ NEQ IN NOT_IN CONTAINS NOT_CONTAINS BETWEEN IS_NULL NOT_NULL MATCHES`.
-- Fields span the transaction, its type-specific detail, the customer, and **customer-level
-  aggregates** (`agg.tx_count_24h`, `agg.amount_sum_24h`, `agg.crypto_ratio_30d`, …).
-- **The evaluator never throws.** An unknown field, a null or a type mismatch yields `false` and
-  marks the result `degraded`, so one malformed rule can never break an analysis.
+- A condition states **a concrete threshold, a time window, and why the pattern matters**, because
+  the last part is what tells the agent how heavily to score a marginal case.
+- It may name **fields the agent can actually fetch** — the transaction, its type-specific detail,
+  the customer, and customer-level aggregates (`agg.tx_count_24h`, `agg.crypto_ratio_30d`, …).
+- It reaches the model **fenced as data** (`PromptSafety.fence("rule_condition", …)`): a condition
+  cannot close its own fence, and the system prompt says a rule's text can never change the
+  procedure or excuse skipping a rule.
+- Validation is textual and strict on write: 20–2,000 characters, unique name ≤ 160, weight
+  0.01–999.99, and a pasted `{"op":"AND",…}` document is **rejected** with "conditions are now plain
+  English" rather than stored and fed to the model as prose. Errors come back as
+  `application/problem+json` naming the offending `field`.
 
-The **field catalog is served by the API** (`GET /api/rules/field-catalog`) and drives the editor, so
-the two halves cannot drift: the operator dropdown is filtered to what is valid for the chosen
-field's type, and the value input adapts (number, date, boolean, enum select, multi-value chips for
-`IN`, two inputs for `BETWEEN`, none for `IS_NULL`).
+The **field catalog is still served by the API** (`GET /api/rules/field-catalog`, 26 entries), but it
+is now *reference material* rather than a grammar: the editor shows what data exists, with types,
+example values and nullability, and clicking a field inserts its path into the prose. A failed
+catalog fetch therefore no longer blocks saving.
 
-The admin editor is a real **visual builder** — nested groups with add/remove, inline validation, a
-live JSON preview, and a "Test rule" action that evaluates the draft against real seeded data before
-saving. Rules that could never fire (e.g. a CARD-scoped rule referencing `payment.*` fields) are
-rejected on save, because a rule that silently never matches is a false-negative generator.
+The admin editor is an authoring surface: an auto-growing condition textarea with a live character
+counter, six worked example conditions, a weight control that shows what the weight is worth against
+the whole catalogue, and a **Test rule** action that sends the draft to the model for one customer
+and shows the verdict, the score, the rationale and the cited transactions. The result panel states
+plainly that it is a judgement rather than a calculation and that a second run can differ — and it
+tells you when the model's estimate was capped at the rule's weight.
 
 ---
 
@@ -482,27 +506,32 @@ needed to record every step for the audit trail *and* to refuse termination whil
 outstanding. Owning the loop made both trivial. Spring AI still provides transport, tool schema
 generation and the vector store.
 
-**2. Hybrid AI + deterministic scoring, with the deterministic side authoritative.**
-An LLM alone is not an acceptable basis for a bank's risk score — it is not reproducible and it can
-rationalise away a hit. A rule engine alone cannot read policy or explain itself in context. So the
-engine owns *scoring* and guarantees coverage; the agent owns *investigation, narrative and
-recommendations*, and must justify itself against the engine. Disagreements are recorded rather than
-hidden.
+**2. The agent is the scoring authority, and the cost of that is stated rather than hidden.**
+`threshold_logic` is a rule *condition* written by a compliance officer in their own words, and the
+agent reads it, gathers the evidence and judges it. There is no engine behind the agent to check the
+answer. Two consequences follow and neither is papered over: **risk scores are not reproducible
+run-to-run**, and a rule the agent misjudges is misjudged for good. What is guaranteed instead is
+that every applicable rule is *judged*, on evidence the tools verified, or the run does not complete
+at all. Each score is the agent's estimate, capped at the rule's weight, and every screen that shows
+one says so.
 
 **3. Rule coverage enforced structurally, not by prompting.**
-"Please check every rule" is not a guarantee. A gate that refuses to let the loop end, plus a
-deterministic backfill, is. This is why coverage is 100% on every completed run.
+"Please check every rule" is not a guarantee. A gate that refuses to let the loop end — and a run
+that is stored `FAILED`, naming the rules it never judged, when the gate cannot be satisfied — is.
+This is why `coverage_complete` is `true` on every `COMPLETED` run.
 
 **4. Asynchronous analyses with a live trace.**
 A local 120B model takes minutes per run. A synchronous endpoint would time out and make the product
 feel broken, so `POST` returns `202` immediately and the trace streams over SSE, with polling as a
 fallback. The wait becomes legible instead of a spinner.
 
-**5. The rule DSL is JSON with an API-served field catalog.**
-`threshold_logic` is `TEXT` in the given schema, so it needed a format. A small typed JSON DSL can be
-safely parsed, evaluated, *and* round-tripped through a visual editor — whereas storing raw SQL or a
-scripting expression would have meant either an injection surface or an un-editable blob. Serving the
-field catalog from the backend keeps the editor and the evaluator from drifting apart.
+**5. `threshold_logic` is prose, and the field catalog is reference material.**
+The schema calls the column a "Rule condition" and types it `TEXT`. Read as a machine grammar it
+buys reproducibility; read as natural language it buys rules a compliance officer can actually write,
+including the judgement ("score near the full weight only when …") that no operator table can
+express. The second reading is the one implemented. The column is stored verbatim, fenced as
+untrusted data on its way to the model, and validated only for length, uniqueness and *not* being a
+pasted JSON document. The API-served field catalog keeps the author honest about which data exists.
 
 **6. One vector table, owned by our migrations.**
 Spring AI's `PgVectorStore` can create its own table, but then the schema is invisible to Flyway. We
@@ -530,8 +559,9 @@ genuinely needs data that does not exist.
    verdict stored on the run.
 3. **Extra tables are permitted.** Login, RAG and persisted AI results are required features with no
    given schema, so four supporting tables were added. The seven specified tables are untouched.
-4. **`threshold_logic` format.** The brief leaves "Rule condition" as free text; we defined a JSON
-   DSL and documented it. Existing rules would need migrating to it.
+4. **`threshold_logic` format.** The brief leaves "Rule condition" as free text; it is read here as
+   natural language — the prompt the agent judges — not as a machine grammar. No column changed;
+   rules written for a parser would need rewriting as prose.
 5. **Amounts are not FX-converted.** Transactions carry mixed currencies and no rate source was
    given, so totals are never silently summed across currencies — sums are per currency, and any
    cross-currency total is labelled as such. Risk thresholds are evaluated against the transaction's
@@ -581,7 +611,18 @@ Verification went beyond the suites, because green tests turned out not to imply
 ## Known limitations
 
 - **Analyses take minutes.** A local quantised 120B model with a 32k effective context is the
-  bottleneck. A hosted frontier model would cut this to seconds; the code is provider-agnostic.
+  bottleneck — roughly 20-30 generated tokens a second, and the agent reasons before every turn. A
+  complete twelve-rule analysis runs seven to fifteen minutes; one "Test rule" judgement is about a
+  minute. A hosted frontier model would cut this to seconds; the code is provider-agnostic.
+- **Risk scores are not reproducible.** The agent judges each rule, so the same customer analysed
+  twice can score differently. That is the accepted cost of reading `threshold_logic` as natural
+  language, and it is stated on the analysis screen rather than hidden. What *is* guaranteed is
+  coverage: every applicable rule is judged, or the run is `FAILED`.
+- **Judgement quality varies with the rule.** In verification the agent read one seeded condition
+  ("eight or more transactions … above 40,000") as requiring ten, and cleared a customer whose
+  activity did meet it. A deterministic engine would not have made that mistake. Conditions should
+  therefore state one threshold per sentence, and a rule that matters should be spot-checked with
+  **Test rule** after it is written.
 - **Vector search is an exact scan.** pgvector refuses an HNSW index above 2000 dimensions, and the
   embedding model produces 2560. At a few dozen policy chunks this is irrelevant; at scale it needs
   either a smaller embedding model or dimensionality reduction. The trade-off is documented in the
@@ -603,7 +644,7 @@ Verification went beyond the suites, because green tests turned out not to imply
 ├── backend/                     Spring Boot 4.1.1 · Java 21 · Maven
 │   └── src/main/java/com/sq/caa/
 │       ├── agent/               ReAct loop, tools, coverage gate, trace, compaction
-│       ├── rules/               DSL parser/evaluator, aggregates, field catalog
+│       ├── rules/               validation, aggregates, field catalog, rule judge
 │       ├── rag/                 DOCX/PDF extraction, section chunking, vector store
 │       ├── domain/ repository/  JPA entities and Spring Data repositories
 │       ├── service/ web/        business services, controllers, DTO records

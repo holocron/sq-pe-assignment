@@ -1,20 +1,12 @@
 /**
  * Admin screen for the risk-rule catalogue.
  *
- * Lists every rule with a plain-English summary of its `threshold_logic`, and
- * opens the visual editor (BUILD_SPEC section 3 DSL) to create, edit, duplicate
- * or delete one.
+ * `risk_rules.threshold_logic` is prose: the agent reads each condition, fetches
+ * the customer's data with its tools and judges the verdict itself. The table
+ * therefore shows the condition as written rather than a rendering of a parsed
+ * expression, and the editor is an authoring tool for that prose.
  */
-import {
-  Braces,
-  Copy,
-  ListFilter,
-  Pencil,
-  Plus,
-  Scale,
-  SlidersHorizontal,
-  Trash2,
-} from 'lucide-react'
+import { Copy, Database, ListFilter, Pencil, Plus, Scale, Trash2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { errorMessage } from '../../api/errors'
 import { useDeleteRule, useFieldCatalog, useRules } from '../../api/rules'
@@ -31,9 +23,8 @@ import { StatCard } from '../../components/ui/StatCard'
 import { Table, type Column } from '../../components/ui/Table'
 import { useToast } from '../../components/ui/Toast'
 import { formatNumber, shortId } from '../../lib/format'
-import { countConditions, ruleDepth } from '../../lib/rules'
 import { RuleEditor, type RuleEditorMode } from './rules/RuleEditor'
-import { describeRuleEnglish, serializedJson, type Catalog } from './rules/ruleModel'
+import { conditionExcerpt } from './rules/conditionText'
 
 const SCOPE_FILTER_ALL = 'ALL_SCOPES'
 
@@ -43,7 +34,6 @@ interface EditorState {
 }
 
 function buildColumns(
-  catalog: Catalog,
   onEdit: (rule: RiskRule) => void,
   onDuplicate: (rule: RiskRule) => void,
   onDelete: (rule: RiskRule) => void,
@@ -85,20 +75,18 @@ function buildColumns(
       key: 'condition',
       header: 'Condition',
       cell: (rule) => {
-        const summary = describeRuleEnglish(rule.thresholdLogic, catalog)
-        const conditions = countConditions(rule.thresholdLogic)
-        const depth = ruleDepth(rule.thresholdLogic)
+        const excerpt = conditionExcerpt(rule.thresholdLogic)
+        if (excerpt.length === 0) {
+          return (
+            <p className="text-xs text-danger-fg">
+              No condition stored — the agent has nothing to judge.
+            </p>
+          )
+        }
         return (
           <div className="min-w-0 max-w-xl">
-            <p className="line-clamp-2 text-xs leading-relaxed text-fg" title={summary}>
-              {summary}
-            </p>
-            <p className="mt-1 flex items-center gap-1.5 text-2xs text-subtle">
-              <Braces aria-hidden="true" className="size-3 shrink-0" />
-              <span className="numeric">
-                {conditions} condition{conditions === 1 ? '' : 's'} · {depth} level
-                {depth === 1 ? '' : 's'} deep
-              </span>
+            <p className="line-clamp-2 text-xs leading-relaxed text-fg" title={rule.thresholdLogic}>
+              {excerpt}
             </p>
           </div>
         )
@@ -169,8 +157,7 @@ export function RulesPage() {
     return rules.filter((rule) => {
       if (scopeFilter !== SCOPE_FILTER_ALL && rule.appliesTo !== scopeFilter) return false
       if (needle.length === 0) return true
-      const haystack = `${rule.ruleName} ${serializedJson(rule.thresholdLogic)}`.toLowerCase()
-      return haystack.includes(needle)
+      return `${rule.ruleName} ${rule.thresholdLogic}`.toLowerCase().includes(needle)
     })
   }, [rules, search, scopeFilter])
 
@@ -182,12 +169,11 @@ export function RulesPage() {
   const columns = useMemo(
     () =>
       buildColumns(
-        catalog,
         (rule) => setEditor({ mode: 'edit', rule }),
         (rule) => setEditor({ mode: 'duplicate', rule }),
         (rule) => setPendingDelete(rule),
       ),
-    [catalog],
+    [],
   )
 
   const confirmDelete = (): void => {
@@ -195,7 +181,7 @@ export function RulesPage() {
     if (!target) return
     deleteRule.mutate(target.ruleId, {
       onSuccess: () => {
-        toast.success('Rule deleted', `“${target.ruleName}” is no longer evaluated.`)
+        toast.success('Rule deleted', `“${target.ruleName}” is no longer judged.`)
         setPendingDelete(null)
       },
       onError: (error) => {
@@ -210,7 +196,7 @@ export function RulesPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Risk rules"
-        description="Deterministic rules the agent must evaluate for every analysis. Each matching rule adds its weight to the customer's risk score."
+        description="Each rule states its condition in plain English. The agent reads it, fetches the customer's data and judges whether the rule is triggered — and every applicable rule must have a verdict before a run can complete."
         actions={
           <Button
             variant="primary"
@@ -226,7 +212,7 @@ export function RulesPage() {
         <StatCard
           label="Rules"
           value={rules.length}
-          hint="evaluated on every analysis"
+          hint="judged on every analysis in scope"
           icon={<ListFilter className="size-4" />}
           loading={rulesQuery.isPending}
         />
@@ -242,10 +228,10 @@ export function RulesPage() {
           numeric
         />
         <StatCard
-          label="Catalog fields"
+          label="Available data"
           value={catalog.length}
-          hint="available to the condition builder"
-          icon={<SlidersHorizontal className="size-4" />}
+          hint="fields the agent can fetch"
+          icon={<Database className="size-4" />}
           loading={catalogQuery.isPending}
         />
       </div>
@@ -256,7 +242,7 @@ export function RulesPage() {
             label="Search rules"
             hideLabel
             containerClassName="min-w-56 flex-1"
-            placeholder="Filter by rule name or field…"
+            placeholder="Filter by rule name or condition text…"
             value={search}
             onChange={(event) => setSearch(event.target.value)}
           />
@@ -310,7 +296,7 @@ export function RulesPage() {
               <EmptyState
                 icon={<ListFilter className="size-5" />}
                 title="No risk rules yet"
-                description="Create the first rule to give the agent something deterministic to evaluate."
+                description="Create the first rule to give the agent something to judge."
                 action={
                   <Button
                     variant="primary"
@@ -360,8 +346,8 @@ export function RulesPage() {
       >
         <div className="flex flex-col gap-2 text-sm text-muted">
           <p>
-            This cannot be undone. Future analyses will no longer evaluate this rule, and the
-            maximum attainable risk score drops by{' '}
+            This cannot be undone. Future analyses will no longer judge this rule, and the maximum
+            attainable risk score drops by{' '}
             <span className="numeric font-medium text-fg">
               {formatNumber(pendingDelete?.weight ?? 0, {
                 minimumFractionDigits: 2,

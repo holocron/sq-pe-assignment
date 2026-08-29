@@ -20,6 +20,29 @@ describe('normalizeTraceStep', () => {
       tool: 'list_risk_rules',
       args: {},
       resultPreview: '10 rules',
+      subject: null,
+      outcome: null,
+    })
+  })
+
+  /* Twelve verdict steps have to read as twelve different rules. The backend
+     labels each step where the meaning was known, so the labels have to survive
+     normalisation rather than being re-derived from a truncated preview. */
+  it('forwards the recorded step labels', () => {
+    expect(
+      normalizeTraceStep({
+        n: 6,
+        type: 'tool_call',
+        tool: 'submit_rule_evaluation',
+        args: { rule_id: 'r-2' },
+        result_preview: '{"ruleName":"Structuring',
+        ms: 1421,
+        subject: 'Structuring - repeated payments just below the reporting threshold',
+        outcome: 'triggered +30.00 (rule 3 of 12)',
+      }),
+    ).toMatchObject({
+      subject: 'Structuring - repeated payments just below the reporting threshold',
+      outcome: 'triggered +30.00 (rule 3 of 12)',
     })
   })
 

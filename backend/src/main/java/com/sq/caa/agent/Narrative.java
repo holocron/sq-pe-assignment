@@ -20,8 +20,9 @@ package com.sq.caa.agent;
  *       break the trace JSON and the CSV a reviewer might export.</li>
  *   <li>Runs of horizontal whitespace collapse to one space; runs of blank lines collapse to one
  *       blank line. Line structure is kept, because recommendations are one action per line.</li>
- *   <li>Text carrying no letter or digit is treated as absent, so the caller's deterministic
- *       fallback narrative is used instead of a line of punctuation.</li>
+ *   <li>Text carrying no letter or digit is treated as absent, so the caller's generated fallback
+ *       narrative is used instead of a line of punctuation - and, for a rule rationale, so a
+ *       verdict cannot be submitted with punctuation in place of a reason.</li>
  *   <li>Length is capped. A summary is specified as three to six sentences; anything past
  *       {@value #MAX_CHARS} characters is a runaway generation, not a narrative.</li>
  * </ul>

@@ -35,7 +35,7 @@ src/
   auth/         AuthContext, useAuth, ProtectedRoute, RoleGate, session storage
   components/   ui primitives (Button, Table, Badge, RiskBadge, Modal, Toast, ...),
                 AppShell + Nav
-  lib/          formatting, risk colour scale, rule-DSL helpers, theme
+  lib/          formatting, risk colour scale, activity helpers, theme
   pages/        one directory per feature area; page components are named exports
 ```
 
@@ -50,7 +50,7 @@ src/
 | `/analyses` | analysis history across customers | signed in |
 | `/analyses/:assessmentId` | live ReAct trace, verdict, rule coverage | signed in |
 | `/knowledge-search` | RAG search over the policy corpus | signed in |
-| `/admin/rules` | visual rule editor for the threshold DSL | ADMIN |
+| `/admin/rules` | rule editor: the condition in plain English, the field catalog beside it, Test rule | ADMIN |
 | `/admin/knowledge` | upload / manage policy documents | ADMIN |
 | `/admin/users` | read-only user directory | ADMIN |
 

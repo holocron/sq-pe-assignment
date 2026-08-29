@@ -35,7 +35,7 @@ import org.hibernate.type.SqlTypes;
 @NoArgsConstructor
 public class Transaction {
 
-    /** {@code status} values used throughout the application and the rule DSL. */
+    /** {@code status} values used throughout the application and the field catalog. */
     public static final String STATUS_COMPLETED = "Completed";
     public static final String STATUS_PENDING = "Pending";
     public static final String STATUS_FAILED = "Failed";

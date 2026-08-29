@@ -102,7 +102,7 @@ class RiskAssessmentWriterTest {
                     .ruleId(UUID.randomUUID())
                     .ruleName("Writer rule " + index + " " + UUID.randomUUID())
                     .appliesTo(RuleScope.ALL)
-                    .thresholdLogic("{\"field\":\"amount\",\"operator\":\"GT\",\"value\":1000}")
+                    .thresholdLogic("Any transaction above 1,000.")
                     .weight(new BigDecimal("10.00"))
                     .build()));
         }
@@ -162,7 +162,7 @@ class RiskAssessmentWriterTest {
     }
 
     @Test
-    @DisplayName("one row per (transaction, rule) pair evaluated survives the round trip to the database")
+    @DisplayName("one row per (transaction, rule) pair judged survives the round trip to the database")
     void everyEvaluatedPairIsPersisted() {
         UUID assessmentId = UUID.randomUUID();
         RiskAssessmentWriter.write(entityManager.getEntityManager(), rows(assessmentId));
@@ -170,7 +170,7 @@ class RiskAssessmentWriterTest {
         entityManager.clear();
 
         assertEquals((long) TRANSACTIONS * RULES, riskAssessments.countById_AssessmentId(assessmentId),
-                "one row per (transaction, rule) pair evaluated");
+                "one row per (transaction, rule) pair judged");
         assertEquals(RULES, riskAssessments.countDistinctRules(assessmentId),
                 "every rule of the coverage set is present, triggered or not");
         assertEquals(RULES, riskAssessments.findEvaluatedRuleIds(assessmentId).size());
@@ -258,12 +258,14 @@ class RiskAssessmentWriterTest {
                     new BigDecimal("10.00"),
                     triggered,
                     triggered ? new BigDecimal("10.00") : new BigDecimal("0.00"),
-                    triggered ? RuleVerdictSource.AGENT : RuleVerdictSource.DETERMINISTIC_FALLBACK,
+                    RuleVerdictSource.AGENT_JUDGED,
                     transactionIds.size(),
                     matched.size(),
                     matched,
                     transactionIds,
-                    false, List.of(), "explanation", null, null, null, false));
+                    "The agent judged this rule from the transactions it cited.",
+                    null,
+                    false));
         }
         return RiskAssessmentRows.build(assessmentId, outcomes, NOW);
     }

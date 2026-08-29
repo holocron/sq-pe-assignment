@@ -6,16 +6,24 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * What the agent claimed about one rule through {@code submit_rule_evaluation}.
+ * The agent's judgement of one rule, as submitted through {@code submit_rule_evaluation}.
  *
- * <p>Deliberately kept separate from the deterministic verdict: the two are compared afterwards and
- * the difference is what the trace reports. The agent's {@code score} is advisory - scoring always
- * uses the deterministic engine - but it is retained so a reviewer can see what the model believed.
+ * <p>This is the whole verdict: there is no engine behind it to confirm or overturn it. What the
+ * tool accepts is therefore what gets scored and what a compliance officer reads, which is why the
+ * tool validates hard before a verdict is ever recorded - a rationale is mandatory, matched
+ * transaction ids must belong to the rule's own scope, and the score is clamped to the rule's
+ * weight.
+ *
+ * @param score        the score after clamping; this is what the run is scored on
+ * @param claimedScore the number the model actually asked for, or {@code null} when it named none.
+ *                     Kept so that {@link #scoreClamped()} can say honestly that the model tried to
+ *                     award a rule more than its weight
  */
 public record AgentRuleVerdict(
         UUID ruleId,
         boolean triggered,
         BigDecimal score,
+        BigDecimal claimedScore,
         List<UUID> transactionIds,
         String rationale,
         Instant submittedAt) {
@@ -25,5 +33,10 @@ public record AgentRuleVerdict(
         // The rationale is rendered verbatim in the coverage table, so it gets the same
         // cleaning as the final narrative - see Narrative.
         rationale = Narrative.clean(rationale);
+    }
+
+    /** True when the model asked for a score the rule's weight did not allow. */
+    public boolean scoreClamped() {
+        return claimedScore != null && score != null && claimedScore.compareTo(score) != 0;
     }
 }

@@ -64,7 +64,7 @@ public final class AnalysisTrace {
 
     /**
      * A transcript that fans out on the calling thread. Only for callers that never subscribe -
-     * tests, and the deterministic-only path; production goes through
+     * tests, and any path that records without streaming; production goes through
      * {@link AnalysisStreamRegistry}, which supplies the fan-out executor.
      */
     public AnalysisTrace(UUID assessmentId, JsonNodeFactory nodes) {
@@ -100,6 +100,8 @@ public final class AnalysisTrace {
 
     public TraceStep started(String model, String customerName, int ruleCount) {
         return add(builder(TraceStep.Type.STARTED)
+                .subject(customerName)
+                .outcome(ruleCount + " rule(s) to judge")
                 .text("Analysing " + customerName + " with " + model + "; " + ruleCount
                         + " applicable rule(s) must each receive a verdict."));
     }
@@ -108,12 +110,22 @@ public final class AnalysisTrace {
         return add(builder(TraceStep.Type.ASSISTANT).text(TraceStep.truncate(text, TraceStep.TEXT_LIMIT)));
     }
 
-    public TraceStep toolCall(String tool, JsonNode args, String resultPreview, long ms) {
+    /**
+     * One executed tool call.
+     *
+     * <p>{@code note} is what makes the step legible while collapsed: twelve rules produce two dozen
+     * steps whose tool name is the same, so the rule being judged - or the transaction opened, or
+     * the query searched - is recorded on the step itself rather than being left inside the
+     * arguments. It may be null for a tool whose call is not scoped to anything nameable.
+     */
+    public TraceStep toolCall(String tool, JsonNode args, String resultPreview, long ms,
+            TraceStep.Note note) {
         return add(builder(TraceStep.Type.TOOL_CALL)
                 .tool(tool)
                 .args(args)
                 .resultPreview(TraceStep.truncate(resultPreview, TraceStep.PREVIEW_LIMIT))
-                .ms(ms));
+                .ms(ms)
+                .note(note));
     }
 
     /** The gate fired: the model tried to conclude while these rules had no verdict. */
@@ -124,6 +136,7 @@ public final class AnalysisTrace {
         return add(builder(TraceStep.Type.COVERAGE_REPROMPT)
                 .missing(List.copyOf(missingRuleIds))
                 .detail(detail)
+                .outcome(missingRuleIds.size() + " rule(s) still unjudged")
                 .text("Coverage gate: " + missingRuleIds.size() + " rule(s) still have no verdict - "
                         + String.join(", ", missingRuleNames)
                         + ". The model was told to keep working instead of concluding."));
@@ -133,32 +146,29 @@ public final class AnalysisTrace {
         return add(builder(TraceStep.Type.REPROMPT).text(text));
     }
 
-    public TraceStep disagreement(UUID ruleId, String ruleName, boolean agentTriggered,
-            boolean deterministicTriggered) {
+    /**
+     * The run ended with applicable rules still unjudged.
+     *
+     * <p>Recorded on the way out of a failed run, before the result is persisted, so the transcript
+     * a reviewer opens names the rules that were never looked at rather than merely showing a
+     * coverage counter that stops short.
+     */
+    public TraceStep coverageFailed(int rulesTotal, Collection<String> unjudgedRuleIds,
+            Collection<String> unjudgedRuleNames) {
         ObjectNode detail = nodes.objectNode();
-        detail.put("rule_id", ruleId.toString());
-        detail.put("rule_name", ruleName);
-        detail.put("agent_triggered", agentTriggered);
-        detail.put("deterministic_triggered", deterministicTriggered);
-        return add(builder(TraceStep.Type.DISAGREEMENT)
+        detail.put("rules_total", rulesTotal);
+        detail.put("rules_unjudged", unjudgedRuleIds.size());
+        ArrayNode names = detail.putArray("unjudged_rule_names");
+        unjudgedRuleNames.forEach(names::add);
+        return add(builder(TraceStep.Type.COVERAGE_FAILED)
+                .missing(List.copyOf(unjudgedRuleIds))
                 .detail(detail)
-                .text("Cross-check on '" + ruleName + "': the agent said "
-                        + (agentTriggered ? "triggered" : "not triggered") + " but the rule engine said "
-                        + (deterministicTriggered ? "triggered" : "not triggered")
-                        + ". The deterministic result wins for scoring."));
-    }
-
-    public TraceStep backfill(UUID ruleId, String ruleName, boolean triggered) {
-        ObjectNode detail = nodes.objectNode();
-        detail.put("rule_id", ruleId.toString());
-        detail.put("rule_name", ruleName);
-        detail.put("triggered", triggered);
-        detail.put("source", RuleVerdictSource.DETERMINISTIC_FALLBACK.name());
-        return add(builder(TraceStep.Type.BACKFILL)
-                .detail(detail)
-                .text("Rule '" + ruleName + "' never received an agent verdict and was evaluated by the "
-                        + "deterministic engine instead (" + (triggered ? "triggered" : "not triggered")
-                        + ")."));
+                .outcome(unjudgedRuleIds.size() + " of " + rulesTotal + " never judged")
+                .text("Coverage failure: " + unjudgedRuleIds.size() + " of " + rulesTotal
+                        + " applicable rule(s) never received a verdict - "
+                        + String.join(", ", unjudgedRuleNames)
+                        + ". This analysis is recorded as FAILED; the verdicts already obtained are "
+                        + "kept, but the review is not complete and must be run again."));
     }
 
     /**
@@ -444,6 +454,8 @@ public final class AnalysisTrace {
         private List<String> missing;
         private String riskLevel;
         private JsonNode detail;
+        private String subject;
+        private String outcome;
 
         private StepBuilder(String type) {
             this.type = type;
@@ -489,9 +501,27 @@ public final class AnalysisTrace {
             return this;
         }
 
+        private StepBuilder subject(String value) {
+            this.subject = value;
+            return this;
+        }
+
+        private StepBuilder outcome(String value) {
+            this.outcome = value;
+            return this;
+        }
+
+        /** Applies a tool's note, if it produced one; a null note leaves the step as it was. */
+        private StepBuilder note(TraceStep.Note value) {
+            if (value == null) {
+                return this;
+            }
+            return subject(value.subject()).outcome(value.outcome());
+        }
+
         private TraceStep build(int n) {
             return new TraceStep(n, type, Instant.now(), tool, args, resultPreview, ms, text, missing,
-                    riskLevel, detail);
+                    riskLevel, detail, subject, outcome);
         }
     }
 }

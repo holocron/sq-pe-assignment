@@ -16,8 +16,14 @@ import org.junit.jupiter.api.Test;
  * The {@code risk_assessments} rows a run writes.
  *
  * <p>Two invariants are load-bearing and are asserted here: one row exists for every (transaction,
- * rule) pair evaluated - including the rules that did not trigger, at {@code 0.00} - and the score
- * contributed by a rule sums to exactly its weight, never more, whatever the number of matches.
+ * rule) pair the agent judged - including the rules it found not triggered, at {@code 0.00} - and
+ * the score contributed by a rule sums to exactly the score the agent gave it, which
+ * {@code submit_rule_evaluation} has already capped at the rule's weight, whatever the number of
+ * transactions cited.
+ *
+ * <p>A rule the agent never judged has no outcome and so appears nowhere below: that case is the
+ * subject of {@link RuleCoverageGuaranteeTest}, and it is why a partial run fails rather than
+ * writing rows that would look like a completed check.
  */
 class RiskAssessmentRowsTest {
 
@@ -32,7 +38,7 @@ class RiskAssessmentRowsTest {
 
         List<RiskAssessment> rows = RiskAssessmentRows.build(UUID.randomUUID(), List.of(outcome), AT);
 
-        assertEquals(5, rows.size(), "one row per (transaction, rule) pair evaluated");
+        assertEquals(5, rows.size(), "one row per (transaction, rule) pair judged");
         assertEquals(0, new BigDecimal("30.00").compareTo(sum(rows)));
         assertEquals(3, rows.stream().filter(RiskAssessment::isTriggered).count());
         assertEquals(2, rows.stream().filter(row -> !row.isTriggered()).count());
@@ -93,10 +99,9 @@ class RiskAssessmentRowsTest {
     private static RuleOutcome outcome(String name, String weight, boolean triggered, String score,
             List<UUID> matched, List<UUID> inScope) {
         return new RuleOutcome(UUID.randomUUID(), name, RuleScope.ALL, new BigDecimal(weight), triggered,
-                new BigDecimal(score), triggered ? RuleVerdictSource.AGENT
-                        : RuleVerdictSource.DETERMINISTIC_FALLBACK,
-                inScope.size(), matched.size(), matched, inScope, false, List.of(), name + " explanation",
-                null, null, null, false);
+                new BigDecimal(score), RuleVerdictSource.AGENT_JUDGED, inScope.size(), matched.size(),
+                matched, inScope, "The agent judged " + name + " from the evidence it cited.", null,
+                false);
     }
 
     private static List<UUID> ids(int count) {

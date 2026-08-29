@@ -3,17 +3,22 @@ package com.sq.caa.rules;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.sq.caa.domain.RuleScope;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /**
- * The catalog is a shared contract: the evaluator resolves these names, the validator rejects
- * anything else, and the frontend editor is generated from it. Renaming an entry breaks stored
- * rules, so the exact list is pinned here.
+ * The catalog is the promise the rule editor makes to a rule author: "these are the values the agent
+ * can see, so a condition about them is one it can settle from evidence".
+ *
+ * <p>Two things therefore have to hold, and both are pinned here. The list of names is stable API -
+ * the editor's reference panel and the evidence the model is shown are generated from it. And every
+ * entry has to be usable as reference material: a label, a type, a category, a description and an
+ * example, because an entry with a blank description tells an author nothing.
  */
 class FieldCatalogTest {
 
     @Test
-    void containsExactlyTheFieldsOfTheSpecification() {
+    void containsExactlyTheFieldsTheAgentCanSee() {
         assertThat(FieldCatalog.fieldNames()).containsExactly(
                 "amount",
                 "currency",
@@ -44,59 +49,58 @@ class FieldCatalogTest {
     }
 
     @Test
-    void everyEntryIsUsableByAnEditor() {
+    void everyEntryIsUsableAsReferenceMaterial() {
         for (FieldDefinition definition : FieldCatalog.entries()) {
             assertThat(definition.label()).as("label of %s", definition.field()).isNotBlank();
-            assertThat(definition.description()).as("description of %s", definition.field()).isNotBlank();
+            assertThat(definition.description()).as("description of %s", definition.field())
+                    .isNotBlank();
+            assertThat(definition.example()).as("example of %s", definition.field()).isNotBlank();
             assertThat(definition.type()).as("type of %s", definition.field()).isNotNull();
+            assertThat(definition.category()).as("category of %s", definition.field()).isNotNull();
             assertThat(definition.appliesTo()).as("scope of %s", definition.field()).isNotNull();
-            assertThat(definition.allowedOperators()).as("operators of %s", definition.field()).isNotEmpty();
-            if (definition.optionsClosed()) {
-                assertThat(definition.options()).as("options of %s", definition.field()).isNotEmpty();
-            }
         }
     }
 
     @Test
-    void enumeratedFieldsCarryTheirOptions() {
-        assertThat(FieldCatalog.find("status").orElseThrow().options())
-                .containsExactly("Completed", "Pending", "Failed", "Reversed");
-        assertThat(FieldCatalog.find("activity_type").orElseThrow().options())
-                .containsExactly("CARD", "PAYMENT", "CRYPTO");
-        assertThat(FieldCatalog.find("card.card_type").orElseThrow().options())
-                .containsExactly("Debit", "Credit", "Prepaid");
-        assertThat(FieldCatalog.find("payment.payment_method").orElseThrow().options())
-                .containsExactly("ACH", "Wire", "SWIFT", "P2P");
-        assertThat(FieldCatalog.find("crypto.blockchain").orElseThrow().optionsClosed()).isFalse();
+    void categoriesGroupTheFieldsTheWayTheEditorRendersThem() {
+        assertThat(categoryOf("amount")).isEqualTo(FieldCategory.TRANSACTION);
+        assertThat(categoryOf("customer.country")).isEqualTo(FieldCategory.CUSTOMER);
+        assertThat(categoryOf("card.mcc_code")).isEqualTo(FieldCategory.CARD);
+        assertThat(categoryOf("payment.payment_method")).isEqualTo(FieldCategory.PAYMENT);
+        assertThat(categoryOf("crypto.blockchain")).isEqualTo(FieldCategory.CRYPTO);
+        assertThat(categoryOf("agg.tx_count_24h")).isEqualTo(FieldCategory.AGGREGATE);
     }
 
     @Test
-    void operatorsFollowTheValueType() {
-        assertThat(FieldCatalog.find("amount").orElseThrow().allowedOperators())
-                .containsExactly(RuleOperator.GT, RuleOperator.GTE, RuleOperator.LT, RuleOperator.LTE,
-                        RuleOperator.EQ, RuleOperator.NEQ, RuleOperator.BETWEEN, RuleOperator.IN,
-                        RuleOperator.NOT_IN, RuleOperator.IS_NULL, RuleOperator.NOT_NULL);
-        assertThat(FieldCatalog.find("card.merchant_name").orElseThrow().allowedOperators())
-                .contains(RuleOperator.CONTAINS, RuleOperator.NOT_CONTAINS, RuleOperator.MATCHES)
-                .doesNotContain(RuleOperator.GT, RuleOperator.BETWEEN);
-        assertThat(FieldCatalog.find("card.card_present").orElseThrow().allowedOperators())
-                .containsExactly(RuleOperator.EQ, RuleOperator.NEQ, RuleOperator.IS_NULL,
-                        RuleOperator.NOT_NULL);
-        assertThat(FieldCatalog.find("created_at").orElseThrow().allowedOperators())
-                .contains(RuleOperator.BETWEEN, RuleOperator.GTE);
+    void categoryNamesAreServedInTheLowerCaseTheEditorGroupsBy() {
+        assertThat(FieldCategory.AGGREGATE.wireName()).isEqualTo("aggregate");
+        assertThat(FieldCategory.values()).extracting(FieldCategory::wireName)
+                .containsExactly("transaction", "customer", "card", "payment", "crypto", "aggregate");
     }
 
     @Test
-    void scopingHidesFieldsThatDoNotExistOnAnActivityType() {
-        assertThat(FieldCatalog.entriesFor(RuleScope.CARD))
-                .extracting(FieldDefinition::field)
-                .contains("amount", "agg.tx_count_24h", "card.mcc_code")
-                .doesNotContain("payment.payment_method", "crypto.blockchain");
-        assertThat(FieldCatalog.entriesFor(RuleScope.ALL)).hasSameSizeAs(FieldCatalog.entries());
+    void enumeratedFieldsListTheirKnownValues() {
+        assertThat(options("status")).containsExactly("Completed", "Pending", "Failed", "Reversed");
+        assertThat(options("activity_type")).containsExactly("CARD", "PAYMENT", "CRYPTO");
+        assertThat(options("card.card_type")).containsExactly("Debit", "Credit", "Prepaid");
+        assertThat(options("payment.payment_method")).containsExactly("ACH", "Wire", "SWIFT", "P2P");
+        assertThat(options("card.merchant_name")).isEmpty();
     }
 
     @Test
-    void nullableFieldsAreFlagged() {
+    void activitySpecificFieldsDeclareTheActivityTheyExistOn() {
+        assertThat(FieldCatalog.find("card.mcc_code").orElseThrow().appliesTo())
+                .isEqualTo(RuleScope.CARD);
+        assertThat(FieldCatalog.find("payment.payment_method").orElseThrow().appliesTo())
+                .isEqualTo(RuleScope.PAYMENT);
+        assertThat(FieldCatalog.find("crypto.blockchain").orElseThrow().appliesTo())
+                .isEqualTo(RuleScope.CRYPTO);
+        assertThat(FieldCatalog.find("agg.tx_count_24h").orElseThrow().appliesTo())
+                .isEqualTo(RuleScope.ALL);
+    }
+
+    @Test
+    void nullableFieldsAreFlaggedSoARuleCanSayWhatAnAbsentValueMeans() {
         assertThat(FieldCatalog.find("card.decline_reason").orElseThrow().nullable()).isTrue();
         assertThat(FieldCatalog.find("crypto.exchange_name").orElseThrow().nullable()).isTrue();
         assertThat(FieldCatalog.find("amount").orElseThrow().nullable()).isFalse();
@@ -108,5 +112,13 @@ class FieldCatalogTest {
         assertThat(FieldCatalog.find("Amount")).isEmpty();
         assertThat(FieldCatalog.contains("nope")).isFalse();
         assertThat(FieldCatalog.find(null)).isEmpty();
+    }
+
+    private static FieldCategory categoryOf(String field) {
+        return FieldCatalog.find(field).orElseThrow().category();
+    }
+
+    private static List<String> options(String field) {
+        return FieldCatalog.find(field).orElseThrow().options();
     }
 }

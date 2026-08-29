@@ -134,7 +134,7 @@ const ANALYSIS: AnalysisResultWire = {
       rationale: 'Nine payments between 9,000 and 9,999 in 30 days.',
       matchedCount: 0,
       matchedTransactionIds: [],
-      source: 'AGENT',
+      source: 'AGENT_JUDGED',
     },
   ],
   trace: { steps: [{ n: 1, type: 'final', risk_level: 'HIGH' }] },

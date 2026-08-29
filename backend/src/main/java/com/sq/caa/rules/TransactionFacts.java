@@ -16,10 +16,11 @@ import java.util.UUID;
 /**
  * Every catalog field of one transaction, resolved once.
  *
- * <p>Values are materialised eagerly at batch build time so that evaluating m rules over n
- * transactions never touches an entity again: the evaluator only reads this map. A field that does
- * not belong to the transaction's activity type is absent from the map, which is what lets
- * {@link #lookup(String)} tell "not applicable here" apart from "unknown field".
+ * <p>Values are materialised eagerly at batch build time, so quoting a transaction to the model - or
+ * rendering the evidence of m rules over n transactions - never touches an entity again: readers
+ * only see this map. A field that does not belong to the transaction's activity type is absent from
+ * it, which is what lets {@link #lookup(String)} tell "not applicable here" apart from "unknown
+ * field" and keeps an empty value distinguishable from a value the model was never shown.
  */
 public final class TransactionFacts {
 
@@ -42,7 +43,8 @@ public final class TransactionFacts {
 
     /**
      * Resolves every field of the catalog for one transaction. Never throws: a detail row that
-     * cannot be read leaves its fields present-but-null, which the evaluator reports as degraded.
+     * cannot be read leaves its fields present-but-null, which is reported to the model as an empty
+     * value rather than silently omitted.
      */
     public static TransactionFacts of(Transaction transaction, Customer customer, AggregateSnapshot aggregates) {
         Map<String, Object> values = new HashMap<>(48);
@@ -97,7 +99,7 @@ public final class TransactionFacts {
                 transaction.getAmount(), text(transaction.getCurrency()), Map.copyOf(nullSafe(values)));
     }
 
-    /** Resolves a DSL field name. */
+    /** Resolves one catalog field name against this transaction. */
     public FieldLookup lookup(String field) {
         if (field == null) {
             return FieldLookup.UNKNOWN;

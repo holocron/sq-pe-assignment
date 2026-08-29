@@ -58,7 +58,7 @@ CREATE TABLE analysis_runs (
 );
 
 COMMENT ON COLUMN analysis_runs.assessment_id     IS 'Same identifier as risk_assessments.assessment_id.';
-COMMENT ON COLUMN analysis_runs.coverage_complete IS 'TRUE when the agent itself evaluated every applicable rule, FALSE when the deterministic backfill was needed.';
+COMMENT ON COLUMN analysis_runs.coverage_complete IS 'TRUE when the agent judged every applicable rule; a COMPLETED run always has TRUE, a run that left a rule unjudged is stored FAILED.';
 COMMENT ON COLUMN analysis_runs.trace             IS 'Full ReAct transcript: {"steps":[{"n":1,"type":"tool_call",...}]}.';
 
 CREATE INDEX idx_analysis_runs_customer_created ON analysis_runs (customer_id, created_at DESC);

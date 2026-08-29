@@ -7,10 +7,11 @@ import com.sq.caa.agent.AnalysisExecutor;
 import com.sq.caa.agent.AnalysisProgressListener;
 import com.sq.caa.agent.AnalysisStreamRegistry;
 import com.sq.caa.agent.AnalysisTrace;
+import com.sq.caa.agent.IncompleteRuleCoverageException;
 import com.sq.caa.agent.ReActRiskAgent;
 import com.sq.caa.agent.RiskAssessmentRows;
 import com.sq.caa.agent.RiskAssessmentWriter;
-import com.sq.caa.agent.RuleVerdictSource;
+import com.sq.caa.agent.UnjudgedRule;
 import com.sq.caa.domain.AnalysisRun;
 import com.sq.caa.domain.AnalysisStatus;
 import com.sq.caa.domain.Customer;
@@ -28,7 +29,6 @@ import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -60,10 +60,18 @@ import tools.jackson.databind.node.ObjectNode;
  * {@code RUNNING} in one of two ways - completed or failed with the reason recorded - because the
  * worker's {@code finally} block always writes an end state.
  *
- * <p><b>Why a failed run still scores.</b> If the agent loop throws, the deterministic rule engine
- * is still run over the whole coverage set before the run is marked {@code FAILED}. The narrative is
- * lost but the rule coverage is not, so "every applicable rule was evaluated" holds on every run,
- * not only on the happy path.
+ * <p><b>Why a run can fail on coverage alone.</b> The agent is the only source of verdicts: it reads
+ * each rule's condition, gathers the evidence and judges it. Nothing fills in a rule it skipped. So
+ * the guarantee is enforced at the only place that can write {@code COMPLETED} - a run reaches that
+ * status only when every applicable rule has an agent verdict, and a run that ran out of turns with
+ * rules unjudged is written as {@code FAILED} with those rules named in {@code error} and in the
+ * trace. A partial analysis is never presented as a finished one.
+ *
+ * <p><b>Why a failed run still keeps its work.</b> Whatever the reason for the failure - a dropped
+ * connection, a refused prompt, an unfinished checklist - every verdict the agent did submit is
+ * persisted, with its rows in {@code risk_assessments} and its rationale in the trace. Nine verdicts
+ * out of twelve is not a complete review, but it is not worthless either, and re-deriving it would
+ * be impossible: there is no engine to re-derive it with.
  *
  * <p><b>Why progress is written while the run is still going.</b> A run is minutes of model time,
  * and a client that loses the SSE stream falls back to polling {@code GET /api/analyses/{id}}. If
@@ -73,16 +81,16 @@ import tools.jackson.databind.node.ObjectNode;
  * a model turn.
  *
  * <p><b>How a rule's score is written.</b> {@code risk_assessments} carries one row per
- * (transaction, rule) pair evaluated, and a rule's score is capped at its weight. Those two
- * requirements are reconciled by distributing the rule's weight across the transactions that
- * actually matched it, largest-remainder style, and writing {@code 0.00} for the in-scope
- * transactions that did not match and for every rule that did not trigger. The sum of the column is
- * then exactly the run's total score, and the table alone proves which rules were evaluated - for
- * every rule that had at least one transaction in scope. A rule whose scope is empty (an
- * {@code ALL}-scoped rule for a customer with no activity) is evaluated like any other but has no
- * transaction to key a row on; for that rule the run header's {@code rules_evaluated} /
- * {@code rules_total} / {@code coverage_complete}, written below on every path, are the
- * authoritative record.
+ * (transaction, rule) pair judged - "in scope" meaning every transaction whose activity type matches
+ * the rule's {@code applies_to} - and a rule's score is capped at its weight. Those two requirements
+ * are reconciled by distributing the rule's score across the transactions the agent cited as
+ * evidence, largest-remainder style, and writing {@code 0.00} for the in-scope transactions it did
+ * not cite and for every rule it judged as not triggered. The sum of the column is then exactly the
+ * run's total score, and the table alone shows which rules were judged - for every rule that had at
+ * least one transaction in scope. A rule whose scope is empty (an {@code ALL}-scoped rule for a
+ * customer with no activity) is judged like any other but has no transaction to key a row on; for
+ * that rule the run header's {@code rules_evaluated} / {@code rules_total} /
+ * {@code coverage_complete}, written below on every path, are the authoritative record.
  */
 @Service
 public class RiskAnalysisService {
@@ -222,15 +230,20 @@ public class RiskAnalysisService {
         try {
             AgentRunResult result = agent.run(assessmentId, customerId, trace,
                     new ProgressWriter(assessmentId, trace));
+            if (!result.coverageComplete()) {
+                // The loop already refuses to return an incomplete run; restating the invariant here
+                // means the one method that can write COMPLETED enforces it itself, so no future
+                // caller of the agent can slip a partial analysis past this point.
+                throw new AgentRunFailedException(result, new IncompleteRuleCoverageException(
+                        result.rulesTotal(), result.unjudgedRules(), result.unjudgedRuleNames()));
+            }
             persist(result, trace, AnalysisStatus.COMPLETED, null,
                     System.currentTimeMillis() - startedAt);
-            log.info("Analysis {} completed: {} ({}), {}/{} rules evaluated by the agent, coverage {}",
-                    assessmentId, result.riskLevel(), result.totalScore(),
-                    result.rulesEvaluatedByAgent(), result.rulesTotal(),
-                    result.coverageComplete() ? "complete" : "completed by fallback");
+            log.info("Analysis {} completed: {} ({}), all {} applicable rule(s) judged by the agent",
+                    assessmentId, result.riskLevel(), result.totalScore(), result.rulesTotal());
         } catch (AgentRunFailedException e) {
-            // The loop already settled the coverage set from the work the agent had done, so the
-            // partial run is persisted as-is rather than re-derived from scratch.
+            // The loop settled the run from the work the agent had done, so the partial result is
+            // persisted as-is: there is nothing to re-derive it from.
             recover(assessmentId, trace, e.result(), e.getCause() == null ? e : e.getCause(),
                     System.currentTimeMillis() - startedAt, customerId);
         } catch (Exception e) {
@@ -241,34 +254,43 @@ public class RiskAnalysisService {
     }
 
     /**
-     * Failure path. The narrative may be incomplete, but the rule coverage never is.
+     * Failure path: the run ends {@code FAILED}, keeping every verdict the agent obtained.
      *
-     * <p>When the agent loop got far enough to settle its own coverage set it hands the partial run
-     * over ({@code settled}); everything the agent actually established is kept and only the rules
-     * it never reached are marked as deterministic fallbacks. When it failed before that - loading
-     * the customer, say - the whole coverage set is evaluated by the engine alone. Either way the
-     * run ends with a verdict and a score for every applicable rule, marked {@code FAILED} with the
-     * reason.
+     * <p>Three things reach here - a broken conversation, a checklist the agent never finished, or a
+     * failure so early that there is nothing to keep. In the first two the settled result carries the
+     * agent's verdicts and they are written exactly as a successful run's are, so the rows in
+     * {@code risk_assessments} and the rationales in the trace survive; what differs is the status,
+     * the {@code error} naming what went wrong, and {@code coverage_complete}, which is false
+     * whenever a rule was left unjudged. In the third there is only the error to record.
+     *
+     * <p>What deliberately does not happen is any attempt to complete the coverage set without the
+     * agent. There is no engine to do it with, and inventing verdicts to make a counter read 100%
+     * would turn an honest failure into a false assurance.
      */
     private void recover(UUID assessmentId, AnalysisTrace trace, AgentRunResult settled,
             Throwable cause, long durationMs, UUID customerId) {
-        String message = describe(cause);
+        String message = describeFailure(cause, settled);
         log.error("Analysis {} for customer {} failed: {}", assessmentId, customerId, message, cause);
         trace.error(message);
-        try {
-            AgentRunResult fallback = settled != null
-                    ? settled
-                    : agent.deterministicOnly(assessmentId, customerId, trace);
-            persist(fallback, trace, AnalysisStatus.FAILED, message, durationMs);
-            log.info("Analysis {} failed after {} step(s) but all {} rule(s) still ended with a verdict "
-                            + "({} from the agent)", assessmentId, fallback.steps(),
-                    fallback.ruleOutcomes().size(), fallback.rulesEvaluatedByAgent());
-        } catch (Exception nested) {
-            log.error("Analysis {} could not even be completed deterministically", assessmentId, nested);
-            trace.error("The deterministic fallback also failed: " + describe(nested));
+        if (settled == null) {
+            log.warn("Analysis {} failed before any verdict was recorded; nothing to persist beyond "
+                    + "the failure itself", assessmentId);
             markFailed(assessmentId, message, durationMs, trace.size());
             trace.publishStatus(statusPayload(assessmentId, AnalysisStatus.FAILED, null, null, 0, 0,
                     false, message));
+            return;
+        }
+        try {
+            persist(settled, trace, AnalysisStatus.FAILED, message, durationMs);
+            log.info("Analysis {} failed after {} step(s); {} of {} rule(s) had been judged and were "
+                            + "kept, {} left unjudged", assessmentId, settled.steps(),
+                    settled.rulesJudged(), settled.rulesTotal(), settled.unjudgedRules().size());
+        } catch (Exception nested) {
+            log.error("Analysis {} could not even persist the work it had done", assessmentId, nested);
+            trace.error("The partial result could not be persisted: " + describe(nested));
+            markFailed(assessmentId, message, durationMs, trace.size());
+            trace.publishStatus(statusPayload(assessmentId, AnalysisStatus.FAILED, null, null,
+                    settled.rulesTotal(), settled.rulesJudged(), false, message));
         }
     }
 
@@ -300,9 +322,11 @@ public class RiskAnalysisService {
             run.setSummary(result.summary());
             run.setRecommendations(result.recommendations());
             run.setRulesTotal(result.rulesTotal());
-            // Every rule of the coverage set ends with a verdict, whether the agent produced it or
-            // the deterministic backfill did: coverage is 100% on any run that reaches this point.
-            run.setRulesEvaluated(result.ruleOutcomes().size());
+            // Both counters are the truth about this run and nothing else: how many of the
+            // applicable rules the agent actually judged, out of how many applied. coverage_complete
+            // is derived from the outcomes themselves, so it is true exactly when the two agree -
+            // which, for a COMPLETED run, execute() has already required.
+            run.setRulesEvaluated(result.rulesJudged());
             run.setCoverageComplete(result.coverageComplete());
             run.setModel(result.model());
             run.setSteps(result.steps());
@@ -314,7 +338,7 @@ public class RiskAnalysisService {
         });
 
         trace.publishStatus(statusPayload(result.assessmentId(), status, result.riskLevel(),
-                result.totalScore(), result.rulesTotal(), result.ruleOutcomes().size(),
+                result.totalScore(), result.rulesTotal(), result.rulesJudged(),
                 result.coverageComplete(), error, result.steps()));
     }
 
@@ -389,8 +413,9 @@ public class RiskAnalysisService {
 
     /**
      * The {@code analysis_runs.trace} document: the transcript in the published
-     * {@code {"steps":[...]}} shape, plus the per-rule detail and the coverage counters the analysis
-     * page needs but {@code risk_assessments} cannot carry (its columns are fixed by the assignment).
+     * {@code {"steps":[...]}} shape, plus the per-rule detail, the coverage counters and the names of
+     * any rules left unjudged - everything the analysis page needs but {@code risk_assessments}
+     * cannot carry, its columns being fixed by the assignment.
      */
     private ObjectNode traceDocument(AnalysisTrace trace, AgentRunResult result,
             List<RuleEvaluationView> evaluations) {
@@ -402,10 +427,15 @@ public class RiskAnalysisService {
         ObjectNode coverage = document.putObject("coverage");
         coverage.put("rulesTotal", result.rulesTotal());
         coverage.put("rulesEvaluated", evaluations.size());
-        coverage.put("evaluatedByAgent", result.rulesEvaluatedByAgent());
-        coverage.put("backfilled", result.rulesBackfilled());
-        coverage.put("disagreements", result.disagreementCount());
         coverage.put("complete", result.coverageComplete());
+        // Named, not merely counted: a reviewer opening a failed run has to be able to see which
+        // rules were never judged without reading the transcript.
+        ArrayNode unjudged = coverage.putArray("unjudgedRules");
+        for (UnjudgedRule rule : result.unjudgedRules()) {
+            ObjectNode entry = unjudged.addObject();
+            entry.put("ruleId", rule.ruleId().toString());
+            entry.put("ruleName", rule.ruleName());
+        }
         return document;
     }
 
@@ -429,10 +459,6 @@ public class RiskAnalysisService {
                 .<JsonNode>map(AnalysisTrace::toJson)
                 .orElse(stored);
 
-        int byAgent = (int) evaluations.stream()
-                .filter(view -> view.source() == RuleVerdictSource.AGENT)
-                .count();
-        int disagreements = (int) evaluations.stream().filter(RuleEvaluationView::disagreement).count();
         int triggered = (int) evaluations.stream().filter(RuleEvaluationView::triggered).count();
         int rulesTotal = Math.max(run.getRulesTotal(), evaluations.size());
 
@@ -450,9 +476,6 @@ public class RiskAnalysisService {
                 run.getRulesEvaluated(),
                 run.isCoverageComplete(),
                 coveragePercent(run.getRulesEvaluated(), rulesTotal),
-                byAgent,
-                evaluations.size() - byAgent,
-                disagreements,
                 triggered,
                 run.getModel(),
                 run.getSteps(),
@@ -600,6 +623,24 @@ public class RiskAnalysisService {
             return 100.0;
         }
         return Math.round(10000.0 * evaluated / total) / 100.0;
+    }
+
+    /**
+     * The failure as it is written to {@code analysis_runs.error}.
+     *
+     * <p>When the run also left rules unjudged and the cause does not already say so - a dropped
+     * connection that happened to strike mid-checklist - the unjudged rules are named here too, so
+     * the {@code error} column alone tells a reviewer both what broke and what was missed.
+     */
+    private static String describeFailure(Throwable cause, AgentRunResult settled) {
+        String message = describe(cause);
+        if (settled == null || settled.coverageComplete()
+                || cause instanceof IncompleteRuleCoverageException) {
+            return message;
+        }
+        return truncate(message + " The analysis is also incomplete: " + settled.unjudgedRules().size()
+                + " of " + settled.rulesTotal() + " applicable rule(s) never received a verdict: "
+                + settled.unjudgedRuleNames() + ".");
     }
 
     private static String describe(Throwable cause) {

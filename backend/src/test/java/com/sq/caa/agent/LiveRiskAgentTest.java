@@ -30,8 +30,9 @@ import org.springframework.boot.test.context.SpringBootTest;
  * {@code mvn test -Dtest.excludedGroups= -Dtest=LiveRiskAgentTest}.
  *
  * <p>What it proves that the unit tests cannot: that the real model can drive the real tool loop to
- * a conclusion, and that the invariant the whole design rests on - every applicable rule ends with a
- * persisted verdict - survives contact with it.
+ * a conclusion, and that the invariant the whole design rests on - a COMPLETED run has an agent
+ * verdict for every applicable rule - survives contact with it. The scores it produces are the
+ * model's estimates and will differ between runs; the coverage claim is what must not.
  */
 @SpringBootTest
 @Tag("live")
@@ -64,14 +65,16 @@ class LiveRiskAgentTest {
         System.out.println(">>> LIVE RUN " + result.assessmentId() + " status=" + result.status()
                 + " level=" + result.riskLevel() + " score=" + result.totalScore()
                 + " steps=" + result.steps() + " coverage=" + result.coveragePercent() + "%"
-                + " agentRules=" + result.rulesEvaluatedByAgent() + "/" + result.rulesTotal()
-                + " disagreements=" + result.disagreementCount());
+                + " judged=" + result.rulesEvaluated() + "/" + result.rulesTotal());
         System.out.println(">>> SUMMARY: " + result.summary());
 
         assertEquals(AnalysisStatus.COMPLETED, result.status(),
                 "the run failed: " + result.error());
         assertEquals(result.rulesTotal(), result.ruleEvaluations().size(),
-                "every applicable rule must end with a verdict");
+                "every applicable rule must end with an agent verdict");
+        assertEquals(result.rulesTotal(), result.rulesEvaluated());
+        assertTrue(result.coverageComplete(),
+                "a COMPLETED run must have judged every applicable rule");
         assertEquals(100.0, result.coveragePercent(), 0.001);
         assertNotNull(result.riskLevel());
         assertNotNull(result.summary());

@@ -44,7 +44,9 @@ class ProseFinalAssessmentTest {
     @DisplayName("a parseable assessment written as prose is accepted once every rule has a verdict, "
             + "without another round trip")
     void aWrittenAssessmentIsAcceptedWhenCoverageIsComplete() {
-        ScriptedChatModel model = new ScriptedChatModel(coverEverything(
+        AnalysisTrace trace = AgentTestFixtures.trace(UUID.randomUUID());
+        AgentRunContext context = AgentTestFixtures.context(UUID.randomUUID(), trace, rules);
+        ScriptedChatModel model = new ScriptedChatModel(coverEverything(context,
                 says("""
                         All twelve checks are done. Here is my final assessment:
 
@@ -59,8 +61,7 @@ class ProseFinalAssessmentTest {
                         ```
                         """)));
 
-        AnalysisTrace trace = AgentTestFixtures.trace(UUID.randomUUID());
-        AgentRunResult result = run(model, AgentTestFixtures.context(UUID.randomUUID(), trace, rules));
+        AgentRunResult result = run(model, context);
 
         assertEquals(5, model.turns(), "the written assessment must end the run, not cost more turns");
         assertEquals(0, countSteps(trace, TraceStep.Type.REPROMPT),
@@ -77,23 +78,24 @@ class ProseFinalAssessmentTest {
         assertTrue(result.recommendations().contains("source-of-funds"),
                 "a list of recommendations must survive as one line each");
 
-        // The band is still the deterministic one, exactly as when the tool is used.
+        // The band is still derived from the rule scores, exactly as when the tool is used.
         assertEquals(RiskLevel.HIGH, result.riskLevel());
         assertTrue(result.coverageComplete());
-        assertEquals(4, result.rulesEvaluatedByAgent());
+        assertEquals(4, result.rulesJudged());
     }
 
     @Test
     @DisplayName("prose that is not an assessment still costs a reprompt, exactly as before")
     void proseWithoutAnAssessmentIsStillReprompted() {
-        ScriptedChatModel model = new ScriptedChatModel(coverEverything(
+        AnalysisTrace trace = AgentTestFixtures.trace(UUID.randomUUID());
+        AgentRunContext context = AgentTestFixtures.context(UUID.randomUUID(), trace, rules);
+        ScriptedChatModel model = new ScriptedChatModel(coverEverything(context,
                 says("I have now finished reviewing every rule for this customer. The risk is high."),
                 calls(RiskAgentTools.SUBMIT_FINAL_ASSESSMENT, """
                         {"risk_level":"HIGH","summary":"Sanctioned wire and structuring.",\
                         "recommendations":"Escalate."}""")));
 
-        AnalysisTrace trace = AgentTestFixtures.trace(UUID.randomUUID());
-        AgentRunResult result = run(model, AgentTestFixtures.context(UUID.randomUUID(), trace, rules));
+        AgentRunResult result = run(model, context);
 
         assertEquals(0, countSteps(trace, TraceStep.Type.PROSE_FINAL),
                 "a sentence mentioning risk is not a submitted assessment");
@@ -140,24 +142,25 @@ class ProseFinalAssessmentTest {
 
     // ------------------------------------------------------------------
 
-    /** The four fixture rules submitted one per turn, followed by whatever the test appends. */
-    private List<ScriptedChatModel.Turn> coverEverything(ScriptedChatModel.Turn... then) {
+    /** The four fixture rules judged one per turn, followed by whatever the test appends. */
+    private List<ScriptedChatModel.Turn> coverEverything(AgentRunContext context,
+            ScriptedChatModel.Turn... then) {
         List<ScriptedChatModel.Turn> script = new java.util.ArrayList<>(List.of(
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION,
-                        verdict(AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE), true, 30, "RU wire.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION,
-                        verdict(AgentTestFixtures.ruleNamed(rules, STRUCTURING), true, 20, "Structuring.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION,
-                        verdict(AgentTestFixtures.ruleNamed(rules, UNATTRIBUTED_CRYPTO), true, 15, "XMR.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION,
-                        verdict(AgentTestFixtures.ruleNamed(rules, DECLINE_BURST), false, 0, "None."))));
+                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
+                        AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE), true, 30, "RU wire.")),
+                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
+                        AgentTestFixtures.ruleNamed(rules, STRUCTURING), true, 20, "Structuring.")),
+                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
+                        AgentTestFixtures.ruleNamed(rules, UNATTRIBUTED_CRYPTO), true, 15, "XMR.")),
+                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
+                        AgentTestFixtures.ruleNamed(rules, DECLINE_BURST), false, 0, "None."))));
         script.addAll(List.of(then));
         return script;
     }
 
     private AgentRunResult run(ScriptedChatModel model, AgentRunContext context) {
         AgentProperties properties = new AgentProperties(40, 3, 4096, 0.1, 32768, 1536, 10, "test-model",
-                2, 16, Duration.ofMinutes(5), 25);
+                2, 16, Duration.ofMinutes(5), Duration.ofMinutes(10), 25);
         RiskAgentTools tools = new RiskAgentTools(context, null, null, jsonMapper, 25);
         RiskAgentLoop loop = new RiskAgentLoop(model, ToolCallingManager.builder().build(), jsonMapper,
                 properties);
@@ -173,11 +176,5 @@ class ProseFinalAssessmentTest {
                 .filter(step -> type.equals(step.type()))
                 .map(TraceStep::text)
                 .collect(Collectors.joining("\n"));
-    }
-
-    private static String verdict(RiskRule rule, boolean triggered, int score, String rationale) {
-        return """
-                {"rule_id":"%s","triggered":%s,"score":%d,"transaction_ids":[],"rationale":"%s"}"""
-                .formatted(rule.getRuleId(), triggered, score, rationale);
     }
 }

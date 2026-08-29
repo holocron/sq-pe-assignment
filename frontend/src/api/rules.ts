@@ -1,3 +1,10 @@
+/**
+ * Risk-rule administration API.
+ *
+ * `threshold_logic` is natural language: the agent reads the condition, pulls
+ * the customer's data with its tools and judges the verdict itself. Nothing in
+ * this module parses the condition — it only ever moves text.
+ */
 import {
   useMutation,
   useQuery,
@@ -5,33 +12,54 @@ import {
   type UseMutationResult,
   type UseQueryResult,
 } from '@tanstack/react-query'
-import { emptyRuleLogic, parseRuleNode } from '../lib/rules'
 import { deleteJson, getJson, postJson, putJson } from './client'
 import type { ApiError } from './errors'
 import type { MutationOpts, QueryOpts } from './query'
 import { queryKeys } from './queryKeys'
 import {
-  RULE_OPERATORS,
+  ACTIVITY_TYPES,
+  FIELD_CATEGORIES,
+  FIELD_TYPES,
+  RULE_SCOPES,
+  type ActivityType,
   type FieldCatalogEntry,
   type FieldCatalogEntryWire,
+  type FieldCategory,
   type FieldType,
   type RiskRule,
   type RiskRuleInput,
   type RiskRuleWire,
-  type RuleOperator,
+  type RuleScope,
+  type RuleTestMatch,
+  type RuleTestMatchWire,
   type RuleTestRequest,
   type RuleTestResult,
+  type RuleTestResultWire,
   type UUID,
 } from './types'
 
-/** `threshold_logic` is a TEXT column, so it may arrive as a JSON string. */
+function toFiniteNumber(value: number | string | null | undefined): number | null {
+  if (value === null || value === undefined || value === '') return null
+  const parsed = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function trimmedOrNull(value: string | null | undefined): string | null {
+  const text = typeof value === 'string' ? value.trim() : ''
+  return text.length > 0 ? text : null
+}
+
+/* -------------------------------------------------------------------------- */
+/* Rules                                                                       */
+/* -------------------------------------------------------------------------- */
+
 export function normalizeRule(wire: RiskRuleWire): RiskRule {
   return {
     ruleId: wire.ruleId,
     ruleName: wire.ruleName,
     appliesTo: wire.appliesTo,
-    thresholdLogic: parseRuleNode(wire.thresholdLogic) ?? emptyRuleLogic(),
-    weight: typeof wire.weight === 'number' ? wire.weight : Number(wire.weight ?? 0),
+    thresholdLogic: wire.thresholdLogic ?? '',
+    weight: toFiniteNumber(wire.weight) ?? 0,
   }
 }
 
@@ -56,16 +84,20 @@ export function deleteRule(ruleId: UUID): Promise<void> {
   return deleteJson(`/rules/${ruleId}`)
 }
 
+/* -------------------------------------------------------------------------- */
+/* Field catalog                                                               */
+/* -------------------------------------------------------------------------- */
+
 /**
- * `rules/FieldType` is a plain Java enum with no `@JsonValue`, so the catalog
- * arrives with UPPER CASE type names. The editor's operator table, value
- * widgets and validators all key off the lowercase `FieldType` union, so the
- * name is folded here — the single place the two vocabularies meet.
+ * `FieldType` is a plain Java enum with no `@JsonValue`, so the catalog arrives
+ * with UPPER CASE type names. The reference panel keys off the lowercase union,
+ * so the two vocabularies meet here and nowhere else.
  */
 const FIELD_TYPE_ALIASES: Record<string, FieldType> = {
   number: 'number',
   integer: 'number',
   decimal: 'number',
+  long: 'number',
   string: 'string',
   text: 'string',
   enum: 'enum',
@@ -77,50 +109,146 @@ const FIELD_TYPE_ALIASES: Record<string, FieldType> = {
   date: 'date',
 }
 
-/** Unknown types degrade to `string`, which supports every text operator. */
+/** Unknown types degrade to `string`; the panel only uses this as a hint. */
 function toFieldType(wire: string | null | undefined): FieldType {
-  return FIELD_TYPE_ALIASES[String(wire ?? '').toLowerCase()] ?? 'string'
+  const known = FIELD_TYPE_ALIASES[String(wire ?? '').toLowerCase()]
+  if (known) return known
+  const lower = String(wire ?? '').toLowerCase()
+  return (FIELD_TYPES as readonly string[]).includes(lower) ? (lower as FieldType) : 'string'
 }
 
-function toOperators(wire: readonly string[] | null | undefined): RuleOperator[] | null {
-  if (!Array.isArray(wire) || wire.length === 0) return null
-  const known = wire.filter((operator): operator is RuleOperator =>
-    (RULE_OPERATORS as readonly string[]).includes(operator),
-  )
-  return known.length > 0 ? known : null
+/** `agg.tx_count_24h` -> `aggregate`, `card.mcc_code` -> `card`, ... */
+const PREFIX_CATEGORIES: Record<string, FieldCategory> = {
+  agg: 'aggregate',
+  aggregate: 'aggregate',
+  aggregates: 'aggregate',
+  card: 'card',
+  payment: 'payment',
+  crypto: 'crypto',
+  customer: 'customer',
+  transaction: 'transaction',
 }
 
-/** Maps `RuleDtos.FieldCatalogEntry` onto the shape the visual editor reads. */
+/**
+ * `category` is a free-form string on the wire, so it needs a floor. Falling
+ * back to the field path rather than to a fixed group keeps `agg.*` and
+ * `payment.*` in the right section even if the backend ever omits it.
+ */
+function toCategory(wire: FieldCatalogEntryWire): FieldCategory {
+  const declared = String(wire.category ?? '')
+    .trim()
+    .toLowerCase()
+  if ((FIELD_CATEGORIES as readonly string[]).includes(declared)) return declared as FieldCategory
+  const mappedDeclared = PREFIX_CATEGORIES[declared]
+  if (mappedDeclared) return mappedDeclared
+
+  const prefix = wire.field.includes('.') ? wire.field.split('.', 1)[0] : ''
+  return PREFIX_CATEGORIES[prefix ?? ''] ?? 'transaction'
+}
+
+/** `payment.receiver_bank_country` -> `Receiver bank country`. */
+function humanizeField(field: string): string {
+  const leaf = field.includes('.') ? field.slice(field.lastIndexOf('.') + 1) : field
+  const spaced = leaf.replace(/_+/g, ' ').trim()
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1)
+}
+
+function toScope(wire: RuleScope | null | undefined): RuleScope {
+  return wire && (RULE_SCOPES as readonly string[]).includes(wire) ? wire : 'ALL'
+}
+
+/** Maps one wire catalog entry onto the shape the reference panel renders. */
 export function normalizeFieldCatalogEntry(wire: FieldCatalogEntryWire): FieldCatalogEntry {
-  const options = Array.isArray(wire.options) ? wire.options.filter(Boolean) : []
+  const rawOptions = wire.options ?? []
   return {
     field: wire.field,
+    label: trimmedOrNull(wire.label) ?? humanizeField(wire.field),
     type: toFieldType(wire.type),
-    label: wire.label ?? null,
-    notes: wire.description ?? null,
-    values: options.length > 0 ? options : null,
-    valuesClosed: wire.optionsClosed ?? null,
-    operators: toOperators(wire.operators),
-    appliesTo: wire.appliesTo ?? null,
-    nullable: wire.nullable ?? null,
+    category: toCategory(wire),
+    appliesTo: toScope(wire.appliesTo),
+    description: trimmedOrNull(wire.description),
+    options: Array.isArray(rawOptions) ? rawOptions.filter(Boolean) : [],
+    nullable: wire.nullable === true,
+    example: trimmedOrNull(wire.example),
   }
 }
 
 /** `GET /api/rules/field-catalog` (ADMIN) */
 export async function fetchFieldCatalog(): Promise<FieldCatalogEntry[]> {
   const wire = await getJson<FieldCatalogEntryWire[]>('/rules/field-catalog')
-  return (wire ?? []).map(normalizeFieldCatalogEntry)
+  return (wire ?? [])
+    .filter((entry) => typeof entry?.field === 'string' && entry.field.length > 0)
+    .map(normalizeFieldCatalogEntry)
 }
 
-/** `POST /api/rules/test` (ADMIN) */
-export async function testRule(request: RuleTestRequest): Promise<RuleTestResult> {
-  const result = await postJson<RuleTestResult, RuleTestRequest>('/rules/test', request)
+/* -------------------------------------------------------------------------- */
+/* Rule test                                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A rule test is a model call, not a query: the agent has to read the condition,
+ * fetch the customer's activity and reason about it. The shared 30s axios
+ * timeout would abort a healthy judgement, so this one request gets its own.
+ *
+ * Measured against the local gpt-oss-120b, a judgement of a twenty-transaction
+ * scope takes two to three minutes. The backend gives up at 240s
+ * (`caa.rules.judge.timeout-seconds`) and answers with a 504 that says so; this
+ * budget is deliberately longer, so the server's honest error wins the race and
+ * the admin is told what happened rather than watching the browser abandon a
+ * request that was still going to succeed.
+ */
+export const RULE_TEST_TIMEOUT_MS = 300_000
+
+const KNOWN_ACTIVITY_TYPES = new Set<string>(ACTIVITY_TYPES)
+
+function normalizeMatch(wire: RuleTestMatchWire): RuleTestMatch {
+  const activityType =
+    wire.activityType && KNOWN_ACTIVITY_TYPES.has(wire.activityType)
+      ? (wire.activityType as ActivityType)
+      : null
   return {
-    ...result,
-    sampleMatches: result.sampleMatches ?? [],
-    degraded: Boolean(result.degraded),
-    notes: Array.isArray(result.notes) ? result.notes.filter(Boolean) : [],
+    transactionId: wire.transactionId,
+    activityType,
+    amount: toFiniteNumber(wire.amount),
+    currency: trimmedOrNull(wire.currency),
+    status: trimmedOrNull(wire.status),
+    createdAt: trimmedOrNull(wire.createdAt),
+    reason: trimmedOrNull(wire.reason),
   }
+}
+
+/**
+ * `matchedCount` is what the model cited; `matchedTransactions` is what the
+ * backend chose to return. When the second is shorter the difference is real
+ * evidence the panel is not showing, so it is flagged rather than smoothed over.
+ */
+export function normalizeRuleTestResult(wire: RuleTestResultWire): RuleTestResult {
+  const matches: RuleTestMatch[] = (wire.matchedTransactions ?? [])
+    .filter((match) => Boolean(match?.transactionId))
+    .map(normalizeMatch)
+  const matchedCount = toFiniteNumber(wire.matchedCount) ?? matches.length
+  return {
+    triggered: wire.triggered === true,
+    score: toFiniteNumber(wire.score),
+    weight: toFiniteNumber(wire.weight),
+    rationale: trimmedOrNull(wire.rationale),
+    matches,
+    matchedCount,
+    evidenceTruncated: matchedCount > matches.length,
+    evaluatedCount: toFiniteNumber(wire.evaluatedTransactionCount),
+    customerName: trimmedOrNull(wire.customerName),
+    model: trimmedOrNull(wire.model),
+    durationMs: toFiniteNumber(wire.durationMs),
+    notes: Array.isArray(wire.notes) ? wire.notes.filter(Boolean) : [],
+  }
+}
+
+/** `POST /api/rules/test` (ADMIN) — runs a real model judgement. */
+export async function testRule(request: RuleTestRequest): Promise<RuleTestResult> {
+  const wire = await postJson<RuleTestResultWire, RuleTestRequest>('/rules/test', request, {
+    timeout: RULE_TEST_TIMEOUT_MS,
+  })
+  return normalizeRuleTestResult(wire ?? {})
 }
 
 /* -------------------------------------------------------------------------- */
@@ -194,7 +322,7 @@ export function useDeleteRule(
   })
 }
 
-/** "Test rule" button on the rule editor. */
+/** "Run the agent's judgement" button on the rule editor. */
 export function useTestRule(
   options?: MutationOpts<RuleTestResult, RuleTestRequest>,
 ): UseMutationResult<RuleTestResult, ApiError, RuleTestRequest> {

@@ -142,7 +142,7 @@ CREATE TABLE risk_rules (
     CONSTRAINT pk_risk_rules PRIMARY KEY (rule_id)
 );
 
-COMMENT ON COLUMN risk_rules.threshold_logic IS 'Rule condition as JSON in the shared rule DSL (see README section "Risk rule DSL").';
+COMMENT ON COLUMN risk_rules.threshold_logic IS 'Rule condition in natural language: the sentence the ReAct agent reads, gathers evidence for and judges.';
 COMMENT ON COLUMN risk_rules.weight          IS 'Score added when the rule matches; the per-rule score is capped at this weight.';
 
 CREATE UNIQUE INDEX uq_risk_rules_rule_name ON risk_rules (lower(rule_name));

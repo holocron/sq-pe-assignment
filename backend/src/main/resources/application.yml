@@ -26,11 +26,26 @@ spring:
       # Single lemonade router on holominix (port 13305) fronts every model and routes by model id.
       # Spring AI 2.x uses the official OpenAI SDK, which expects /v1 inside the base URL.
       base-url: ${LLM_BASE_URL:http://localhost:13305/api/v1}
+      # Spring AI 2.0.1 defaults every OpenAI timeout to 60 seconds with 3 retries. That is wrong for
+      # a local reasoning model: gpt-oss-120b writes 20-30 tokens a second and thinks before it
+      # answers, so a single agent turn regularly needs one to three minutes. Left at 60s, every
+      # long turn was cut off and retried until the run died with "OpenAIIoException: Request
+      # failed" - measured, not guessed: four analyses of Viktor Semenov died exactly this way.
+      #
+      # These keys bound the shared OkHttp client. They are NOT sufficient on their own: whenever a
+      # call supplies its own OpenAiChatOptions - which both the ReAct loop (it must attach tool
+      # callbacks) and the rule judge do - OpenAiChatModel copies that object's timeout and retry
+      # count into the SDK's per-request options, and OpenAiChatOptions.builder() bakes in 60s and
+      # 3 retries. So the timeout is also set explicitly where those options are built, from
+      # caa.agent.request-timeout and caa.rules.judge.timeout-seconds. Both halves are required.
+      timeout: 10m
+      max-retries: 1
       chat:
         options:
           model: ${LLM_CHAT_MODEL:gpt-oss-120b-GGUF}
           temperature: 0.1
           max-tokens: 4096
+          timeout: 10m
       embedding:
         options:
           model: ${LLM_EMBED_MODEL:Qwen3-Embedding-4B-GGUF}
@@ -77,6 +92,24 @@ caa:
     context-tokens: 32768
     context-reserve-tokens: 1536
     keep-recent-messages: 10
+    # One model turn. Generous because the bound that matters is max-steps, not the wall clock of a
+    # single call: a turn that needs three minutes is normal here, and cutting it off costs the whole
+    # run. See AgentProperties#requestTimeout for why this cannot be left to spring.ai.openai.timeout.
+    request-timeout: 10m
+  rules:
+    judge:
+      # "Test rule" in the admin editor: one model call that judges one draft condition against one
+      # customer. Sized from measurement, not from hope - on the local gpt-oss-120b a judgement of a
+      # 20-transaction scope generates ~2,000 completion tokens at ~20-30 tokens/second, of which
+      # more than half is reasoning content that the server counts against max-tokens. A 1,536-token
+      # budget therefore ran out mid-JSON and the whole answer was lost; 4,096 leaves room for the
+      # thinking and the verdict, and the timeout has to cover the ~3 minutes that costs.
+      # The browser waits longer than this (see RuleTester), so the honest 504 below always wins the
+      # race against the client giving up.
+      timeout-seconds: 240
+      max-tokens: 4096
+      max-transactions: 80
+      temperature: 0.1
   cors:
     allowed-origins: http://localhost:5173
 

@@ -17,10 +17,11 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Hand-built domain objects for the rule engine tests.
+ * Hand-built domain objects for the rules tests.
  *
- * <p>Everything here is plain Java: no Spring context, no database, no model. The engine is a pure
- * function of (rule, customer, transactions), and the tests keep it that way.
+ * <p>Everything here is plain Java: no Spring context, no database, no live model. Building a
+ * customer's snapshot is a pure function of (customer, transactions), and the tests keep it that
+ * way.
  */
 final class RuleTestFixtures {
 
@@ -119,11 +120,6 @@ final class RuleTestFixtures {
                 .thresholdLogic(thresholdLogic)
                 .weight(new BigDecimal(weight))
                 .build();
-    }
-
-    /** Evaluates a node against a single transaction, the way most operator tests need it. */
-    static NodeOutcome evaluate(RuleNode node, Transaction transaction) {
-        return new RuleEvaluator().evaluateNode(node, facts(transaction));
     }
 
     static List<Transaction> list(Transaction... transactions) {

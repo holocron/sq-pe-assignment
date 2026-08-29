@@ -1,41 +1,41 @@
 /**
- * Visual editor for one risk rule: name, scope, weight and the recursive
- * condition builder, with a live JSON preview of the `threshold_logic` that
- * will be persisted and a dry-run tester against real data.
+ * Authoring surface for one risk rule.
+ *
+ * Identity and weight on the left with the condition below them, the data
+ * reference on the right, and the model-backed test underneath. The catalog is
+ * reference material rather than a grammar now, so a failed field-catalog fetch
+ * degrades the panel but never blocks saving a rule.
  */
-import { CircleCheck, Quote, TriangleAlert } from 'lucide-react'
-import { useId, useMemo, useState, type ReactNode } from 'react'
-import { errorMessage } from '../../../api/errors'
-import { useCreateRule, useFieldCatalog, useUpdateRule } from '../../../api/rules'
+import { CircleCheck, TriangleAlert } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { errorMessage, isApiError } from '../../../api/errors'
+import { useCreateRule, useFieldCatalog, useRules, useUpdateRule } from '../../../api/rules'
 import {
+  RULE_NAME_MAX_LENGTH,
   RULE_SCOPES,
+  RULE_WEIGHT_MAX,
+  RULE_WEIGHT_MIN,
   type RiskRule,
   type RiskRuleInput,
-  type RuleGroup,
   type RuleScope,
 } from '../../../api/types'
 import { Button } from '../../../components/ui/Button'
-import { ErrorState } from '../../../components/ui/ErrorState'
 import { Input } from '../../../components/ui/Input'
 import { Modal } from '../../../components/ui/Modal'
 import { Select } from '../../../components/ui/Select'
-import { Skeleton } from '../../../components/ui/Skeleton'
 import { useToast } from '../../../components/ui/Toast'
 import { cn } from '../../../lib/cn'
-import { appendNodeAt, removeNodeAt, replaceNodeAt, type RulePath } from '../../../lib/rules'
-import { ConditionGroup, type BuilderActions } from './ConditionGroup'
-import { JsonPreview } from './JsonPreview'
+import { ConditionEditor } from './ConditionEditor'
+import { FieldReference } from './FieldReference'
 import { RuleTester } from './RuleTester'
+import { WeightControl } from './WeightControl'
 import {
-  asRootGroup,
-  collectIssues,
-  describeRuleEnglish,
-  duplicateNodeAt,
-  newCondition,
-  newGroup,
-  serializeRuleNode,
-  toRootGroup,
-} from './ruleModel'
+  RULE_SCOPE_HINTS,
+  appendParagraph,
+  insertAtCaret,
+  validateCondition,
+} from './conditionText'
+import type { RuleTemplate } from './templates'
 
 export type RuleEditorMode = 'create' | 'edit' | 'duplicate'
 
@@ -44,13 +44,6 @@ export interface RuleEditorProps {
   /** The rule being edited or duplicated; omitted when creating. */
   rule?: RiskRule | null
   onClose: () => void
-}
-
-const SCOPE_HINTS: Record<RuleScope, string> = {
-  ALL: 'Evaluated for every transaction',
-  CARD: 'Evaluated for card activity only',
-  PAYMENT: 'Evaluated for payment activity only',
-  CRYPTO: 'Evaluated for crypto activity only',
 }
 
 const MODE_TITLES: Record<RuleEditorMode, string> = {
@@ -64,79 +57,118 @@ function initialName(mode: RuleEditorMode, rule: RiskRule | null | undefined): s
   return mode === 'duplicate' ? `${rule.ruleName} (copy)` : rule.ruleName
 }
 
+/** First message the backend attached to a field, when it sent any. */
+function serverFieldError(error: unknown, field: string): string | null {
+  if (!isApiError(error)) return null
+  return error.fieldErrors[field]?.[0] ?? null
+}
+
 export function RuleEditor({ mode, rule, onClose }: RuleEditorProps) {
   const toast = useToast()
-  const weightSliderId = useId()
   const catalogQuery = useFieldCatalog()
   const catalog = useMemo(() => catalogQuery.data ?? [], [catalogQuery.data])
+  const rulesQuery = useRules()
+  const conditionRef = useRef<HTMLTextAreaElement | null>(null)
 
   const [ruleName, setRuleName] = useState(() => initialName(mode, rule))
   const [appliesTo, setAppliesTo] = useState<RuleScope>(rule?.appliesTo ?? 'ALL')
   const [weightDraft, setWeightDraft] = useState(() => String(rule?.weight ?? 10))
-  const [root, setRoot] = useState<RuleGroup>(() => toRootGroup(rule?.thresholdLogic))
-  const [seeded, setSeeded] = useState(() => Boolean(rule))
+  const [condition, setCondition] = useState(() => rule?.thresholdLogic ?? '')
   const [nameTouched, setNameTouched] = useState(false)
+  const [submitted, setSubmitted] = useState(false)
 
-  // A brand-new rule seeds its first row from the catalog once it arrives, so
-  // the starting field is always a real, evaluable one.
-  if (!seeded && catalog.length > 0) {
-    setSeeded(true)
-    setRoot(newGroup(catalog))
-  }
-
-  const actions = useMemo<BuilderActions>(
-    () => ({
-      replaceNode: (path: RulePath, node) =>
-        setRoot((current) => asRootGroup(replaceNodeAt(current, path, node), current)),
-      removeNode: (path: RulePath) =>
-        setRoot((current) => asRootGroup(removeNodeAt(current, path), current)),
-      duplicateNode: (path: RulePath) =>
-        setRoot((current) => asRootGroup(duplicateNodeAt(current, path), current)),
-      addCondition: (path: RulePath) =>
-        setRoot((current) => asRootGroup(appendNodeAt(current, path, newCondition(catalog)), current)),
-      addGroup: (path: RulePath) =>
-        setRoot((current) => asRootGroup(appendNodeAt(current, path, newGroup(catalog)), current)),
-    }),
-    [catalog],
-  )
-
-  const issues = useMemo(() => collectIssues(root, catalog), [root, catalog])
-  const weight = Number(weightDraft)
-  const nameError = ruleName.trim().length === 0 ? 'Enter a rule name' : null
-  const weightError =
-    weightDraft.trim() === '' || !Number.isFinite(weight)
-      ? 'Enter a weight'
-      : weight < 0
-        ? 'Weight cannot be negative'
-        : weight > 999.99
-          ? 'Weight must be 999.99 or lower'
-          : null
+  /* The caret can only be restored once React has flushed the new value into
+     the DOM, so an insertion parks the position in a ref and the next commit
+     applies and clears it. A ref rather than state: this is a DOM detail, and
+     storing it in state would render twice for every inserted field. */
+  const pendingCaret = useRef<number | null>(null)
+  useEffect(() => {
+    const caret = pendingCaret.current
+    if (caret === null) return
+    pendingCaret.current = null
+    const element = conditionRef.current
+    if (element) {
+      element.focus()
+      element.setSelectionRange(caret, caret)
+    }
+  })
 
   const create = useCreateRule()
   const update = useUpdateRule()
   const saving = create.isPending || update.isPending
   const saveError = create.error ?? update.error
-  const builderReady = catalogQuery.isSuccess
-  const canSave =
-    builderReady && !saving && issues.total === 0 && nameError === null && weightError === null
 
-  const blockers: string[] = [
-    catalogQuery.isPending ? 'Loading the field catalog…' : null,
-    catalogQuery.error ? 'Field catalog unavailable' : null,
-    nameError,
-    weightError,
-    issues.total > 0
-      ? `${issues.total} condition issue${issues.total === 1 ? '' : 's'} to fix`
-      : null,
-  ].filter((blocker): blocker is string => blocker !== null)
+  const trimmedName = ruleName.trim()
+  const weight = Number(weightDraft)
+  const nameError =
+    trimmedName.length === 0
+      ? 'Enter a rule name'
+      : trimmedName.length > RULE_NAME_MAX_LENGTH
+        ? `Rule names are limited to ${RULE_NAME_MAX_LENGTH} characters.`
+        : null
+  const weightError =
+    weightDraft.trim() === '' || !Number.isFinite(weight)
+      ? 'Enter a weight'
+      : weight < RULE_WEIGHT_MIN
+        ? `Weight must be at least ${RULE_WEIGHT_MIN}`
+        : weight > RULE_WEIGHT_MAX
+          ? `Weight must be ${RULE_WEIGHT_MAX} or lower`
+          : null
+  const conditionError = validateCondition(condition)
+
+  /* The weight only means something next to the rest of the catalogue: it is a
+     share of the maximum score any run can reach. A rule being edited counts
+     once, under its draft weight, not twice. */
+  const otherRulesWeight = useMemo(() => {
+    const rules = rulesQuery.data ?? []
+    if (rules.length === 0) return null
+    return rules
+      .filter((item) => !(mode === 'edit' && rule ? item.ruleId === rule.ruleId : false))
+      .reduce((total, item) => total + (Number.isFinite(item.weight) ? item.weight : 0), 0)
+  }, [rulesQuery.data, mode, rule])
+
+  const showNameError = nameTouched || submitted
+  /* A pristine, untouched condition is not "wrong" yet — the checklist and the
+     footer already say what is missing without shouting at a blank page. */
+  const showConditionError = submitted || condition.trim().length > 0
+  const canSave = !saving && nameError === null && weightError === null && conditionError === null
+
+  const blockers = [nameError, conditionError, weightError].filter(
+    (blocker): blocker is string => blocker !== null,
+  )
+
+  const insertField = (field: string): void => {
+    const element = conditionRef.current
+    const start = element?.selectionStart ?? condition.length
+    const end = element?.selectionEnd ?? condition.length
+    const { text, caret } = insertAtCaret(condition, field, start, end)
+    pendingCaret.current = caret
+    setCondition(text)
+  }
+
+  /**
+   * A starter always replaces the (blank) condition and fills a blank name, but
+   * only a brand-new rule takes the example's scope and weight — silently
+   * re-scoping a rule someone is editing would change which transactions it is
+   * ever judged against.
+   */
+  const useTemplate = (template: RuleTemplate): void => {
+    setCondition(template.condition)
+    if (trimmedName.length === 0) setRuleName(template.ruleName)
+    if (mode === 'create') {
+      setAppliesTo(template.appliesTo)
+      setWeightDraft(String(template.weight))
+    }
+  }
 
   const handleSave = (): void => {
+    setSubmitted(true)
     if (!canSave) return
     const input: RiskRuleInput = {
-      ruleName: ruleName.trim(),
+      ruleName: trimmedName,
       appliesTo,
       weight,
-      thresholdLogic: serializeRuleNode(root),
+      thresholdLogic: condition.trim(),
     }
     const onSuccess = (): void => {
       toast.success(
@@ -152,37 +184,6 @@ export function RuleEditor({ mode, rule, onClose }: RuleEditorProps) {
     }
   }
 
-  let builder: ReactNode
-  if (catalogQuery.isPending) {
-    builder = (
-      <div className="flex flex-col gap-2" aria-busy="true">
-        <Skeleton className="h-9 w-full" />
-        <Skeleton className="h-16 w-full" />
-        <Skeleton className="h-16 w-full" />
-      </div>
-    )
-  } else if (catalogQuery.error) {
-    builder = (
-      <ErrorState
-        error={catalogQuery.error}
-        title="Field catalog unavailable"
-        description="The condition builder needs GET /api/rules/field-catalog to know which fields and operators are valid."
-        onRetry={() => void catalogQuery.refetch()}
-      />
-    )
-  } else {
-    builder = (
-      <ConditionGroup
-        group={root}
-        path={[]}
-        catalog={catalog}
-        issues={issues}
-        actions={actions}
-        disabled={saving}
-      />
-    )
-  }
-
   return (
     <Modal
       open
@@ -194,7 +195,7 @@ export function RuleEditor({ mode, rule, onClose }: RuleEditorProps) {
         mode === 'edit' && rule ? (
           <span className="font-mono text-2xs">{rule.ruleId}</span>
         ) : (
-          'Build the condition visually — the JSON on the right is what gets stored.'
+          'Describe the condition in plain English — the agent reads it, fetches the data and judges the verdict.'
         )
       }
       footer={
@@ -238,16 +239,17 @@ export function RuleEditor({ mode, rule, onClose }: RuleEditorProps) {
         </div>
       ) : null}
 
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_22rem]">
-        <div className="flex max-h-[62vh] min-w-0 flex-col gap-4 overflow-y-auto pr-1">
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_21rem]">
+        <div className="flex max-h-[64vh] min-w-0 flex-col gap-4 overflow-y-auto pr-1">
           <div className="grid gap-3 sm:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
             <Input
               label="Rule name"
               required
-              placeholder="High-value payment to a sanctioned jurisdiction"
+              maxLength={RULE_NAME_MAX_LENGTH}
+              placeholder="Payment to a sanctioned or high-risk jurisdiction"
               value={ruleName}
               disabled={saving}
-              error={nameTouched ? nameError : null}
+              error={showNameError ? (nameError ?? serverFieldError(saveError, 'ruleName')) : null}
               onBlur={() => setNameTouched(true)}
               onChange={(event) => setRuleName(event.target.value)}
             />
@@ -255,74 +257,66 @@ export function RuleEditor({ mode, rule, onClose }: RuleEditorProps) {
               label="Applies to"
               value={appliesTo}
               disabled={saving}
-              hint={SCOPE_HINTS[appliesTo]}
+              hint={RULE_SCOPE_HINTS[appliesTo]}
               options={RULE_SCOPES.map((scope) => ({ value: scope, label: scope }))}
               onChange={(event) => setAppliesTo(event.target.value as RuleScope)}
             />
           </div>
 
-          <div className="flex flex-col gap-1.5 rounded-md border border-border bg-surface-2/40 px-3 py-2.5">
-            <label
-              htmlFor={weightSliderId}
-              className="text-2xs font-semibold tracking-caption text-muted uppercase"
-            >
-              Weight
-              <span className="ml-1.5 font-normal normal-case text-subtle">
-                score added when the rule matches
-              </span>
-            </label>
-            <div className="flex items-center gap-3">
-              <input
-                id={weightSliderId}
-                type="range"
-                min={0}
-                max={100}
-                step={0.5}
-                disabled={saving}
-                value={Number.isFinite(weight) ? Math.min(Math.max(weight, 0), 100) : 0}
-                onChange={(event) => setWeightDraft(event.target.value)}
-                className="h-1.5 flex-1 accent-accent"
-              />
-              <Input
-                label="Weight value"
-                hideLabel
-                type="number"
-                min={0}
-                max={999.99}
-                step={0.5}
-                containerClassName="w-24"
-                className="numeric text-right"
-                value={weightDraft}
-                disabled={saving}
-                error={weightError}
-                onChange={(event) => setWeightDraft(event.target.value)}
-              />
-            </div>
-          </div>
+          <WeightControl
+            value={weightDraft}
+            onChange={setWeightDraft}
+            error={weightError ?? serverFieldError(saveError, 'weight')}
+            disabled={saving}
+            otherRulesWeight={otherRulesWeight}
+          />
 
-          <div className="flex flex-col gap-2">
-            <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
-              <h3 className="text-2xs font-semibold tracking-caption text-muted uppercase">
-                Conditions
-              </h3>
-              <span className="text-2xs text-subtle">
-                Nested AND / OR / NOT groups — the rule triggers when the root group matches.
-              </span>
-            </div>
-            {/* Plain-English reading of the tree, so the builder is verifiable
-                without parsing the JSON on the right. */}
-            <p className="flex items-start gap-2 rounded-md border border-border border-l-2 border-l-accent bg-surface-2/50 px-3 py-2 text-xs leading-relaxed text-muted">
-              <Quote aria-hidden="true" className="mt-0.5 size-3 shrink-0 text-subtle" />
-              <span className="min-w-0">{describeRuleEnglish(root, catalog)}</span>
-            </p>
-            {builder}
-          </div>
+          <ConditionEditor
+            value={condition}
+            onChange={setCondition}
+            textareaRef={conditionRef}
+            catalog={catalog}
+            disabled={saving}
+            error={
+              (showConditionError ? conditionError : null) ??
+              serverFieldError(saveError, 'thresholdLogic')
+            }
+            onUseTemplate={useTemplate}
+            onAppendTemplate={(template) =>
+              setCondition((current) => appendParagraph(current, template.condition))
+            }
+          />
+
+          <RuleTester
+            /* The column scrolls, so its children are flex items that may be shrunk below their
+               content. The tester clips (overflow-hidden), so shrinking it hides the customer
+               picker and the verdict instead of extending the column's scroll. */
+            className="shrink-0"
+            ruleName={ruleName}
+            thresholdLogic={condition.trim()}
+            appliesTo={appliesTo}
+            weight={Number.isFinite(weight) ? weight : 0}
+            blockedReason={
+              conditionError
+                ? 'Write a valid condition before testing — the agent is given this exact text.'
+                : weightError
+                  ? 'Set a valid weight before testing — the agent caps its score at it.'
+                  : saving
+                    ? 'Saving the rule…'
+                    : null
+            }
+          />
         </div>
 
-        <div className="flex max-h-[62vh] min-w-0 flex-col gap-3 overflow-y-auto pr-0.5">
-          <JsonPreview node={root} />
-          <RuleTester thresholdLogic={root} appliesTo={appliesTo} issueCount={issues.total} />
-        </div>
+        <FieldReference
+          className="max-h-[64vh]"
+          catalog={catalog}
+          loading={catalogQuery.isPending}
+          error={catalogQuery.error}
+          onRetry={() => void catalogQuery.refetch()}
+          scope={appliesTo}
+          onInsert={insertField}
+        />
       </div>
     </Modal>
   )

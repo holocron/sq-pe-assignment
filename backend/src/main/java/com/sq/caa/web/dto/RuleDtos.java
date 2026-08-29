@@ -5,10 +5,9 @@ import com.sq.caa.domain.RiskRule;
 import com.sq.caa.domain.RuleScope;
 import com.sq.caa.rules.FieldDefinition;
 import com.sq.caa.rules.FieldType;
-import com.sq.caa.rules.RuleMatch;
-import com.sq.caa.rules.RuleOperator;
-import com.sq.caa.rules.RuleParser;
-import com.sq.caa.rules.RuleTestOutcome;
+import com.sq.caa.rules.JudgedTransaction;
+import com.sq.caa.rules.RuleJudgement;
+import com.sq.caa.rules.RuleValidator;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Digits;
@@ -19,8 +18,6 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
-import tools.jackson.databind.JsonNode;
-import tools.jackson.databind.node.NullNode;
 
 /** Request and response payloads of the rule administration API. */
 public final class RuleDtos {
@@ -31,105 +28,129 @@ public final class RuleDtos {
     /**
      * A stored rule.
      *
-     * @param thresholdLogic     the logic as a JSON object, which is what the visual editor binds to
-     * @param thresholdLogicText the exact text stored in the column, so an admin can still see a rule
-     *                           that somehow became unparseable
+     * @param thresholdLogic the rule condition in plain English, exactly the text the agent is shown
      */
     public record RiskRuleDto(
             UUID ruleId,
             String ruleName,
             RuleScope appliesTo,
-            JsonNode thresholdLogic,
-            String thresholdLogicText,
+            String thresholdLogic,
             BigDecimal weight) {
 
         public static RiskRuleDto from(RiskRule rule) {
             return new RiskRuleDto(rule.getRuleId(), rule.getRuleName(), rule.getAppliesTo(),
-                    safeTree(rule.getThresholdLogic()), rule.getThresholdLogic(), rule.getWeight());
-        }
-
-        private static JsonNode safeTree(String json) {
-            try {
-                return RuleParser.readTree(json);
-            } catch (RuntimeException e) {
-                return NullNode.getInstance();
-            }
+                    rule.getThresholdLogic(), rule.getWeight());
         }
     }
 
-    /** Create or replace a rule. */
+    /**
+     * Create or replace a rule.
+     *
+     * <p>The bounds mirror {@link RuleValidator}; bean validation gives the editor a per-field error
+     * without a round trip through the service, and the service checks the same limits again on the
+     * normalised text so nothing depends on the annotation alone.
+     */
     public record RuleUpsertRequest(
             @NotBlank @Size(max = 160) String ruleName,
             @NotNull RuleScope appliesTo,
-            @NotNull JsonNode thresholdLogic,
+            @NotBlank @Size(min = 20, max = 2000) String thresholdLogic,
             @NotNull @DecimalMin("0.01") @DecimalMax("999.99") @Digits(integer = 3, fraction = 2)
             BigDecimal weight) {
     }
 
-    /** Try a draft rule against live data without saving it. */
+    /**
+     * Judge one draft rule against one customer.
+     *
+     * <p>The customer is mandatory: with a prose condition there is nothing to evaluate mechanically,
+     * so the only answer is the one the model gives after reading that customer's activity.
+     */
     public record RuleTestRequest(
-            @NotNull JsonNode thresholdLogic,
-            RuleScope appliesTo,
-            UUID customerId) {
+            @Size(max = 160) String ruleName,
+            @NotBlank @Size(min = 20, max = 2000) String thresholdLogic,
+            @NotNull RuleScope appliesTo,
+            @NotNull @DecimalMin("0.01") @DecimalMax("999.99") @Digits(integer = 3, fraction = 2)
+            BigDecimal weight,
+            @NotNull UUID customerId) {
     }
 
-    /** Outcome of a draft rule test. */
+    /**
+     * The model's verdict on a draft rule.
+     *
+     * @param score      the model's estimated contribution, never above {@code weight}
+     * @param model      model id that produced the verdict, {@code null} when no call was needed
+     * @param durationMs wall time of the judgement, so the cost of the call is visible
+     * @param notes      corrections and caveats: evidence truncated, ids dropped, score capped
+     */
     public record RuleTestResponse(
+            String ruleName,
+            RuleScope appliesTo,
+            BigDecimal weight,
+            UUID customerId,
+            String customerName,
+            boolean triggered,
+            BigDecimal score,
+            List<RuleMatchDto> matchedTransactions,
             int matchedCount,
-            int evaluatedCount,
-            int customerCount,
-            boolean degraded,
-            List<String> notes,
-            List<RuleMatchDto> sampleMatches) {
+            int evaluatedTransactionCount,
+            String rationale,
+            String model,
+            long durationMs,
+            List<String> notes) {
 
-        public static RuleTestResponse from(RuleTestOutcome outcome) {
-            return new RuleTestResponse(outcome.matchedCount(), outcome.evaluatedCount(),
-                    outcome.customerCount(), outcome.degraded(), outcome.notes(),
-                    outcome.sampleMatches().stream().map(RuleMatchDto::from).toList());
+        public static RuleTestResponse from(RuleJudgement judgement) {
+            return new RuleTestResponse(judgement.ruleName(), judgement.appliesTo(),
+                    judgement.weight(), judgement.customerId(), judgement.customerName(),
+                    judgement.triggered(), judgement.score(),
+                    judgement.matchedTransactions().stream().map(RuleMatchDto::from).toList(),
+                    judgement.matchedCount(), judgement.evaluatedTransactionCount(),
+                    judgement.rationale(), judgement.model(), judgement.durationMs(),
+                    judgement.notes());
         }
     }
 
-    /** One matching transaction, with the trace explaining the match. */
+    /**
+     * One transaction the model cited.
+     *
+     * @param reason the model's note on why it counted, or {@code null} when it gave none
+     */
     public record RuleMatchDto(
             UUID transactionId,
-            UUID customerId,
-            String customerName,
             ActivityType activityType,
             BigDecimal amount,
             String currency,
             String status,
             Instant createdAt,
-            String explanation) {
+            String reason) {
 
-        public static RuleMatchDto from(RuleMatch match) {
-            return new RuleMatchDto(match.transactionId(), match.customerId(), match.customerName(),
-                    match.activityType(), match.amount(), match.currency(), match.status(),
-                    match.createdAt(), match.explanation());
+        public static RuleMatchDto from(JudgedTransaction match) {
+            return new RuleMatchDto(match.transactionId(), match.activityType(), match.amount(),
+                    match.currency(), match.status(), match.createdAt(), match.reason());
         }
     }
 
     /**
-     * One field the editor may offer.
+     * One field the agent can see, as the rule editor's reference panel renders it.
      *
-     * @param operators     operators valid for this field, in display order
-     * @param options       enum options where applicable
-     * @param optionsClosed whether a value outside {@code options} is rejected on write
+     * @param category grouping of the panel, lower case: {@code transaction}, {@code customer},
+     *                 {@code card}, {@code payment}, {@code crypto}, {@code aggregate}
+     * @param options  known values of an enumerated field, empty when it is free-form
+     * @param example  a short sample value
      */
     public record FieldCatalogEntry(
             String field,
             String label,
             FieldType type,
+            String category,
             RuleScope appliesTo,
-            List<RuleOperator> operators,
             List<String> options,
-            boolean optionsClosed,
             boolean nullable,
+            String example,
             String description) {
 
         public static FieldCatalogEntry from(FieldDefinition definition) {
             return new FieldCatalogEntry(definition.field(), definition.label(), definition.type(),
-                    definition.appliesTo(), definition.allowedOperators(), definition.options(),
-                    definition.optionsClosed(), definition.nullable(), definition.description());
+                    definition.category().wireName(), definition.appliesTo(), definition.options(),
+                    definition.nullable(), definition.example(), definition.description());
         }
     }
 }

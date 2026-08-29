@@ -80,10 +80,11 @@ export function ActivitySummaryCards({
     (summary?.byActivityType ?? []).map((entry) => [entry.activityType, entry]),
   )
 
-  /* The `agg.*` values the rule engine scored on. The server folds each rolling
-     window with `max` over the customer's whole history, so every figure is a
-     PEAK, not a reading taken at some instant — a threshold rule fires exactly
-     when the peak crosses it. The labels have to say so, otherwise "3" reads as
+  /* The `agg.*` values the agent reads through its tools. The server folds each
+     rolling window with `max` over the customer's whole history, so every figure
+     is a PEAK, not a reading taken at some instant — a rule condition naming a
+     threshold is met exactly when the peak crosses it. The labels have to say so,
+     otherwise "3" reads as
      "3 transactions in the last day" when the customer may be long dormant.
      Every tile is a field the summary endpoint really sends, so the block
      renders for any customer instead of staying permanently empty. */
@@ -208,10 +209,11 @@ export function ActivitySummaryCards({
           <CardHeader>
             <CardTitle>Velocity and exposure</CardTitle>
             <p className="mt-0.5 text-xs text-muted">
-              The same aggregates the rule engine scores on, exposed as{' '}
+              The same aggregates the agent reads when it judges a rule, exposed as{' '}
               <code className="font-mono">agg.*</code> fields. Each figure is the highest the
-              rolling window ever reached across this customer's history — the value a threshold
-              rule was measured against — not a reading for the last 24 hours or 30 days.
+              rolling window ever reached across this customer's history — the value a rule
+              condition naming a threshold is judged against — not a reading for the last 24 hours
+              or 30 days.
             </p>
           </CardHeader>
           <CardContent>

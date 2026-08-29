@@ -1,14 +1,15 @@
 /**
  * Per-rule results with an explicit coverage indicator.
  *
- * BUILD_SPEC section 4 makes full rule coverage a graded requirement: every
- * rule in the coverage set is persisted, triggered or not, and each verdict
- * records whether it came from the agent or from the deterministic backfill.
- * This table is where a reviewer verifies that nothing was skipped, so the
- * coverage count leads the panel, triggered rules are grouped away from the
- * quiet ones, and any agent/deterministic disagreement is impossible to miss.
+ * Full rule coverage is the guarantee this table exists to evidence: every rule
+ * in the coverage set is persisted, triggered or not, and a run may only be
+ * COMPLETED when every one of them has a verdict. Every verdict here is the
+ * agent's own judgement of a rule written in plain English — nothing recomputed
+ * it and nothing overruled it — so the panel leads with the coverage count,
+ * groups triggered rules away from the quiet ones, and states plainly that the
+ * scores are estimates rather than arithmetic.
  */
-import { Bot, ChevronRight, Scale, ShieldAlert, ShieldCheck, TriangleAlert } from 'lucide-react'
+import { Bot, ChevronRight, ShieldAlert, ShieldCheck, TriangleAlert } from 'lucide-react'
 import { Fragment, useId, useState, type ReactNode } from 'react'
 import type { EvaluationSource, RiskRule, RuleEvaluation, UUID } from '../../api/types'
 import { Badge } from '../../components/ui/Badge'
@@ -18,7 +19,6 @@ import { ErrorState } from '../../components/ui/ErrorState'
 import { Skeleton } from '../../components/ui/Skeleton'
 import { cn } from '../../lib/cn'
 import { formatNumber, shortId } from '../../lib/format'
-import { describeRuleNode, ruleLogicToJson } from '../../lib/rules'
 import {
   coverageCountLabel,
   coverageExplanation,
@@ -35,26 +35,22 @@ const CAPTION = 'text-2xs font-semibold tracking-caption text-muted uppercase'
 
 const HEADER_CELL = cn('px-3 py-2 font-semibold', CAPTION)
 
+/**
+ * There is only one origin for a verdict now, and saying so on every row is the
+ * point: a reviewer must never mistake an estimate for a computation.
+ */
 function SourceBadge({ source }: { source: EvaluationSource }) {
-  if (source === 'DETERMINISTIC_FALLBACK') {
-    return (
-      <Badge
-        tone="outline"
-        className="border-dashed"
-        icon={<Scale aria-hidden="true" className="size-3" />}
-        title="The agent never submitted a verdict for this rule, so the deterministic DSL engine evaluated it during backfill."
-      >
-        Deterministic fallback
-      </Badge>
-    )
-  }
   return (
     <Badge
       tone="neutral"
       icon={<Bot aria-hidden="true" className="size-3" />}
-      title="The agent submitted this verdict itself."
+      title={
+        source === 'AGENT_JUDGED'
+          ? 'The agent read the rule condition, fetched the evidence and judged it. Nothing recomputed this verdict.'
+          : `Verdict source reported as ${source}.`
+      }
     >
-      Agent
+      Agent judged
     </Badge>
   )
 }
@@ -102,34 +98,22 @@ function CoverageRow({ evaluation, rule, expanded, onToggle }: CoverageRowProps)
   const reactId = useId()
   const panelId = `${reactId}-rule-panel`
   const triggered = evaluation.triggered
-  const disputed = evaluation.disagreement === true
+  const capped = evaluation.scoreClamped === true
   const weight = evaluation.weight ?? rule?.weight ?? null
   const appliesTo = evaluation.appliesTo ?? rule?.appliesTo ?? null
-  /* `matchedTransactionIds` is the wire name; a run that failed before the
-     evidence was recorded may omit it, so never dereference it blind. */
+  /* `matchedTransactionIds` is the wire name; a run rebuilt from the assessment
+     rows alone carries no evidence ids, so never dereference it blind. */
   const matchedIds = evaluation.matchedTransactionIds ?? []
-  const degradationNotes = evaluation.degradationNotes ?? []
 
   return (
     <Fragment>
       <tr
         className={cn(
           'border-b border-border/60 transition-colors',
-          disputed
-            ? 'bg-warning-soft/60'
-            : triggered
-              ? 'bg-warning-soft/25'
-              : 'hover:bg-surface-2/60',
+          triggered ? 'bg-warning-soft/25' : 'hover:bg-surface-2/60',
         )}
       >
-        <td
-          className={cn(
-            'px-3 py-2.5 align-top',
-            disputed
-              ? 'border-l-4 border-l-warning'
-              : triggered && 'border-l-2 border-l-warning',
-          )}
-        >
+        <td className={cn('px-3 py-2.5 align-top', triggered && 'border-l-2 border-l-warning')}>
           <button
             type="button"
             onClick={onToggle}
@@ -185,13 +169,13 @@ function CoverageRow({ evaluation, rule, expanded, onToggle }: CoverageRowProps)
         <td className="px-3 py-2.5 align-top">
           <div className="flex flex-wrap items-center gap-1.5">
             <SourceBadge source={evaluation.source} />
-            {disputed ? (
+            {capped ? (
               <Badge
                 tone="warning"
                 icon={<TriangleAlert aria-hidden="true" className="size-3" />}
-                title="The agent and the deterministic engine disagreed. The deterministic verdict was used for scoring."
+                title="The agent asked for more than this rule's weight; the score was capped at the weight."
               >
-                Disagreement
+                Capped at weight
               </Badge>
             ) : null}
           </div>
@@ -217,54 +201,39 @@ function CoverageRow({ evaluation, rule, expanded, onToggle }: CoverageRowProps)
                   </p>
                 </section>
 
-                {evaluation.explanation ? (
-                  <section>
-                    <h4 className={CAPTION}>Deterministic engine</h4>
-                    <p className="mt-1 text-xs leading-relaxed text-muted">
-                      {evaluation.explanation}
-                    </p>
-                  </section>
-                ) : null}
-
                 <section>
                   <h4 className={CAPTION}>Verdict source</h4>
                   <p className="mt-1 text-xs leading-relaxed text-muted">
-                    {evaluation.source === 'DETERMINISTIC_FALLBACK'
-                      ? 'The agent finished without submitting a verdict for this rule, so the deterministic DSL engine evaluated it during backfill. Coverage stays complete either way.'
-                      : 'The agent submitted this verdict through submit_rule_evaluation.'}
-                    {evaluation.disagreement
-                      ? ' The agent and the deterministic engine disagreed here; the deterministic result was used for scoring.'
+                    The agent read the rule condition, gathered the evidence with its tools and
+                    submitted this verdict through <code className="font-mono">
+                      submit_rule_evaluation
+                    </code>. The score is its estimate, capped at the rule&rsquo;s weight — it is a
+                    judgement, so a second run can reach a different number.
+                    {capped && evaluation.claimedScore != null
+                      ? ` It asked for ${formatNumber(evaluation.claimedScore, {
+                          minimumFractionDigits: 2,
+                          maximumFractionDigits: 2,
+                        })} here and was capped at the weight.`
                       : ''}
                   </p>
                 </section>
 
-                {degradationNotes.length > 0 ? (
-                  <section>
-                    <h4 className={CAPTION}>Degraded conditions</h4>
-                    <ul className="mt-1 space-y-1 text-xs leading-relaxed text-warning-fg">
-                      {degradationNotes.map((note) => (
-                        <li key={note}>{note}</li>
-                      ))}
-                    </ul>
-                  </section>
-                ) : null}
-
                 {rule ? (
                   <section>
-                    <h4 className={CAPTION}>Threshold logic</h4>
-                    <p className="mt-1 font-mono text-2xs leading-relaxed break-words text-fg">
-                      {describeRuleNode(rule.thresholdLogic)}
+                    <h4 className={CAPTION}>Rule condition</h4>
+                    <p className="mt-1 text-xs leading-relaxed whitespace-pre-line text-fg">
+                      {rule.thresholdLogic}
                     </p>
-                    <pre className="mt-1.5 max-h-40 overflow-auto rounded-xs border border-border bg-surface px-2.5 py-2 font-mono text-2xs leading-relaxed text-muted">
-                      {ruleLogicToJson(rule.thresholdLogic)}
-                    </pre>
+                    <p className="mt-1.5 text-2xs leading-relaxed text-subtle">
+                      This is the text the agent was shown, word for word.
+                    </p>
                   </section>
                 ) : null}
               </div>
 
               <section>
                 <h4 className={CAPTION}>
-                  Matched transactions
+                  Transactions cited as evidence
                   {matchedIds.length > 0 ? (
                     <span className="numeric ml-1.5 font-normal text-subtle">
                       {matchedIds.length}
@@ -283,7 +252,7 @@ function CoverageRow({ evaluation, rule, expanded, onToggle }: CoverageRowProps)
   )
 }
 
-/** The headline "18 / 18 rules evaluated" block — the evidence a reviewer looks for first. */
+/** The headline "18 / 18 rules judged" block — the evidence a reviewer looks for first. */
 function CoverageMeter({
   stats,
   running,
@@ -315,7 +284,7 @@ function CoverageMeter({
           {stats.total}
         </p>
         <p aria-hidden="true" className={cn('mt-1.5', CAPTION)}>
-          Rules evaluated
+          Rules judged
         </p>
         <span className="sr-only">{coverageCountLabel(stats)}</span>
       </div>
@@ -329,7 +298,7 @@ function CoverageMeter({
 export interface RuleCoverageTableProps {
   evaluations: RuleEvaluation[]
   stats: CoverageStats
-  /** Optional join on `GET /api/rules`, used to show the threshold logic. */
+  /** Optional join on `GET /api/rules`, used to show the rule condition verbatim. */
   rules?: RiskRule[]
   running?: boolean
   loading?: boolean
@@ -379,8 +348,8 @@ export function RuleCoverageTable({
       <CardHeader>
         <CardTitle>Rule coverage</CardTitle>
         <CardDescription>
-          Every rule that applies to this customer, with its verdict — including the rules that did
-          not trigger.
+          Every rule that applies to this customer, with the agent&rsquo;s verdict — including the
+          rules it judged and cleared.
         </CardDescription>
       </CardHeader>
 
@@ -388,25 +357,22 @@ export function RuleCoverageTable({
         <div className="flex flex-wrap items-center justify-between gap-4">
           <CoverageMeter stats={stats} running={running} />
           <div className="flex flex-wrap items-center gap-1.5">
-            <Badge tone="neutral" title="Rules whose conditions matched at least one transaction.">
+            <Badge tone="neutral" title="Rules the agent judged to be triggered by this activity.">
               {stats.triggered} triggered
             </Badge>
-            <Badge tone="neutral" title="Verdicts submitted by the agent itself.">
-              {stats.agentCount} by agent
-            </Badge>
             <Badge
-              tone={stats.fallbackCount > 0 ? 'warning' : 'neutral'}
-              title="Verdicts produced by the deterministic backfill after the agent stopped short."
+              tone={stats.unjudged > 0 ? 'warning' : 'neutral'}
+              title="Rules of the coverage set that never received a verdict. A run that ends this way is recorded FAILED."
             >
-              {stats.fallbackCount} deterministic
+              {stats.unjudged} unjudged
             </Badge>
-            {stats.disagreements > 0 ? (
+            {stats.cappedCount > 0 ? (
               <Badge
                 tone="warning"
                 icon={<TriangleAlert aria-hidden="true" className="size-3" />}
-                title="Rules where the agent and the deterministic engine reached different verdicts."
+                title="Rules where the agent estimated a score above the rule's weight and the backend capped it."
               >
-                {stats.disagreements} disputed
+                {stats.cappedCount} capped at weight
               </Badge>
             ) : null}
           </div>
@@ -417,7 +383,7 @@ export function RuleCoverageTable({
           aria-valuenow={stats.evaluated}
           aria-valuemin={0}
           aria-valuemax={stats.total}
-          aria-label="Rules evaluated"
+          aria-label="Rules judged"
           className="mt-3 h-2 w-full overflow-hidden rounded-full bg-surface-3"
         >
           <div
@@ -434,25 +400,24 @@ export function RuleCoverageTable({
           {coverageExplanation(stats, running)}
         </p>
 
-        {stats.complete && stats.agentComplete && stats.fallbackCount === 0 ? (
+        {stats.complete ? (
           <p className="mt-2 inline-flex items-center gap-1.5 text-xs text-fg">
             <ShieldCheck aria-hidden="true" className="size-3.5 text-accent" />
-            The coverage gate confirmed the agent evaluated the full rule set.
+            The coverage gate confirmed the agent judged the full rule set.
           </p>
         ) : null}
 
-        {stats.disagreements > 0 ? (
+        {!stats.complete && !running ? (
           <div className="mt-3 flex items-start gap-2.5 rounded-xs border border-warning/50 border-l-4 border-l-warning bg-warning-soft/60 p-3">
             <TriangleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning-fg" />
             <div className="min-w-0">
-              <p className={cn(CAPTION, 'text-warning-fg')}>
-                Agent / deterministic disagreement
-              </p>
+              <p className={cn(CAPTION, 'text-warning-fg')}>Incomplete review</p>
               <p className="mt-1.5 text-xs leading-relaxed text-fg">
-                The agent and the deterministic engine disagreed on {stats.disagreements} rule
-                {stats.disagreements === 1 ? '' : 's'}. The deterministic verdict was used for
-                scoring — this is the false-negative safety net, and the affected rows are flagged
-                below.
+                The agent never returned a verdict for{' '}
+                {stats.unjudged > 0 ? stats.unjudged : stats.total - stats.evaluated} rule
+                {stats.unjudged === 1 ? '' : 's'}. Nothing fills that gap in — the run is recorded
+                as FAILED and the verdicts below are partial. Re-run the analysis before relying on
+                this assessment.
               </p>
             </div>
           </div>
@@ -520,7 +485,7 @@ export function RuleCoverageTable({
               <tbody>
                 <GroupRow
                   triggered={false}
-                  label="Evaluated — no contribution"
+                  label="Judged and cleared — no contribution"
                   count={quietRows.length}
                 />
                 {renderRows(quietRows)}

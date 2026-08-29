@@ -45,11 +45,11 @@ import org.springframework.transaction.annotation.Transactional;
  * loading the customer's transactions.
  *
  * <p>The timeline and the six velocity figures share one read: the customer's
- * {@link EvaluationBatch}, the same object the rule engine and the ReAct agent evaluate against.
- * That read is a single fetch-joined statement and it is briefly cached per customer, so the whole
- * endpoint costs a fixed number of queries regardless of how much activity the customer has. It
- * also removes any chance of the operator seeing a velocity figure that differs from the one a rule
- * fired on, because both read the identical snapshots.
+ * {@link EvaluationBatch}, the same object the ReAct agent's tools read the customer's activity
+ * from. That read is a single fetch-joined statement and it is briefly cached per customer, so the
+ * whole endpoint costs a fixed number of queries regardless of how much activity the customer has.
+ * It also removes any chance of the operator seeing a velocity figure that differs from the one the
+ * agent judged a rule on, because both read the identical snapshots.
  */
 @Service
 public class ActivitySummaryService {
@@ -169,11 +169,11 @@ public class ActivitySummaryService {
      * The six {@code agg.*} figures, peaked over the customer's whole history.
      *
      * <p>Every window is defined relative to a transaction, so there is one snapshot per transaction
-     * and no single "current" value. The peak is the figure that matters: a threshold rule triggers
-     * exactly when the peak crosses its threshold, so an operator looking at a triggered rule sees
-     * the number that made it fire. The snapshots are read straight off the rule engine's own batch
-     * and folded with the same maximum the agent's {@code get_customer_activity_summary} velocity
-     * block uses, so the screen, the agent's narrative and the rule verdict cannot disagree.
+     * and no single "current" value. The peak is the figure that matters: a rule condition that
+     * names a threshold is met exactly when the peak crosses it, so an operator looking at a
+     * triggered rule sees the number behind it. The snapshots are folded with the same maximum the
+     * agent's {@code get_customer_activity_summary} velocity block uses, so the screen, the agent's
+     * narrative and its verdict cannot disagree.
      */
     private static PeakVelocity peakVelocity(EvaluationBatch batch) {
         long txCount24h = 0L;

@@ -2,7 +2,13 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { deleteJson, getJson, postJson } from '../../api/client'
-import type { FieldCatalogEntryWire, RiskRuleWire } from '../../api/types'
+import { ApiError } from '../../api/errors'
+import type {
+  CustomerSummary,
+  FieldCatalogEntryWire,
+  RiskRuleWire,
+  SpringPage,
+} from '../../api/types'
 import { ToastProvider } from '../../components/ui/Toast'
 import { RulesPage } from '../admin/RulesPage'
 
@@ -21,150 +27,125 @@ const mockGet = vi.mocked(getJson)
 const mockPost = vi.mocked(postJson)
 const mockDelete = vi.mocked(deleteJson)
 
-/**
- * Subset of `GET /api/rules/field-catalog` copied verbatim from a live
- * response: `type` is the Java enum name in UPPER CASE, the allowed members
- * are `options` (not `values`), the prose is `description` (not `notes`), and
- * every entry states the `operators` the backend will accept. Typed as the
- * wire shape so the fixture cannot drift back into the editor's vocabulary.
- */
-const NUMBER_OPERATORS = ['GT', 'GTE', 'LT', 'LTE', 'EQ', 'NEQ', 'BETWEEN', 'IN', 'NOT_IN', 'IS_NULL', 'NOT_NULL']
-const STRING_OPERATORS = ['EQ', 'NEQ', 'IN', 'NOT_IN', 'CONTAINS', 'NOT_CONTAINS', 'MATCHES', 'IS_NULL', 'NOT_NULL']
-const ENUM_OPERATORS = ['EQ', 'NEQ', 'IN', 'NOT_IN', 'IS_NULL', 'NOT_NULL']
+/* -------------------------------------------------------------------------- */
+/* Fixtures                                                                    */
+/* -------------------------------------------------------------------------- */
 
+/**
+ * `GET /api/rules/field-catalog` in the shape the backend serialises: `type` is
+ * the Java enum name in UPPER CASE and `category` is the reference panel's
+ * grouping. `agg.tx_count_24h` deliberately omits `category` — the panel has to
+ * derive it from the field path, because a catalog entry that lands in the
+ * wrong group is a field an author never finds.
+ */
 const CATALOG: FieldCatalogEntryWire[] = [
   {
     field: 'amount',
     label: 'Amount',
     type: 'NUMBER',
+    category: 'transaction',
     appliesTo: 'ALL',
-    operators: NUMBER_OPERATORS,
     options: [],
-    optionsClosed: false,
     nullable: false,
+    example: '12500.00',
     description: 'Transaction amount in the transaction currency.',
-  },
-  {
-    field: 'currency',
-    label: 'Currency',
-    type: 'STRING',
-    appliesTo: 'ALL',
-    operators: STRING_OPERATORS,
-    options: [],
-    optionsClosed: false,
-    nullable: false,
-    description: 'ISO-4217 code of the transaction.',
   },
   {
     field: 'status',
     label: 'Status',
     type: 'ENUM',
+    category: 'transaction',
     appliesTo: 'ALL',
-    operators: ENUM_OPERATORS,
     options: ['Completed', 'Pending', 'Failed', 'Reversed'],
-    optionsClosed: true,
     nullable: false,
     description: 'Processing outcome of the transaction.',
-  },
-  {
-    field: 'created_at',
-    label: 'Created at (UTC)',
-    type: 'DATETIME',
-    appliesTo: 'ALL',
-    operators: ['GT', 'GTE', 'LT', 'LTE', 'BETWEEN', 'EQ', 'NEQ', 'IS_NULL', 'NOT_NULL'],
-    options: [],
-    optionsClosed: false,
-    nullable: false,
-    description: 'Instant the transaction occurred.',
   },
   {
     field: 'customer.country',
     label: 'Customer country',
     type: 'STRING',
+    category: 'customer',
     appliesTo: 'ALL',
-    operators: STRING_OPERATORS,
     options: [],
-    optionsClosed: false,
     nullable: false,
-    description: 'ISO-2 country of residence.',
+    description: 'ISO 3166-1 alpha-2 country of the customer.',
   },
   {
     field: 'card.card_present',
     label: 'Card present',
     type: 'BOOLEAN',
+    category: 'card',
     appliesTo: 'CARD',
-    operators: ['EQ', 'NEQ', 'IS_NULL', 'NOT_NULL'],
     options: ['true', 'false'],
-    optionsClosed: true,
     nullable: false,
     description: 'False means a card-not-present authorisation.',
-  },
-  {
-    field: 'card.decline_reason',
-    label: 'Decline reason',
-    type: 'STRING',
-    appliesTo: 'CARD',
-    operators: STRING_OPERATORS,
-    options: [],
-    optionsClosed: false,
-    nullable: true,
-    description: 'Populated only for declined authorisations.',
   },
   {
     field: 'payment.receiver_bank_country',
     label: 'Receiver bank country',
     type: 'STRING',
+    category: 'payment',
     appliesTo: 'PAYMENT',
-    operators: STRING_OPERATORS,
     options: [],
-    optionsClosed: false,
     nullable: false,
-    description: 'ISO-2 country of the receiving bank.',
+    description: 'ISO 3166-1 alpha-2 country of the beneficiary bank.',
   },
   {
-    field: 'crypto.blockchain',
-    label: 'Blockchain',
-    type: 'ENUM',
+    field: 'crypto.exchange_name',
+    label: 'Exchange name',
+    type: 'STRING',
+    category: 'crypto',
     appliesTo: 'CRYPTO',
-    operators: ENUM_OPERATORS,
-    options: ['BTC', 'ETH', 'USDT', 'XMR'],
-    // The backend calls this list a suggestion, so any value is accepted.
-    optionsClosed: false,
-    nullable: false,
-    description: 'Chain or token the transfer settled on.',
+    options: [],
+    nullable: true,
+    description: 'Counterparty exchange, empty when unattributed.',
   },
   {
     field: 'agg.tx_count_24h',
-    label: 'Tx count in previous 24h',
+    label: 'Transactions in the previous 24h',
     type: 'NUMBER',
+    // No `category`: grouping falls back to the `agg.` prefix.
     appliesTo: 'ALL',
-    operators: NUMBER_OPERATORS,
     options: [],
-    optionsClosed: false,
     nullable: false,
     description: 'Customer-level velocity relative to the transaction.',
   },
 ]
 
+const LONG_CONDITION =
+  'Triggered when a payment is sent to a beneficiary bank in a sanctioned or high-risk jurisdiction — ' +
+  'payment.receiver_bank_country in IR, KP, SY, RU, BY or AF. A single such payment triggers the rule ' +
+  'regardless of amount, and the score should reach the full weight when the amount exceeds 10 000.'
+
 const EXISTING_RULE: RiskRuleWire = {
   ruleId: '11111111-2222-3333-4444-555555555555',
-  ruleName: 'High-value SWIFT to sanctioned country',
+  ruleName: 'Payment to a sanctioned jurisdiction',
   appliesTo: 'PAYMENT',
-  // TEXT column: the backend may hand the DSL over as a JSON string.
-  thresholdLogic: JSON.stringify({
-    op: 'AND',
-    conditions: [
-      { field: 'amount', operator: 'GT', value: 10000 },
-      { field: 'payment.receiver_bank_country', operator: 'IN', value: ['IR', 'KP'] },
-    ],
-  }),
-  weight: '25.00',
+  thresholdLogic: LONG_CONDITION,
+  // DECIMAL(5,2) may serialise as a string.
+  weight: '35.00',
+}
+
+const CUSTOMER: CustomerSummary = {
+  customerId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+  firstName: 'Mila',
+  lastName: 'Novak',
+  country: 'CH',
+}
+
+const CUSTOMER_PAGE: SpringPage<CustomerSummary> = {
+  content: [CUSTOMER],
+  page: 0,
+  size: 6,
+  totalElements: 1,
+  totalPages: 1,
 }
 
 function mockApi(rules: RiskRuleWire[]): void {
   mockGet.mockImplementation((url: string) => {
     if (url === '/rules') return Promise.resolve(rules) as Promise<never>
     if (url === '/rules/field-catalog') return Promise.resolve(CATALOG) as Promise<never>
+    if (url === '/customers') return Promise.resolve(CUSTOMER_PAGE) as Promise<never>
     return Promise.reject(new Error(`unexpected GET ${url}`)) as Promise<never>
   })
 }
@@ -184,12 +165,22 @@ function renderRulesPage() {
 
 async function openNewRuleEditor(): Promise<HTMLElement> {
   fireEvent.click(await screen.findByRole('button', { name: 'New rule' }))
-  return screen.findByRole('dialog')
+  const dialog = await screen.findByRole('dialog')
+  // The reference panel only renders once the catalog resolves.
+  await screen.findByRole('button', { name: 'Insert amount into the condition' })
+  return dialog
 }
 
-function jsonPreview(): unknown {
-  return JSON.parse(screen.getByTestId('rule-json').textContent ?? 'null')
+function conditionBox(): HTMLTextAreaElement {
+  return screen.getByLabelText(/Rule condition/) as HTMLTextAreaElement
 }
+
+function typeCondition(text: string): void {
+  fireEvent.change(conditionBox(), { target: { value: text } })
+}
+
+const VALID_CONDITION =
+  'Triggered when the customer makes three or more payments between 8 000 and 9 999.99 within any rolling 24 hours.'
 
 beforeEach(() => {
   mockApi([])
@@ -197,20 +188,37 @@ beforeEach(() => {
   mockDelete.mockReset()
 })
 
+/* -------------------------------------------------------------------------- */
+/* Catalogue screen                                                            */
+/* -------------------------------------------------------------------------- */
+
 describe('RulesPage', () => {
   it('renders the empty state when there are no rules', async () => {
     renderRulesPage()
     expect(await screen.findByText('No risk rules yet')).toBeInTheDocument()
   })
 
-  it('lists rules with a plain-English summary of the condition', async () => {
+  it('lists rules with a readable excerpt of the condition', async () => {
     mockApi([EXISTING_RULE])
     renderRulesPage()
 
-    expect(await screen.findByText('High-value SWIFT to sanctioned country')).toBeInTheDocument()
-    expect(screen.getByText(/Amount greater than/)).toBeInTheDocument()
-    expect(screen.getByText(/Receiver bank country is one of IR, KP/)).toBeInTheDocument()
-    expect(screen.getByText('2 conditions · 1 level deep')).toBeInTheDocument()
+    expect(await screen.findByText('Payment to a sanctioned jurisdiction')).toBeInTheDocument()
+    const excerpt = screen.getByText(/Triggered when a payment is sent to a beneficiary bank/)
+    // Truncated for the cell, but the full prose stays available on hover.
+    expect(excerpt).toHaveAttribute('title', LONG_CONDITION)
+    expect(excerpt.textContent?.length).toBeLessThan(LONG_CONDITION.length)
+    // Scoped to the row: the same figure is also the catalogue's combined weight.
+    const row = excerpt.closest('tr') as HTMLElement
+    expect(within(row).getByText('35.00')).toBeInTheDocument()
+    expect(within(row).getByText('PAYMENT')).toBeInTheDocument()
+  })
+
+  it('calls out a rule that has no condition at all', async () => {
+    mockApi([{ ...EXISTING_RULE, thresholdLogic: '   ' }])
+    renderRulesPage()
+    expect(
+      await screen.findByText('No condition stored — the agent has nothing to judge.'),
+    ).toBeInTheDocument()
   })
 
   it('surfaces a failed rule fetch with a retry affordance', async () => {
@@ -229,7 +237,7 @@ describe('RulesPage', () => {
     renderRulesPage()
 
     fireEvent.click(
-      await screen.findByRole('button', { name: 'Delete High-value SWIFT to sanctioned country' }),
+      await screen.findByRole('button', { name: 'Delete Payment to a sanctioned jurisdiction' }),
     )
     const dialog = await screen.findByRole('dialog')
     expect(mockDelete).not.toHaveBeenCalled()
@@ -247,76 +255,27 @@ describe('RulesPage', () => {
   })
 })
 
-describe('visual condition builder', () => {
-  it('builds a nested AND/OR rule and emits the exact threshold_logic DSL', async () => {
+/* -------------------------------------------------------------------------- */
+/* Condition editor                                                            */
+/* -------------------------------------------------------------------------- */
+
+describe('condition editor', () => {
+  it('saves the condition as the prose that was typed', async () => {
     renderRulesPage()
     await openNewRuleEditor()
 
     fireEvent.change(screen.getByLabelText(/Rule name/), {
-      target: { value: 'High-value cross-border payment' },
+      target: { value: 'Structuring below the reporting threshold' },
     })
     fireEvent.change(screen.getByLabelText('Applies to'), { target: { value: 'PAYMENT' } })
     fireEvent.change(screen.getByLabelText('Weight value'), { target: { value: '30' } })
-
-    // Root condition: amount >= 10000
-    const first = screen.getByRole('group', { name: 'Condition 1' })
-    fireEvent.change(within(first).getByLabelText('Operator'), { target: { value: 'GTE' } })
-    fireEvent.change(within(first).getByLabelText('Value'), { target: { value: '10000' } })
-
-    // Nested group, switched from AND to OR
-    fireEvent.click(screen.getByRole('button', { name: 'Add nested group to Root group' }))
-    const nested = await screen.findByRole('group', { name: 'Group 2' })
-    fireEvent.click(within(nested).getByRole('button', { name: 'Set Group 2 to Any of (OR)' }))
-
-    // Nested condition 1: receiver bank country IN [IR, KP]
-    const nestedFirst = screen.getByRole('group', { name: 'Condition 2.1' })
-    fireEvent.change(within(nestedFirst).getByLabelText('Field'), {
-      target: { value: 'payment.receiver_bank_country' },
-    })
-    // Switching a number field to a string field resets the invalid operator...
-    expect(within(nestedFirst).getByLabelText('Operator')).toHaveValue('EQ')
-    // ...and the incomplete row blocks saving.
-    expect(screen.getByRole('button', { name: 'Create rule' })).toBeDisabled()
-
-    fireEvent.change(within(nestedFirst).getByLabelText('Operator'), { target: { value: 'IN' } })
-    const chipInput = within(nestedFirst).getByLabelText('Values')
-    fireEvent.change(chipInput, { target: { value: 'IR' } })
-    fireEvent.click(within(nestedFirst).getByRole('button', { name: 'Add value' }))
-    fireEvent.change(chipInput, { target: { value: 'KP' } })
-    fireEvent.click(within(nestedFirst).getByRole('button', { name: 'Add value' }))
-
-    // Nested condition 2: customer.country != US
-    fireEvent.click(within(nested).getByRole('button', { name: 'Add condition to Group 2' }))
-    const nestedSecond = await screen.findByRole('group', { name: 'Condition 2.2' })
-    fireEvent.change(within(nestedSecond).getByLabelText('Field'), {
-      target: { value: 'customer.country' },
-    })
-    fireEvent.change(within(nestedSecond).getByLabelText('Operator'), { target: { value: 'NEQ' } })
-    fireEvent.change(within(nestedSecond).getByLabelText('Value'), { target: { value: 'US' } })
-
-    const expected = {
-      op: 'AND',
-      conditions: [
-        { field: 'amount', operator: 'GTE', value: 10000 },
-        {
-          op: 'OR',
-          conditions: [
-            { field: 'payment.receiver_bank_country', operator: 'IN', value: ['IR', 'KP'] },
-            { field: 'customer.country', operator: 'NEQ', value: 'US' },
-          ],
-        },
-      ],
-    }
-
-    // The preview is byte-for-byte what gets persisted, key order included.
-    expect(jsonPreview()).toEqual(expected)
-    expect(screen.getByTestId('rule-json').textContent).toBe(JSON.stringify(expected, null, 2))
+    typeCondition(`  ${VALID_CONDITION}  `)
 
     mockPost.mockResolvedValue({
-      ruleId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
-      ruleName: 'High-value cross-border payment',
+      ruleId: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff',
+      ruleName: 'Structuring below the reporting threshold',
       appliesTo: 'PAYMENT',
-      thresholdLogic: expected,
+      thresholdLogic: VALID_CONDITION,
       weight: 30,
     } as never)
 
@@ -326,244 +285,368 @@ describe('visual condition builder', () => {
 
     await waitFor(() => {
       expect(mockPost).toHaveBeenCalledWith('/rules', {
-        ruleName: 'High-value cross-border payment',
+        ruleName: 'Structuring below the reporting threshold',
         appliesTo: 'PAYMENT',
         weight: 30,
-        thresholdLogic: expected,
+        thresholdLogic: VALID_CONDITION,
       })
     })
   })
 
-  it('filters operators and swaps the value control to match the field type', async () => {
+  it('counts characters against the server limit', async () => {
     renderRulesPage()
     await openNewRuleEditor()
 
-    const row = screen.getByRole('group', { name: 'Condition 1' })
-    const operator = within(row).getByLabelText('Operator')
-    expect(within(operator).getByRole('option', { name: 'greater than' })).toBeInTheDocument()
-    expect(within(operator).queryByRole('option', { name: 'contains' })).not.toBeInTheDocument()
+    expect(screen.getByText('0 / 2000 characters')).toBeInTheDocument()
+    typeCondition(VALID_CONDITION)
+    expect(
+      screen.getByText(`${VALID_CONDITION.length} / 2000 characters`),
+    ).toBeInTheDocument()
 
-    fireEvent.change(within(row).getByLabelText('Field'), {
-      target: { value: 'card.card_present' },
-    })
-
-    // `GT` is not valid for a boolean, so the operator falls back to `EQ`
-    // and the value control becomes a checkbox.
-    expect(within(row).getByLabelText('Operator')).toHaveValue('EQ')
-    expect(within(row).queryByRole('option', { name: 'greater than' })).not.toBeInTheDocument()
-
-    const checkbox = within(row).getByLabelText('Value is true')
-    expect(checkbox).toBeChecked()
-    expect(jsonPreview()).toEqual({
-      op: 'AND',
-      conditions: [{ field: 'card.card_present', operator: 'EQ', value: true }],
-    })
-
-    fireEvent.click(checkbox)
-    expect(jsonPreview()).toEqual({
-      op: 'AND',
-      conditions: [{ field: 'card.card_present', operator: 'EQ', value: false }],
-    })
+    typeCondition('x'.repeat(2001))
+    expect(screen.getByText('2001 / 2000 characters')).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('1 character(s) over the 2000 limit.')
+    expect(screen.getByRole('button', { name: 'Create rule' })).toBeDisabled()
   })
 
-  it('offers the allowed values of an enum field', async () => {
+  it('refuses a condition too short for the agent to judge', async () => {
     renderRulesPage()
     await openNewRuleEditor()
 
-    const row = screen.getByRole('group', { name: 'Condition 1' })
-    fireEvent.change(within(row).getByLabelText('Field'), { target: { value: 'status' } })
-    const value = within(row).getByLabelText('Value')
-    expect(within(value).getByRole('option', { name: 'Reversed' })).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText(/Rule name/), { target: { value: 'Too short' } })
+    typeCondition('big payments')
 
-    fireEvent.change(value, { target: { value: 'Failed' } })
-    expect(jsonPreview()).toEqual({
-      op: 'AND',
-      conditions: [{ field: 'status', operator: 'EQ', value: 'Failed' }],
-    })
-  })
-
-  it('omits the value key entirely for the no-argument operators', async () => {
-    renderRulesPage()
-    await openNewRuleEditor()
-
-    const row = screen.getByRole('group', { name: 'Condition 1' })
-    fireEvent.change(within(row).getByLabelText('Field'), {
-      target: { value: 'card.decline_reason' },
-    })
-    fireEvent.change(within(row).getByLabelText('Operator'), { target: { value: 'NOT_NULL' } })
-
-    expect(within(row).getByText('No value needed')).toBeInTheDocument()
-    expect(screen.getByTestId('rule-json').textContent).toBe(
-      JSON.stringify(
-        { op: 'AND', conditions: [{ field: 'card.decline_reason', operator: 'NOT_NULL' }] },
-        null,
-        2,
-      ),
+    // Inline on the field, and repeated as the footer's first blocker.
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Too short to judge — write at least 20 characters.',
     )
+    expect(screen.getByRole('button', { name: 'Create rule' })).toBeDisabled()
   })
 
-  it('renders two inputs for BETWEEN and emits a two-element array', async () => {
+  /* The old editor stored a JSON DSL. Pasting one in now would be persisted
+     verbatim and fed to the model as if it were prose, so it is rejected with
+     an explanation rather than silently accepted. */
+  it('rejects a pasted JSON rule from the old DSL', async () => {
     renderRulesPage()
     await openNewRuleEditor()
 
-    const row = screen.getByRole('group', { name: 'Condition 1' })
-    fireEvent.change(within(row).getByLabelText('Operator'), { target: { value: 'BETWEEN' } })
-    fireEvent.change(within(row).getByLabelText('Minimum'), { target: { value: '5000' } })
-    fireEvent.change(within(row).getByLabelText('Maximum'), { target: { value: '9999.99' } })
+    fireEvent.change(screen.getByLabelText(/Rule name/), { target: { value: 'Pasted DSL' } })
+    typeCondition(
+      JSON.stringify({
+        op: 'AND',
+        conditions: [{ field: 'amount', operator: 'GT', value: 10000 }],
+      }),
+    )
 
-    expect(jsonPreview()).toEqual({
-      op: 'AND',
-      conditions: [{ field: 'amount', operator: 'BETWEEN', value: [5000, 9999.99] }],
-    })
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Conditions are plain English now, not JSON. Describe when the rule is triggered.',
+    )
+    expect(screen.getByRole('button', { name: 'Create rule' })).toBeDisabled()
   })
 
-  it('removes a nested group again', async () => {
+  it('coaches the author until the condition is judgeable', async () => {
     renderRulesPage()
     await openNewRuleEditor()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Add nested group to Root group' }))
-    expect(await screen.findByRole('group', { name: 'Group 2' })).toBeInTheDocument()
+    const checklist = screen.getByText('A condition the agent can judge').closest('ul')
+    expect(checklist).not.toBeNull()
+    expect(within(checklist as HTMLElement).getAllByText(/not yet/)).toHaveLength(3)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Remove Group 2' }))
-    await waitFor(() => {
-      expect(screen.queryByRole('group', { name: 'Group 2' })).not.toBeInTheDocument()
-    })
-    expect(jsonPreview()).toEqual({
-      op: 'AND',
-      conditions: [{ field: 'amount', operator: 'GT', value: 0 }],
-    })
+    typeCondition(
+      'Triggered when agg.tx_count_24h reaches 8 or more within any rolling 24 hours.',
+    )
+    expect(within(checklist as HTMLElement).queryByText(/not yet/)).not.toBeInTheDocument()
   })
 })
 
-describe('rule tester', () => {
-  it('posts the built logic to /api/rules/test and reports matches', async () => {
+/* -------------------------------------------------------------------------- */
+/* Starter templates                                                           */
+/* -------------------------------------------------------------------------- */
+
+describe('starter templates', () => {
+  it('fills a blank rule from an example', async () => {
     renderRulesPage()
     await openNewRuleEditor()
 
-    mockPost.mockResolvedValue({
-      matchedCount: 2,
-      degraded: true,
-      sampleMatches: [
+    fireEvent.click(screen.getByRole('button', { name: 'Use the Structuring example' }))
+
+    expect(screen.getByLabelText(/Rule name/)).toHaveValue(
+      'Structuring — repeated payments below the reporting threshold',
+    )
+    expect(screen.getByLabelText('Applies to')).toHaveValue('PAYMENT')
+    expect(screen.getByLabelText('Weight value')).toHaveValue(30)
+    expect(conditionBox().value).toContain('8 000 and 9 999.99')
+    expect(screen.getByRole('button', { name: 'Create rule' })).toBeEnabled()
+  })
+
+  it('appends a second example instead of discarding what is written', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+
+    typeCondition(VALID_CONDITION)
+    fireEvent.click(screen.getByRole('button', { name: 'Append the Velocity spike example' }))
+
+    const text = conditionBox().value
+    expect(text.startsWith(VALID_CONDITION)).toBe(true)
+    expect(text).toContain('agg.tx_count_24h')
+  })
+})
+
+/* -------------------------------------------------------------------------- */
+/* Available-data reference                                                    */
+/* -------------------------------------------------------------------------- */
+
+describe('available data reference', () => {
+  it('groups the catalog by category, deriving the group when the API omits it', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+
+    const panel = screen.getByRole('region', { name: 'Available data' })
+    const groups = within(panel)
+      .getAllByRole('button', { expanded: true })
+      .map((button) => button.textContent)
+    expect(groups.join(' ')).toMatch(/Transaction/)
+    expect(groups.join(' ')).toMatch(/Aggregates/)
+
+    // `agg.tx_count_24h` has no `category` on the wire; the `agg.` prefix decides.
+    const aggregates = within(panel).getByRole('button', { name: /Aggregates/ })
+    const list = aggregates.closest('li') as HTMLElement
+    expect(
+      within(list).getByRole('button', { name: 'Insert agg.tx_count_24h into the condition' }),
+    ).toBeInTheDocument()
+  })
+
+  it('inserts a field name into the condition at the caret', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+
+    typeCondition('Triggered when')
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Insert agg.tx_count_24h into the condition' }),
+    )
+    expect(conditionBox().value).toBe('Triggered when agg.tx_count_24h')
+  })
+
+  it('marks fields that do not exist on the rule scope', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+
+    fireEvent.change(screen.getByLabelText('Applies to'), { target: { value: 'CARD' } })
+    const panel = screen.getByRole('region', { name: 'Available data' })
+    const payment = within(panel).getByRole('button', {
+      name: 'Insert payment.receiver_bank_country into the condition',
+    })
+    expect(within(payment).getByText('PAYMENT only')).toBeInTheDocument()
+
+    const card = within(panel).getByRole('button', {
+      name: 'Insert card.card_present into the condition',
+    })
+    expect(within(card).queryByText(/only/)).not.toBeInTheDocument()
+  })
+
+  it('filters the reference by search', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+
+    const panel = screen.getByRole('region', { name: 'Available data' })
+    fireEvent.change(within(panel).getByLabelText('Search available data'), {
+      target: { value: 'beneficiary' },
+    })
+
+    expect(
+      within(panel).getByRole('button', {
+        name: 'Insert payment.receiver_bank_country into the condition',
+      }),
+    ).toBeInTheDocument()
+    expect(
+      within(panel).queryByRole('button', { name: 'Insert amount into the condition' }),
+    ).not.toBeInTheDocument()
+  })
+
+  /* The catalog is reference material now, not a grammar, so losing it must
+     degrade the panel without preventing a rule from being written. */
+  it('still allows saving when the field catalog is unavailable', async () => {
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/rules') return Promise.resolve([]) as Promise<never>
+      if (url === '/rules/field-catalog') {
+        return Promise.reject(new ApiError({ status: 503, title: 'Backend unavailable' }))
+      }
+      return Promise.reject(new Error(`unexpected GET ${url}`)) as Promise<never>
+    })
+    renderRulesPage()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'New rule' }))
+    await screen.findByRole('dialog')
+    expect(await screen.findByText('Field reference unavailable')).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText(/Rule name/), { target: { value: 'Written blind' } })
+    typeCondition(VALID_CONDITION)
+    expect(screen.getByRole('button', { name: 'Create rule' })).toBeEnabled()
+  })
+})
+
+/* -------------------------------------------------------------------------- */
+/* Rule tester                                                                 */
+/* -------------------------------------------------------------------------- */
+
+async function pickCustomer(): Promise<HTMLElement> {
+  const panel = screen.getByRole('region', { name: 'Rule test' })
+  fireEvent.change(within(panel).getByLabelText('Customer to test against'), {
+    target: { value: 'Mila' },
+  })
+  fireEvent.click(await within(panel).findByRole('button', { name: /Mila Novak/ }))
+  return panel
+}
+
+describe('rule tester', () => {
+  it('needs a customer before it will run', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+    typeCondition(VALID_CONDITION)
+
+    const panel = screen.getByRole('region', { name: 'Rule test' })
+    expect(within(panel).getByRole('button', { name: /Run the agent/ })).toBeDisabled()
+
+    await pickCustomer()
+    expect(within(panel).getByRole('button', { name: /Run the agent/ })).toBeEnabled()
+  })
+
+  it('blocks the test while the condition is not judgeable', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+
+    const panel = screen.getByRole('region', { name: 'Rule test' })
+    expect(
+      within(panel).getByText(
+        'Write a valid condition before testing — the agent is given this exact text.',
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it('explains that a model is running, then renders the verdict and evidence', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+    typeCondition(VALID_CONDITION)
+    fireEvent.change(screen.getByLabelText('Weight value'), { target: { value: '30' } })
+    fireEvent.change(screen.getByLabelText(/Rule name/), { target: { value: 'Structuring' } })
+    const panel = await pickCustomer()
+
+    /* Held in an object so TypeScript does not narrow the binding to `null`
+       between the mock's closure and the assertion below. */
+    const pending: { resolve: (value: unknown) => void } = { resolve: () => undefined }
+    mockPost.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          pending.resolve = resolve as (value: unknown) => void
+        }) as Promise<never>,
+    )
+
+    fireEvent.click(within(panel).getByRole('button', { name: /Run the agent/ }))
+
+    expect(await within(panel).findByText('A model is evaluating this rule')).toBeInTheDocument()
+    expect(within(panel).getByText(/live model call/)).toBeInTheDocument()
+
+    await waitFor(() => {
+      expect(mockPost).toHaveBeenCalledWith(
+        '/rules/test',
+        {
+          ruleName: 'Structuring',
+          thresholdLogic: VALID_CONDITION,
+          appliesTo: 'ALL',
+          weight: 30,
+          customerId: CUSTOMER.customerId,
+        },
+        /* Longer than the backend's own 240s judge timeout on purpose: the
+           server's 504 has to arrive before the browser gives up. */
+        { timeout: 300_000 },
+      )
+    })
+
+    pending.resolve({
+      triggered: true,
+      score: 24.5,
+      weight: 30,
+      rationale: 'Four payments of 9 400 in eleven hours, none reaching 10 000.',
+      matchedTransactions: [
         {
           transactionId: '99999999-8888-7777-6666-555555555555',
           activityType: 'PAYMENT',
-          amount: 12500,
+          amount: 9400,
           currency: 'USD',
           status: 'Completed',
           createdAt: '2026-08-01T10:00:00Z',
+          reason: 'Third of four near-threshold payments.',
         },
       ],
-    } as never)
-
-    const panel = screen.getByRole('region', { name: 'Rule test' })
-    fireEvent.click(within(panel).getByRole('button', { name: 'Test rule' }))
-
-    await waitFor(() => {
-      expect(mockPost).toHaveBeenCalledWith('/rules/test', {
-        thresholdLogic: {
-          op: 'AND',
-          conditions: [{ field: 'amount', operator: 'GT', value: 0 }],
-        },
-        appliesTo: 'ALL',
-        customerId: null,
-      })
+      evaluatedTransactionCount: 42,
+      model: 'gpt-oss-120b',
+      durationMs: 18_400,
     })
 
-    expect(await within(panel).findByText('2')).toBeInTheDocument()
-    expect(within(panel).getByText('Degraded evaluation')).toBeInTheDocument()
+    expect(await within(panel).findByText('Triggered')).toBeInTheDocument()
+    expect(within(panel).getByText('24.50')).toBeInTheDocument()
+    expect(within(panel).getByText(/1 transaction cited of 42 in scope/)).toBeInTheDocument()
+    expect(
+      within(panel).getByText('Four payments of 9 400 in eleven hours, none reaching 10 000.'),
+    ).toBeInTheDocument()
+    expect(within(panel).getByText('99999999')).toBeInTheDocument()
+    expect(
+      within(panel).getByText('Third of four near-threshold payments.'),
+    ).toBeInTheDocument()
+
+    /* The verdict is a judgement, not a calculation. Saying so is the whole
+       honesty requirement of dropping the deterministic engine. */
+    expect(within(panel).getByText(/Running it again .* can produce a different/)).toBeInTheDocument()
+  })
+
+  it('warns when the agent estimated more than the rule’s weight', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+    typeCondition(VALID_CONDITION)
+    fireEvent.change(screen.getByLabelText('Weight value'), { target: { value: '10' } })
+    const panel = await pickCustomer()
+
+    mockPost.mockResolvedValue({
+      triggered: true,
+      score: 40,
+      weight: 10,
+      matchedCount: 6,
+      matchedTransactions: [{ transactionId: '99999999-8888-7777-6666-555555555555' }],
+    } as never)
+
+    fireEvent.click(within(panel).getByRole('button', { name: /Run the agent/ }))
+
+    expect(
+      await within(panel).findByText(/The agent estimated more than the rule’s weight/),
+    ).toBeInTheDocument()
+    /* The backend caps the evidence it returns, so a count of six over one row
+       is not a contradiction — but it has to be named, not silently shown. */
+    expect(
+      within(panel).getByText('Showing 1 of the 6 transactions the agent cited.'),
+    ).toBeInTheDocument()
     expect(within(panel).getByText('99999999')).toBeInTheDocument()
   })
 
-  /* `notes` is where the evaluator explains WHY it degraded. The tester used
-     to read a `message` key the API never sends, so the badge appeared with no
-     explanation and the admin had nothing to act on. */
-  it('shows the backend degradation notes next to the degraded badge', async () => {
+  it('reports a model timeout honestly instead of as an empty result', async () => {
     renderRulesPage()
     await openNewRuleEditor()
+    typeCondition(VALID_CONDITION)
+    const panel = await pickCustomer()
 
-    mockPost.mockResolvedValue({
-      matchedCount: 0,
-      evaluatedCount: 233,
-      customerCount: 12,
-      degraded: true,
-      notes: [
-        "'card.decline_reason' has no value on at least one transaction",
-        "unknown field 'card.mystery'",
-      ],
-      sampleMatches: [],
-    } as never)
+    mockPost.mockRejectedValue(
+      new ApiError({
+        status: 0,
+        title: 'Request timed out',
+        detail: 'The backend did not respond in time. Please retry.',
+      }),
+    )
 
-    const panel = screen.getByRole('region', { name: 'Rule test' })
-    fireEvent.click(within(panel).getByRole('button', { name: 'Test rule' }))
+    fireEvent.click(within(panel).getByRole('button', { name: /Run the agent/ }))
 
     expect(
-      await within(panel).findByText(
-        "'card.decline_reason' has no value on at least one transaction",
-      ),
+      await within(panel).findByText('The model did not answer in time'),
     ).toBeInTheDocument()
-    expect(within(panel).getByText("unknown field 'card.mystery'")).toBeInTheDocument()
-  })
-})
-
-describe('field catalog contract', () => {
-  it('keeps the operator that is still valid after a field change', async () => {
-    renderRulesPage()
-    await openNewRuleEditor()
-
-    const row = screen.getByRole('group', { name: 'Condition 1' })
-    fireEvent.change(within(row).getByLabelText('Operator'), { target: { value: 'GT' } })
-    fireEvent.change(within(row).getByLabelText('Value'), { target: { value: '10000' } })
-
-    // Both fields are NUMBER, so `GT 10000` must survive the swap intact —
-    // silently rewriting it to `EQ "10000"` persists a rule that never fires.
-    fireEvent.change(within(row).getByLabelText('Field'), {
-      target: { value: 'agg.tx_count_24h' },
-    })
-
-    expect(within(row).getByLabelText('Operator')).toHaveValue('GT')
-    expect(jsonPreview()).toEqual({
-      op: 'AND',
-      conditions: [{ field: 'agg.tx_count_24h', operator: 'GT', value: 10000 }],
-    })
-  })
-
-  it('offers only the operators the catalog declares for the field', async () => {
-    renderRulesPage()
-    await openNewRuleEditor()
-
-    const row = screen.getByRole('group', { name: 'Condition 1' })
-    fireEvent.change(within(row).getByLabelText('Field'), { target: { value: 'status' } })
-
-    const operator = within(row).getByLabelText('Operator')
-    const offered = within(operator)
-      .getAllByRole('option')
-      .map((option) => (option as HTMLOptionElement).value)
-    // ENUM_OPERATORS from the catalog entry — CONTAINS and MATCHES are not in it.
-    expect(offered).toEqual(['EQ', 'NEQ', 'IN', 'NOT_IN', 'IS_NULL', 'NOT_NULL'])
-  })
-
-  it('keeps an open option set typeable instead of forcing a dropdown', async () => {
-    renderRulesPage()
-    await openNewRuleEditor()
-
-    fireEvent.change(screen.getByLabelText(/Rule name/), {
-      target: { value: 'Privacy chain exposure' },
-    })
-    const row = screen.getByRole('group', { name: 'Condition 1' })
-    fireEvent.change(within(row).getByLabelText('Field'), {
-      target: { value: 'crypto.blockchain' },
-    })
-
-    // `optionsClosed: false` — the backend accepts anything, so a chain that
-    // is not in the suggestion list must still be authorable.
-    const value = within(row).getByLabelText('Value')
-    expect(value.tagName).toBe('INPUT')
-    fireEvent.change(value, { target: { value: 'AVAX' } })
-
-    expect(jsonPreview()).toEqual({
-      op: 'AND',
-      conditions: [{ field: 'crypto.blockchain', operator: 'EQ', value: 'AVAX' }],
-    })
-    expect(screen.getByRole('button', { name: 'Create rule' })).toBeEnabled()
+    expect(within(panel).getByText(/nothing was saved/)).toBeInTheDocument()
+    expect(within(panel).getByRole('button', { name: 'Try again' })).toBeInTheDocument()
   })
 })

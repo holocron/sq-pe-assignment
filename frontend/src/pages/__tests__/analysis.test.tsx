@@ -4,16 +4,17 @@ import type { ReactElement } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import type {
   AnalysisResult,
+  CoverageFailedTraceStep,
   RuleEvaluation,
   Transaction,
   TraceStep,
   UUID,
 } from '../../api/types'
-import { normalizeRuleEvaluation } from '../../api/analyses'
+import { normalizeRuleEvaluation, normalizeTraceStep } from '../../api/analyses'
 import { AnalysisResultView } from '../analysis/AnalysisResultView'
 import { TraceViewer } from '../analysis/TraceViewer'
 import { coverageStats } from '../analysis/coverage'
-import { mergeTraceSteps } from '../analysis/trace'
+import { coverageFailedExplanation, mergeTraceSteps, traceStepMeta } from '../analysis/trace'
 
 const TX_ONE: UUID = '11111111-aaaa-4000-8000-000000000001'
 const TX_TWO: UUID = '22222222-bbbb-4000-8000-000000000002'
@@ -79,10 +80,8 @@ const EVALUATIONS: RuleEvaluation[] = [
     matchedCount: 2,
     evaluatedTransactionCount: 14,
     rationale: 'Eleven payments between 9,500 and 9,999 USD across nine days.',
-    explanation:
-      "Rule 'Structuring pattern under reporting threshold' triggered on 2 of 14 PAYMENT transaction(s).",
     matchedTransactionIds: [TX_ONE, TX_TWO],
-    source: 'AGENT',
+    source: 'AGENT_JUDGED',
   },
   {
     ruleId: RULE_IDS.sanctioned,
@@ -95,10 +94,7 @@ const EVALUATIONS: RuleEvaluation[] = [
     evaluatedTransactionCount: 14,
     rationale: 'One SWIFT wire of 48,000 USD to a bank in a listed jurisdiction.',
     matchedTransactionIds: [TX_TWO],
-    source: 'DETERMINISTIC_FALLBACK',
-    disagreement: true,
-    degraded: true,
-    degradationNotes: ["'payment.receiver_bank_country' has no value on at least one transaction"],
+    source: 'AGENT_JUDGED',
   },
   {
     ruleId: RULE_IDS.cryptoMixer,
@@ -110,7 +106,7 @@ const EVALUATIONS: RuleEvaluation[] = [
     matchedCount: 0,
     rationale: 'No crypto activity in the review window.',
     matchedTransactionIds: [],
-    source: 'AGENT',
+    source: 'AGENT_JUDGED',
   },
   {
     ruleId: RULE_IDS.declineBurst,
@@ -122,7 +118,7 @@ const EVALUATIONS: RuleEvaluation[] = [
     matchedCount: 0,
     rationale: 'Only two declines, below the threshold of five.',
     matchedTransactionIds: [],
-    source: 'AGENT',
+    source: 'AGENT_JUDGED',
   },
   {
     ruleId: RULE_IDS.highValueCard,
@@ -134,7 +130,7 @@ const EVALUATIONS: RuleEvaluation[] = [
     matchedCount: 0,
     rationale: 'Highest card-not-present amount was 1,240 USD.',
     matchedTransactionIds: [],
-    source: 'AGENT',
+    source: 'AGENT_JUDGED',
   },
   {
     ruleId: RULE_IDS.dormantSpike,
@@ -146,7 +142,7 @@ const EVALUATIONS: RuleEvaluation[] = [
     matchedCount: 0,
     rationale: 'Account has been continuously active for 90 days.',
     matchedTransactionIds: [],
-    source: 'AGENT',
+    source: 'AGENT_JUDGED',
   },
 ]
 
@@ -189,7 +185,7 @@ const COMPLETED: AnalysisResult = {
   totalScore: 62.5,
   rulesTotal: 6,
   rulesEvaluated: 6,
-  coverageComplete: false,
+  coverageComplete: true,
   model: 'gpt-oss-120b',
   steps: 5,
   durationMs: 42_000,
@@ -239,18 +235,31 @@ describe('AnalysisResultView — completed analysis', () => {
     expect(within(table).getAllByText('Not triggered')).toHaveLength(4)
   })
 
-  it('shows a complete coverage indicator and the verdict source of every rule', () => {
+  it('shows a complete coverage indicator and names the agent as the source of every verdict', () => {
     renderWithQueryClient(<AnalysisResultView analysis={COMPLETED} />)
 
-    expect(screen.getAllByText('6 / 6 rules evaluated').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('6 / 6 rules judged').length).toBeGreaterThan(0)
     expect(screen.getByText('Complete')).toBeInTheDocument()
     expect(screen.getByText('2 triggered')).toBeInTheDocument()
-    expect(screen.getByText('5 by agent')).toBeInTheDocument()
-    expect(screen.getByText('1 deterministic')).toBeInTheDocument()
+    expect(screen.getByText('0 unjudged')).toBeInTheDocument()
+    expect(
+      screen.getByText('The coverage gate confirmed the agent judged the full rule set.'),
+    ).toBeInTheDocument()
 
+    /* Every verdict is a model judgement now, and the table has to say so on
+       every row - a reviewer must not read an estimate as a calculation. */
     const table = screen.getByRole('table', { name: /Rule coverage/ })
-    expect(within(table).getAllByText('Agent')).toHaveLength(5)
-    expect(within(table).getByText('Deterministic fallback')).toBeInTheDocument()
+    expect(within(table).getAllByText('Agent judged')).toHaveLength(6)
+    expect(within(table).queryByText(/[Dd]eterministic/)).not.toBeInTheDocument()
+  })
+
+  /* Reproducibility was the price of this design; the screen must not hide it. */
+  it('states that the scores are judgements rather than a calculation', () => {
+    renderWithQueryClient(<AnalysisResultView analysis={COMPLETED} />)
+
+    expect(
+      screen.getByText(/not a recomputation .* can reach different scores/),
+    ).toBeInTheDocument()
   })
 
   /* `score` on the wire, not `scoreContribution`: reading the wrong key
@@ -279,13 +288,49 @@ describe('AnalysisResultView — completed analysis', () => {
     expect(sanctioned).toBeLessThan(structuring)
   })
 
-  it('flags a disagreement between the agent and the deterministic engine', () => {
-    renderWithQueryClient(<AnalysisResultView analysis={COMPLETED} />)
+  /* The agent estimates the score, so it can ask for more than the rule allows.
+     The cap is applied server-side and the row has to admit it happened. */
+  it('flags a rule whose score the agent overstated and the backend capped', () => {
+    const capped: AnalysisResult = {
+      ...COMPLETED,
+      ruleEvaluations: COMPLETED.ruleEvaluations.map((evaluation) =>
+        evaluation.ruleId === RULE_IDS.sanctioned
+          ? { ...evaluation, score: 40, claimedScore: 95, scoreClamped: true }
+          : evaluation,
+      ),
+    }
 
-    expect(screen.getByText('Disagreement')).toBeInTheDocument()
+    renderWithQueryClient(<AnalysisResultView analysis={capped} />)
+
+    expect(screen.getByText('1 capped at weight')).toBeInTheDocument()
+    expect(screen.getByText('Capped at weight')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /High-value wire to sanctioned/ }))
+    expect(screen.getByText(/asked for 95\.00 here and was capped/)).toBeInTheDocument()
+  })
+
+  /* The whole point of dropping the engine: a gap in coverage is no longer a
+     footnote on a finished review, it is the reason the run is FAILED. */
+  it('reports an incomplete run as a failed review rather than a complete one', () => {
+    const incomplete: AnalysisResult = {
+      ...COMPLETED,
+      status: 'FAILED',
+      coverageComplete: false,
+      rulesEvaluated: 4,
+      ruleEvaluations: COMPLETED.ruleEvaluations.slice(0, 4),
+      error: "Coverage incomplete: 2 rule(s) never judged - 'Card-not-present above 5,000'",
+    }
+
+    renderWithQueryClient(<AnalysisResultView analysis={incomplete} />)
+
+    expect(screen.getAllByText('4 / 6 rules judged').length).toBeGreaterThan(0)
+    expect(screen.getByText('Incomplete')).toBeInTheDocument()
+    expect(screen.getByText('2 unjudged')).toBeInTheDocument()
+    expect(screen.getByText('Incomplete review')).toBeInTheDocument()
+    expect(screen.getByText(/recorded as FAILED and the verdicts below are partial/)).toBeInTheDocument()
     expect(
-      screen.getByText(/disagreed on 1 rule\. The deterministic verdict was used for scoring/),
-    ).toBeInTheDocument()
+      screen.queryByText('The coverage gate confirmed the agent judged the full rule set.'),
+    ).not.toBeInTheDocument()
   })
 
   it('expands a triggered rule to reveal the transactions that matched it', async () => {
@@ -301,25 +346,41 @@ describe('AnalysisResultView — completed analysis', () => {
       screen.getAllByText('Eleven payments between 9,500 and 9,999 USD across nine days.'),
     ).toHaveLength(2)
 
-    const matched = screen.getByRole('table', { name: /matched this rule/ })
+    const matched = screen.getByRole('table', { name: /cited as evidence/ })
     expect(await within(matched).findByText('11111111')).toBeInTheDocument()
     expect(await within(matched).findByText('22222222')).toBeInTheDocument()
 
-    // The deterministic engine's own account of the verdict.
-    expect(screen.getByText(/triggered on 2 of 14 PAYMENT transaction/)).toBeInTheDocument()
+    // The only account of the verdict there is: the agent said so, through the tool.
+    expect(screen.getByText(/submitted this verdict through/)).toBeInTheDocument()
+    expect(screen.getByText('submit_rule_evaluation')).toBeInTheDocument()
   })
 
-  it('surfaces the degradation notes of a degraded rule when it is expanded', () => {
-    renderWithQueryClient(<AnalysisResultView analysis={COMPLETED} />)
+  /* The condition is a prompt now, so the reviewer must be able to read exactly
+     the sentence the agent was judging - not a rendering of a parsed structure. */
+  it('shows the rule condition verbatim when the rule set is joined in', () => {
+    const condition =
+      'Three or more payments, each between 8,000 and 9,999.99, inside any rolling 24-hour '
+      + 'window, together totalling at least 20,000.'
+    renderWithQueryClient(
+      <AnalysisResultView
+        analysis={COMPLETED}
+        rules={[
+          {
+            ruleId: RULE_IDS.structuring,
+            ruleName: 'Structuring pattern under reporting threshold',
+            appliesTo: 'PAYMENT',
+            weight: 30,
+            thresholdLogic: condition,
+          },
+        ]}
+      />,
+    )
 
-    fireEvent.click(screen.getByRole('button', { name: /High-value wire to sanctioned/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Structuring pattern/ }))
 
-    expect(screen.getByText('Degraded conditions')).toBeInTheDocument()
-    expect(
-      screen.getByText(
-        "'payment.receiver_bank_country' has no value on at least one transaction",
-      ),
-    ).toBeInTheDocument()
+    expect(screen.getByText('Rule condition')).toBeInTheDocument()
+    expect(screen.getByText(condition)).toBeInTheDocument()
+    expect(screen.getByText('This is the text the agent was shown, word for word.')).toBeInTheDocument()
   })
 
   /* A run that stopped before recording its evidence must not blank the page:
@@ -334,7 +395,7 @@ describe('AnalysisResultView — completed analysis', () => {
     renderWithQueryClient(<AnalysisResultView analysis={partial} />)
 
     fireEvent.click(screen.getByRole('button', { name: /Structuring pattern/ }))
-    expect(screen.getByText('No transaction matched this rule.')).toBeInTheDocument()
+    expect(screen.getByText('The agent cited no transaction for this rule.')).toBeInTheDocument()
   })
 
   it('reports an incomplete coverage set while the run is still going', () => {
@@ -348,15 +409,16 @@ describe('AnalysisResultView — completed analysis', () => {
           completedAt: null,
           durationMs: null,
           rulesEvaluated: 4,
+          coverageComplete: false,
           ruleEvaluations: EVALUATIONS.slice(0, 4),
         }}
         live={{ connected: true, error: null, elapsedMs: 65_000, pollIntervalMs: 3000 }}
       />,
     )
 
-    expect(screen.getAllByText('4 / 6 rules evaluated').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('4 / 6 rules judged').length).toBeGreaterThan(0)
     expect(screen.getByText('In progress')).toBeInTheDocument()
-    expect(screen.getByText(/2 rule\(s\) still to evaluate/)).toBeInTheDocument()
+    expect(screen.getByText(/2 rule\(s\) still to judge/)).toBeInTheDocument()
     expect(screen.getByText('Analysis running')).toBeInTheDocument()
     // Elapsed time is shown both in the live panel and as the run duration.
     expect(screen.getAllByText('1m 05s')).toHaveLength(2)
@@ -413,7 +475,7 @@ describe('TraceViewer', () => {
 
     expect(
       screen.getByText(
-        /The agent tried to conclude while 2 rules were still unevaluated .* sent back to evaluate them/,
+        /The agent tried to conclude while 2 rules were still unjudged .* sent back to judge them/,
       ),
     ).toBeInTheDocument()
     expect(screen.getByText('High-value wire to sanctioned jurisdiction')).toBeInTheDocument()
@@ -461,18 +523,58 @@ describe('trace and coverage helpers', () => {
     expect(merged[1]).toEqual(persisted[1])
   })
 
-  it('counts coverage, sources and disagreements', () => {
+  it('counts coverage and the verdicts behind it', () => {
     const stats = coverageStats(COMPLETED)
 
     expect(stats.total).toBe(6)
     expect(stats.evaluated).toBe(6)
+    expect(stats.unjudged).toBe(0)
     expect(stats.complete).toBe(true)
-    expect(stats.agentComplete).toBe(false)
     expect(stats.triggered).toBe(2)
-    expect(stats.agentCount).toBe(5)
-    expect(stats.fallbackCount).toBe(1)
-    expect(stats.disagreements).toBe(1)
+    expect(stats.cappedCount).toBe(0)
     expect(stats.percent).toBe(100)
     expect(stats.scoreFromRules).toBe(62.5)
+  })
+
+  /* `coverage_complete` is the column that gates COMPLETED, so it outranks the
+     row count: a run the backend called incomplete must never render complete. */
+  it('trusts the backend coverage flag over the counters', () => {
+    const stats = coverageStats({
+      rulesTotal: 6,
+      rulesEvaluated: 6,
+      coverageComplete: false,
+      ruleEvaluations: EVALUATIONS,
+    })
+
+    expect(stats.complete).toBe(false)
+  })
+
+  it('names the unjudged rules as the reason a run failed, not as a backfill', () => {
+    const step = normalizeTraceStep({
+      n: 9,
+      type: 'coverage_failed',
+      missing: [RULE_IDS.highValueCard],
+      text: 'Coverage failure: 1 of 6 applicable rule(s) never received a verdict',
+      detail: {
+        rules_total: 6,
+        rules_unjudged: 1,
+        unjudged_rule_names: ['Card-not-present above 5,000'],
+      },
+    })
+
+    expect(step).toEqual({
+      type: 'coverage_failed',
+      n: 9,
+      ms: null,
+      missing: [RULE_IDS.highValueCard],
+      unjudgedRuleNames: ['Card-not-present above 5,000'],
+      rulesTotal: 6,
+      text: 'Coverage failure: 1 of 6 applicable rule(s) never received a verdict',
+    })
+    expect(traceStepMeta(step).label).toBe('Coverage not met')
+    expect(traceStepMeta(step).tone).toBe('danger')
+    expect(coverageFailedExplanation(step as CoverageFailedTraceStep)).toContain(
+      'nothing behind the agent to fill that in',
+    )
   })
 })

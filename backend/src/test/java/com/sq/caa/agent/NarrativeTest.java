@@ -56,7 +56,7 @@ class NarrativeTest {
     }
 
     @Test
-    @DisplayName("text that says nothing is reported as absent so the deterministic wording is used")
+    @DisplayName("text that says nothing is reported as absent so the generated wording is used")
     void contentFreeTextBecomesNull() {
         for (String nothing : List.of("   ", "\n\n\n", NBSP + NARROW_NBSP + FIGURE_SPACE,
                 "( )", "...", "-- --", "\"\"", "[]")) {
@@ -137,7 +137,8 @@ class NarrativeTest {
     @Test
     @DisplayName("the per-rule rationale is rendered in the coverage table, so it is cleaned too")
     void ruleVerdictRationaleIsCleaned() {
-        AgentRuleVerdict verdict = new AgentRuleVerdict(UUID.randomUUID(), true, null, List.of(),
+        AgentRuleVerdict verdict = new AgentRuleVerdict(UUID.randomUUID(), true,
+                new java.math.BigDecimal("30.00"), null, List.of(),
                 "Matched" + NBSP.repeat(5) + "five payments.", Instant.EPOCH);
 
         assertThat(verdict.rationale()).isEqualTo("Matched five payments.");

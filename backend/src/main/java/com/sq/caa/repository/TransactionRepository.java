@@ -99,7 +99,7 @@ public interface TransactionRepository
             @Param("to") Instant to,
             Pageable pageable);
 
-    /** Every transaction of a customer with its detail row - the input of the rule engine. */
+    /** Every transaction of a customer with its detail row - the evidence the agent reads. */
     @Query("""
             select distinct t
             from Transaction t
@@ -218,7 +218,7 @@ public interface TransactionRepository
     BigDecimal sumAmountForCustomer(@Param("customerId") UUID customerId);
 
     // ---------------------------------------------------------------------
-    // Window aggregates backing the agg.* fields of the rule DSL.
+    // Window aggregates behind the agg.* fields of the field catalog.
     // Windows are half-open: (from, to].
     // ---------------------------------------------------------------------
 

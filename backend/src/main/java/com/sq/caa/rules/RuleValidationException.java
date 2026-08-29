@@ -1,40 +1,30 @@
 package com.sq.caa.rules;
 
 /**
- * Thrown when a {@code threshold_logic} document is malformed or references something the catalog
- * does not know.
+ * Thrown when a rule cannot be saved as written.
  *
- * <p>It always names the offending node: {@link #path()} is a JSONPath-style pointer into the
- * document and {@link #node()} is the compact JSON of that node, both of which are surfaced in the
- * {@code application/problem+json} body of a rejected write.
+ * <p>Conditions are prose, so there is no node to point at any more: the exception names the
+ * offending <em>field</em> of the request ({@code thresholdLogic}, {@code ruleName}, {@code weight})
+ * and says in one sentence what is wrong with it. Both are surfaced in the
+ * {@code application/problem+json} body of a rejected write so the editor can highlight the input
+ * that needs fixing.
  */
 public class RuleValidationException extends RuntimeException {
 
-    private final String path;
-    private final String node;
+    private final String field;
 
-    public RuleValidationException(String path, String node, String message) {
+    public RuleValidationException(String field, String message) {
         super(message);
-        this.path = path == null || path.isBlank() ? "$" : path;
-        this.node = node;
+        this.field = field == null || field.isBlank() ? "thresholdLogic" : field.trim();
     }
 
-    public RuleValidationException(String path, String message) {
-        this(path, null, message);
+    /** Request field the problem belongs to, e.g. {@code thresholdLogic}. */
+    public String field() {
+        return field;
     }
 
-    /** JSONPath-style pointer to the bad node, e.g. {@code $.conditions[1].conditions[0]}. */
-    public String path() {
-        return path;
-    }
-
-    /** Compact JSON of the bad node, or {@code null} when the document could not be read at all. */
-    public String node() {
-        return node;
-    }
-
-    /** Message prefixed with the node pointer, for logs and for the problem detail. */
+    /** Message prefixed with the field name, for logs and for the problem detail. */
     public String describe() {
-        return "Invalid rule logic at " + path + ": " + getMessage();
+        return "Invalid rule: " + field + " " + getMessage();
     }
 }

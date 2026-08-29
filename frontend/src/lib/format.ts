@@ -204,7 +204,7 @@ export function initials(name: string | null | undefined): string {
   return (first + last).toUpperCase() || '?'
 }
 
-/** Turns `DETERMINISTIC_FALLBACK` / `tool_call` into `Deterministic fallback`. */
+/** Turns `AGENT_JUDGED` / `tool_call` into `Agent judged` / `Tool call`. */
 export function humanizeToken(value: string | null | undefined): string {
   if (!value) return EM_DASH
   const spaced = value.replace(/[_-]+/g, ' ').trim().toLowerCase()

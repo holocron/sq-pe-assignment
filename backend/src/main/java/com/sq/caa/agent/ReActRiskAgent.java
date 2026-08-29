@@ -4,7 +4,6 @@ import com.sq.caa.domain.Customer;
 import com.sq.caa.domain.RiskRule;
 import com.sq.caa.rag.RagService;
 import com.sq.caa.rules.EvaluationBatch;
-import com.sq.caa.rules.RuleEvaluator;
 import com.sq.caa.service.ActivitySummaryService;
 import com.sq.caa.service.CustomerService;
 import com.sq.caa.service.RiskRuleService;
@@ -18,12 +17,12 @@ import tools.jackson.databind.json.JsonMapper;
  * Entry point of the ReAct risk-assessment agent: loads everything one run needs, wires the tools to
  * it and hands the conversation to {@link RiskAgentLoop}.
  *
- * <p>The customer's activity is loaded exactly once, into a single
- * {@link EvaluationBatch}. Every transaction the tools read and every deterministic rule evaluation
- * of the run is served from that one snapshot - the tool surface is handed no repository and no
- * transaction service, so it has nothing else to read from - and the evidence the agent reasons
- * about and the evidence the engine scores can never be two different things, which is what makes
- * the post-loop cross-check meaningful rather than a race.
+ * <p>The customer's activity is loaded exactly once, into a single {@link EvaluationBatch}. Every
+ * transaction the tools read and every rule scope the run resolves is served from that one snapshot
+ * - the tool surface is handed no repository and no transaction service, so it has nothing else to
+ * read from. The agent therefore judges one fixed body of evidence: the transaction it quotes in a
+ * rationale and the transaction whose id is written to {@code risk_assessments} are by construction
+ * the same row, even if the database moves underneath the run.
  */
 @Component
 public class ReActRiskAgent {
@@ -31,7 +30,6 @@ public class ReActRiskAgent {
     private final RiskAgentLoop loop;
     private final CustomerService customerService;
     private final RiskRuleService riskRuleService;
-    private final RuleEvaluator ruleEvaluator;
     private final ActivitySummaryService activitySummaryService;
     private final ObjectProvider<RagService> ragServiceProvider;
     private final JsonMapper jsonMapper;
@@ -40,7 +38,6 @@ public class ReActRiskAgent {
     public ReActRiskAgent(RiskAgentLoop loop,
             CustomerService customerService,
             RiskRuleService riskRuleService,
-            RuleEvaluator ruleEvaluator,
             ActivitySummaryService activitySummaryService,
             ObjectProvider<RagService> ragServiceProvider,
             JsonMapper jsonMapper,
@@ -48,7 +45,6 @@ public class ReActRiskAgent {
         this.loop = loop;
         this.customerService = customerService;
         this.riskRuleService = riskRuleService;
-        this.ruleEvaluator = ruleEvaluator;
         this.activitySummaryService = activitySummaryService;
         this.ragServiceProvider = ragServiceProvider;
         this.jsonMapper = jsonMapper;
@@ -68,6 +64,10 @@ public class ReActRiskAgent {
     /**
      * Runs one full analysis, reporting turn and coverage counters to {@code progress} as it goes so
      * a RUNNING analysis is not a black box for the minutes it takes.
+     *
+     * @throws AgentRunFailedException when the run cannot be reported as complete - the conversation
+     *                                 broke, or it ended with applicable rules unjudged. The
+     *                                 exception carries the verdicts that were obtained.
      */
     public AgentRunResult run(UUID assessmentId, UUID customerId, AnalysisTrace trace,
             AnalysisProgressListener progress) {
@@ -77,26 +77,11 @@ public class ReActRiskAgent {
         return loop.execute(context, tools);
     }
 
-    /**
-     * Evaluates the whole coverage set with the rule engine alone, with no model in the loop.
-     *
-     * <p>Used when an agent run failed: the narrative is lost, but every applicable rule is still
-     * evaluated and scored, so rule coverage stays complete even on a failed run. Every verdict it
-     * produces is marked {@link RuleVerdictSource#DETERMINISTIC_FALLBACK}.
-     */
-    public AgentRunResult deterministicOnly(UUID assessmentId, UUID customerId, AnalysisTrace trace) {
-        long startedAt = System.currentTimeMillis();
-        AgentRunContext context = context(assessmentId, customerId, trace,
-                AnalysisProgressListener.NONE);
-        return loop.settle(context, 0, System.currentTimeMillis() - startedAt);
-    }
-
     private AgentRunContext context(UUID assessmentId, UUID customerId, AnalysisTrace trace,
             AnalysisProgressListener progress) {
         Customer customer = customerService.requireCustomer(customerId);
         EvaluationBatch batch = riskRuleService.batchFor(customer);
         List<RiskRule> rules = riskRuleService.coverageSetFor(customerId);
-        return new AgentRunContext(assessmentId, customer, batch, rules,
-                rule -> ruleEvaluator.evaluate(rule, batch), trace, progress);
+        return new AgentRunContext(assessmentId, customer, batch, rules, trace, progress);
     }
 }

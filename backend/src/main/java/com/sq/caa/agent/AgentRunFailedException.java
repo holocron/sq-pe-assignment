@@ -1,16 +1,22 @@
 package com.sq.caa.agent;
 
 /**
- * Raised when the ReAct conversation could not be finished, carrying the run settled from whatever
- * the agent had already established.
+ * Raised when a run cannot be reported as a finished analysis, carrying everything the agent did
+ * establish before it stopped.
  *
- * <p>An agent run is a long chain of work: by the time the model server refuses a request or the
- * network drops, the agent has usually already submitted verdicts for most of the coverage set.
- * Discarding those and re-deriving everything from the rule engine would throw away real analysis
- * and mislabel it as a deterministic fallback. So {@link RiskAgentLoop#execute} settles the run it
- * has - agent verdicts kept, the remaining rules backfilled by the engine, coverage still 100% - and
- * hands the settled result over inside this exception. The caller persists {@link #result()} and
- * marks the run {@code FAILED} with this cause.
+ * <p>Two situations reach here, and they are deliberately the same situation from the caller's point
+ * of view - the run is persisted {@code FAILED} with {@link #result()} and this cause:
+ *
+ * <ul>
+ *   <li>the conversation itself broke - the model server refused a request, the connection dropped;
+ *   <li>the conversation ended with applicable rules still unjudged
+ *       ({@link IncompleteRuleCoverageException}).
+ * </ul>
+ *
+ * <p>In both cases the verdicts the agent already submitted are kept rather than discarded: an
+ * analysis that judged nine of twelve rules is not worthless, it is simply not complete, and the
+ * three it missed are named in the error and in the trace. What must never happen is the third
+ * option - reporting such a run as {@code COMPLETED}.
  */
 public class AgentRunFailedException extends RuntimeException {
 
@@ -21,7 +27,7 @@ public class AgentRunFailedException extends RuntimeException {
         this.result = result;
     }
 
-    /** The run as far as it got, with the coverage set closed. Never {@code null}. */
+    /** The run as far as it got, with every verdict the agent submitted. Never {@code null}. */
     public AgentRunResult result() {
         return result;
     }

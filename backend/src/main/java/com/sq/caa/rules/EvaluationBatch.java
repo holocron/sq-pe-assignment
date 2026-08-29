@@ -13,12 +13,13 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * One customer's transactions with every DSL field already resolved.
+ * One customer's transactions with every catalog field already resolved.
  *
- * <p>This is the unit of work that keeps rule evaluation cheap: the customer's activity is read from
+ * <p>This is the frozen snapshot one analysis reasons about: the customer's activity is read from
  * the database once, the {@code agg.*} windows are swept once, and the per-transaction facts are
- * built once. Evaluating another rule against the same batch costs no I/O at all, which is what
- * stops the agent's per-rule tool calls from turning into O(rules x transactions) queries.
+ * built once. Judging another rule against the same batch costs no I/O at all, which is what stops
+ * the agent's per-rule tool calls from turning into O(rules x transactions) queries - and, more
+ * importantly, means every rule of a run is judged against exactly the same evidence.
  *
  * <p>Instances are immutable and safe to share between threads.
  */
@@ -108,8 +109,9 @@ public final class EvaluationBatch {
     }
 
     /**
-     * Ids of the transactions in scope. The agent uses this to write one {@code risk_assessments}
-     * row per (transaction, rule) pair, including the rows that did not trigger.
+     * Ids of the transactions in scope. One {@code risk_assessments} row is written per (transaction,
+     * rule) pair, including the rows the rule did not trigger on, so "no rule was skipped" is
+     * provable from the table alone.
      */
     public List<UUID> transactionIdsFor(RuleScope scope) {
         return transactionsFor(scope).stream().map(Transaction::getTransactionId).toList();
@@ -121,9 +123,9 @@ public final class EvaluationBatch {
      *
      * <p>This is what lets a caller quote the type-specific detail of a transaction - a merchant, a
      * wallet address, a status - without going back to the database. The record it returns is the
-     * one every rule of the run was evaluated against, so a row that has since changed cannot make
-     * the narrative and the score disagree. The agent's {@code get_transaction_details} reads
-     * through here for exactly that reason.
+     * one every rule of the run was judged against, so a row that has since changed cannot make the
+     * narrative and the score disagree. The agent's {@code get_transaction_details} reads through
+     * here for exactly that reason.
      */
     public Transaction transactionFor(UUID transactionId) {
         return transactionId == null ? null : byId.get(transactionId);

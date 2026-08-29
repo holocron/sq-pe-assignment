@@ -11,9 +11,10 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  *                             {@code ChatModel.call}, so this bounds both latency and spend even if
  *                             the model never converges.
  * @param maxCoverageReprompts how often the loop may refuse to let the model conclude while rules
- *                             remain unevaluated. Once exhausted the loop stops and the
- *                             deterministic backfill completes the coverage set, so this is a
- *                             latency bound, never a correctness one.
+ *                             remain unjudged. Once exhausted the loop stops; if rules are still
+ *                             unjudged at that point the run is recorded as FAILED rather than
+ *                             completed, so this bounds how long a stubborn model may argue, never
+ *                             what may be reported as a finished analysis.
  * @param maxTokens            completion budget per turn. The chat model emits reasoning content,
  *                             so anything below ~2048 comes back with an empty message.
  * @param temperature          sampling temperature; low, because this is an audit task.
@@ -31,6 +32,14 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * @param queueCapacity        how many analyses may wait; beyond that a request is rejected with
  *                             503 rather than queued forever.
  * @param streamTimeout        how long an idle SSE subscription is held open.
+ * @param requestTimeout       how long one {@code ChatModel.call} may take before the HTTP client
+ *                             abandons it. This has to be set on the options object we build:
+ *                             {@code OpenAiChatOptions.builder()} bakes in a 60-second timeout and
+ *                             three retries, and those win over {@code spring.ai.openai.timeout}
+ *                             for any call that supplies its own options - which every call here
+ *                             does, because tool callbacks have to be attached. Left at the builder
+ *                             default, a turn of a local reasoning model that needs more than a
+ *                             minute is cut off and retried until the run fails.
  * @param transactionPageSize  default page size of {@code list_transactions}.
  */
 @ConfigurationProperties(prefix = "caa.agent")
@@ -46,6 +55,7 @@ public record AgentProperties(
         @DefaultValue("2") int concurrentRuns,
         @DefaultValue("16") int queueCapacity,
         @DefaultValue("30m") Duration streamTimeout,
+        @DefaultValue("10m") Duration requestTimeout,
         @DefaultValue("25") int transactionPageSize) {
 
     public AgentProperties {
@@ -60,6 +70,9 @@ public record AgentProperties(
         queueCapacity = clamp(queueCapacity, 1, 1000);
         transactionPageSize = clamp(transactionPageSize, 1, 100);
         streamTimeout = streamTimeout == null ? Duration.ofMinutes(30) : streamTimeout;
+        requestTimeout = requestTimeout == null || requestTimeout.isZero() || requestTimeout.isNegative()
+                ? Duration.ofMinutes(10)
+                : requestTimeout;
         model = model == null ? "" : model.trim();
     }
 

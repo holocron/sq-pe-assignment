@@ -143,12 +143,12 @@ class ConversationCompactorTest {
             history.add(AssistantMessage.builder()
                     .content("Checking rule " + i + ". ".repeat(20))
                     .toolCalls(List.of(new AssistantMessage.ToolCall(id, "function",
-                            "evaluate_rule_deterministically", "{\"rule_id\":\"rule-" + i + "\"}")))
+                            "get_transaction_details", "{\"transaction_id\":\"tx-" + i + "\"}")))
                     .build());
             history.add(ToolResponseMessage.builder()
                     .responses(List.of(new ToolResponseMessage.ToolResponse(id,
-                            "evaluate_rule_deterministically",
-                            "{\"triggered\":true,\"matched\":[" + "\"tx\",".repeat(60) + "\"tx\"]}")))
+                            "get_transaction_details",
+                            "{\"amount\":9500,\"matched\":[" + "\"tx\",".repeat(60) + "\"tx\"]}")))
                     .build());
         }
         return history;

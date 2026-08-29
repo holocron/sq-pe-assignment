@@ -124,7 +124,7 @@ export function CustomerHeader({
                     ? ` — ${latestAnalysis.status.toLowerCase()}`
                     : ''}
                   {latestAnalysis.coverageComplete === false
-                    ? ' — coverage completed by the deterministic fallback'
+                    ? ' — incomplete: some rules were never judged'
                     : ''}
                 </>
               ) : (

@@ -183,13 +183,13 @@ public final class CustomerDtos {
      *
      * <p><b>Velocity.</b> {@code txCount24h}, {@code amountSum24h}, {@code failedCount24h},
      * {@code distinctCountries30d}, {@code cryptoRatio30d} and {@code maxAmount30d} are the
-     * {@code agg.*} values of the rule DSL, read off the customer's {@code EvaluationBatch} - the
-     * very snapshots the engine scores rules against. Each window is defined relative to a
-     * transaction, so what is reported is the <b>peak</b> over the customer's history: the busiest
-     * rolling 24 hours, the largest 24-hour sum, and so on. That is the figure a threshold rule
-     * fires on, and it is the same fold the agent's {@code get_customer_activity_summary} velocity
-     * block reports, so the screen, the AI narrative and the rule verdict cannot disagree. Label
-     * them as peaks in the UI, not as "the last 24 hours".
+     * {@code agg.*} values of the field catalog, read off the customer's {@code EvaluationBatch} -
+     * the very snapshots the agent is shown. Each window is defined relative to a transaction, so
+     * what is reported is the <b>peak</b> over the customer's history: the busiest rolling 24 hours,
+     * the largest 24-hour sum, and so on. That is the figure a rule condition talks about, and it is
+     * the same fold the agent's {@code get_customer_activity_summary} velocity block reports, so the
+     * screen, the AI narrative and the rule verdict cannot disagree. Label them as peaks in the UI,
+     * not as "the last 24 hours".
      *
      * <p>{@code totalAmount} here is the sum across every currency of the customer's history and is
      * only meaningful together with {@code byCurrency} / {@code distinctCurrencies}; the

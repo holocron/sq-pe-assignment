@@ -28,9 +28,10 @@ public final class AnalysisDtos {
      * One rule of one run, as the analysis page renders it.
      *
      * <p>Every rule of the coverage set appears here, triggered or not - that is what makes rule
-     * coverage visible. {@code source} says whether the agent produced the verdict or the
-     * deterministic backfill did; {@code disagreement} marks the rules where the agent and the
-     * engine differed and the engine won.
+     * coverage visible. Every verdict is the agent's own judgement of the rule's condition, which is
+     * why {@code rationale} carries the reasoning it gave: there is no computation behind the score
+     * that could be shown instead. {@code claimedScore} and {@code scoreClamped} record the case
+     * where the model asked for more than the rule's weight and was capped.
      *
      * <p>The field names are also the keys used inside {@code analysis_runs.trace}, because this
      * record is what is written there and read back.
@@ -46,13 +47,9 @@ public final class AnalysisDtos {
             int evaluatedTransactionCount,
             int matchedCount,
             List<UUID> matchedTransactionIds,
-            boolean degraded,
-            List<String> degradationNotes,
-            String explanation,
             String rationale,
-            Boolean agentTriggered,
-            BigDecimal agentScore,
-            boolean disagreement) {
+            BigDecimal claimedScore,
+            boolean scoreClamped) {
 
         /** Matched ids kept in the trace; the complete set is in {@code risk_assessments}. */
         public static final int MAX_MATCHED_IDS = 50;
@@ -60,7 +57,6 @@ public final class AnalysisDtos {
         public RuleEvaluationView {
             matchedTransactionIds = matchedTransactionIds == null ? List.of()
                     : List.copyOf(matchedTransactionIds);
-            degradationNotes = degradationNotes == null ? List.of() : List.copyOf(degradationNotes);
         }
 
         public static RuleEvaluationView from(RuleOutcome outcome) {
@@ -75,19 +71,17 @@ public final class AnalysisDtos {
                     outcome.evaluatedTransactionCount(),
                     outcome.matchedCount(),
                     outcome.matchedTransactionIds().stream().limit(MAX_MATCHED_IDS).toList(),
-                    outcome.degraded(),
-                    outcome.degradationNotes(),
-                    outcome.explanation(),
                     outcome.rationale(),
-                    outcome.agentTriggered(),
-                    outcome.agentScore(),
-                    outcome.disagreement());
+                    outcome.claimedScore(),
+                    outcome.scoreClamped());
         }
 
         /**
          * Rebuilt from {@code risk_assessments} alone. Used only as a fallback when a run's trace
-         * cannot be read: the scores and counts are authoritative, the narrative fields are not
-         * available from the table.
+         * cannot be read: the scores and counts are authoritative, the rationale is not available
+         * from the table. The source is still the agent - those rows could not have been written by
+         * anything else - so the reviewer is told the truth about where the verdict came from even
+         * when the reasoning behind it has been lost.
          */
         public static RuleEvaluationView from(RuleEvaluationRow row) {
             boolean triggered = row.getTriggeredCount() > 0;
@@ -98,14 +92,10 @@ public final class AnalysisDtos {
                     row.getWeight(),
                     triggered,
                     row.getScore(),
-                    RuleVerdictSource.DETERMINISTIC_FALLBACK,
+                    RuleVerdictSource.AGENT_JUDGED,
                     (int) row.getEvaluatedCount(),
                     (int) row.getTriggeredCount(),
                     List.of(),
-                    false,
-                    List.of(),
-                    null,
-                    null,
                     null,
                     null,
                     false);
@@ -115,11 +105,12 @@ public final class AnalysisDtos {
     /**
      * Full result of one analysis run: {@code GET /api/analyses/{assessmentId}}.
      *
-     * @param riskLevel      banded from {@link #totalScore()}, which is the sum of the deterministic
-     *                       rule scores
+     * @param riskLevel      banded from {@link #totalScore()}, which is the sum of the per-rule
+     *                       scores the agent estimated, each capped at its rule's weight
      * @param agentRiskLevel the level the agent itself proposed, kept so the two can be compared
-     * @param coveragePercent share of the coverage set that ended with a verdict; 100 on any run
-     *                        that completed, because of the deterministic backfill
+     * @param coveragePercent share of the coverage set that ended with an agent verdict; 100 on
+     *                        every {@code COMPLETED} run, because a run that leaves a rule unjudged
+     *                        is persisted {@code FAILED} instead
      * @param trace          the ReAct transcript, {@code {"steps":[...]}} plus the persisted rule
      *                       detail; live steps while the run is still in flight
      */
@@ -137,9 +128,6 @@ public final class AnalysisDtos {
             int rulesEvaluated,
             boolean coverageComplete,
             double coveragePercent,
-            int rulesEvaluatedByAgent,
-            int rulesBackfilled,
-            int disagreementCount,
             int triggeredRuleCount,
             String model,
             int steps,

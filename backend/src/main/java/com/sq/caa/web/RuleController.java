@@ -1,11 +1,11 @@
 package com.sq.caa.web;
 
 import com.sq.caa.domain.RiskRule;
-import com.sq.caa.domain.RuleScope;
 import com.sq.caa.rules.DuplicateRuleNameException;
 import com.sq.caa.rules.FieldDefinition;
+import com.sq.caa.rules.RuleDraft;
+import com.sq.caa.rules.RuleJudgementException;
 import com.sq.caa.rules.RuleNotFoundException;
-import com.sq.caa.rules.RuleParser;
 import com.sq.caa.rules.RuleValidationException;
 import com.sq.caa.rules.UnknownCustomerException;
 import com.sq.caa.security.SecurityRoles;
@@ -37,17 +37,18 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
-import tools.jackson.databind.JsonNode;
 
 /**
  * Risk rule administration.
  *
  * <p>Reading rules is open to any authenticated user because the analysis screens show them;
- * everything that changes a rule, exposes the field catalog or runs an ad-hoc evaluation is
- * restricted to administrators and enforced here as well as in the URL security rules.
+ * everything that changes a rule, reads the field catalog or spends a model call is restricted to
+ * administrators and enforced here as well as in the URL security rules.
  *
- * <p>Rule-specific failures are translated locally into RFC-7807 responses that name the offending
- * node, which is more useful to a rule author than a generic 400.
+ * <p>{@code threshold_logic} is natural language - the sentence the ReAct agent reads before it goes
+ * and looks at the customer's data - so this controller only ever moves text. It parses nothing. The
+ * two things it still owns are validation of that text (via the service) and turning the failure
+ * modes of a model call into RFC-7807 responses an admin can act on.
  */
 @RestController
 @RequestMapping("/api/rules")
@@ -68,12 +69,11 @@ public class RuleController {
         return riskRuleService.findAll().stream().map(RiskRuleDto::from).toList();
     }
 
-    /** Creates a rule. The logic is validated against the field catalog before it is stored. */
+    /** Creates a rule. */
     @PostMapping
     @PreAuthorize(SecurityRoles.IS_ADMIN)
     @ResponseStatus(HttpStatus.CREATED)
     public RiskRuleDto create(@Valid @RequestBody RuleUpsertRequest request) {
-        validateAgainstScope(request.thresholdLogic(), request.appliesTo());
         RiskRule rule = riskRuleService.create(request.ruleName(), request.appliesTo(),
                 request.thresholdLogic(), request.weight());
         return RiskRuleDto.from(rule);
@@ -83,7 +83,6 @@ public class RuleController {
     @PutMapping("/{ruleId}")
     @PreAuthorize(SecurityRoles.IS_ADMIN)
     public RiskRuleDto update(@PathVariable UUID ruleId, @Valid @RequestBody RuleUpsertRequest request) {
-        validateAgainstScope(request.thresholdLogic(), request.appliesTo());
         RiskRule rule = riskRuleService.update(ruleId, request.ruleName(), request.appliesTo(),
                 request.thresholdLogic(), request.weight());
         return RiskRuleDto.from(rule);
@@ -97,7 +96,13 @@ public class RuleController {
         riskRuleService.delete(ruleId);
     }
 
-    /** The field catalog the visual editor is built from. */
+    /**
+     * The data a rule condition may talk about.
+     *
+     * <p>Not a grammar - conditions are prose - but the reference an author needs: these are exactly
+     * the values the agent can fetch, so a condition written against them is one it can settle from
+     * evidence instead of from memory.
+     */
     @GetMapping("/field-catalog")
     @PreAuthorize(SecurityRoles.IS_ADMIN)
     public List<FieldCatalogEntry> fieldCatalog() {
@@ -105,47 +110,55 @@ public class RuleController {
         return definitions.stream().map(FieldCatalogEntry::from).toList();
     }
 
-    /** Runs a draft rule over live activity without saving it. */
+    /**
+     * Judges a draft rule against one customer, for real, with the agent's model.
+     *
+     * <p>Synchronous and slow by nature: it is one model call, bounded by
+     * {@code caa.rules.judge.timeout-seconds}. Two runs of the same draft may differ - that is what
+     * it means for the agent to be the scoring authority - so the response carries the model id, the
+     * elapsed time and every correction that had to be applied to the answer.
+     */
     @PostMapping("/test")
     @PreAuthorize(SecurityRoles.IS_ADMIN)
     public RuleTestResponse test(@Valid @RequestBody RuleTestRequest request) {
-        validateAgainstScope(request.thresholdLogic(), request.appliesTo());
-        return RuleTestResponse.from(riskRuleService.testRule(request.thresholdLogic(),
-                request.appliesTo(), request.customerId()));
-    }
-
-    /**
-     * Refuses logic that cannot fire under the scope it is being saved with - a CARD rule reading
-     * {@code payment.*}, for instance, which would validate cleanly against the catalog and then
-     * evaluate to false on every transaction for ever.
-     *
-     * <p>Applied on create, replace and "Test rule" so the three give the same verdict. The service
-     * re-parses the same document when it canonicalises it for storage; this call is the scope-aware
-     * half of that contract and runs before anything is written.
-     */
-    private static void validateAgainstScope(JsonNode thresholdLogic, RuleScope appliesTo) {
-        if (thresholdLogic == null || thresholdLogic.isNull() || thresholdLogic.isMissingNode()) {
-            throw new RuleValidationException("$", null, "thresholdLogic is required");
-        }
-        RuleParser.parseStrict(thresholdLogic, appliesTo == null ? RuleScope.ALL : appliesTo);
+        RuleDraft draft = new RuleDraft(
+                request.ruleName() == null || request.ruleName().isBlank()
+                        ? "Draft rule" : request.ruleName().trim(),
+                request.appliesTo(), request.thresholdLogic(), request.weight());
+        return RuleTestResponse.from(riskRuleService.judgeRule(draft, request.customerId()));
     }
 
     // ------------------------------------------------------------------
     // Problem responses
     // ------------------------------------------------------------------
 
-    /**
-     * Malformed rule logic. The response names the offending node in {@code detail} and repeats it
-     * as the {@code path} and {@code node} properties so the editor can highlight it.
-     */
+    /** A rule that cannot be saved as written. {@code field} names the input to highlight. */
     @ExceptionHandler(RuleValidationException.class)
     public ResponseEntity<ProblemDetail> onInvalidRule(RuleValidationException e, HttpServletRequest request) {
-        log.debug("Rejected rule logic at {}: {}", e.path(), e.getMessage());
-        ProblemDetail problem = problem(HttpStatus.BAD_REQUEST, "Invalid rule definition", e.describe(), request);
-        problem.setProperty("path", e.path());
-        if (e.node() != null) {
-            problem.setProperty("node", e.node());
-        }
+        log.debug("Rejected rule: {} {}", e.field(), e.getMessage());
+        ProblemDetail problem = problem(HttpStatus.BAD_REQUEST, "Invalid rule definition",
+                e.describe(), request);
+        problem.setProperty("field", e.field());
+        return respond(problem);
+    }
+
+    /**
+     * A judgement that could not be obtained.
+     *
+     * <p>Mapped by cause, because the four cases need different answers from the caller: wait
+     * (504/503), fix the configuration (503), or look at what the model actually said (502).
+     */
+    @ExceptionHandler(RuleJudgementException.class)
+    public ResponseEntity<ProblemDetail> onFailedJudgement(RuleJudgementException e,
+            HttpServletRequest request) {
+        HttpStatus status = switch (e.reason()) {
+            case TIMEOUT -> HttpStatus.GATEWAY_TIMEOUT;
+            case BUSY, UNAVAILABLE -> HttpStatus.SERVICE_UNAVAILABLE;
+            case MODEL_ERROR, UNREADABLE_ANSWER -> HttpStatus.BAD_GATEWAY;
+        };
+        log.warn("Rule judgement failed ({}): {}", e.reason(), e.getMessage());
+        ProblemDetail problem = problem(status, "Rule could not be judged", e.getMessage(), request);
+        problem.setProperty("reason", e.reason().name());
         return respond(problem);
     }
 

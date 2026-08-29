@@ -84,6 +84,11 @@ export function normalizeTraceStep(raw: unknown, fallbackIndex = 0): TraceStep {
         tool: str(step.tool) ?? 'unknown_tool',
         args: step.args ?? null,
         resultPreview: str(step.result_preview) ?? str(step.resultPreview),
+        /* The backend labels the step where the meaning was known, so these are
+           forwarded verbatim; the viewer only falls back to reading the args
+           and the truncated preview when a run predates them. */
+        subject: str(step.subject),
+        outcome: str(step.outcome),
       }
     case 'assistant':
       return { type: 'assistant', n, ms, text: str(step.text) ?? '' }
@@ -92,6 +97,24 @@ export function normalizeTraceStep(raw: unknown, fallbackIndex = 0): TraceStep {
         ? step.missing.map((item) => String(item))
         : []
       return { type: 'coverage_reprompt', n, ms, missing }
+    }
+    case 'coverage_failed': {
+      const missing = Array.isArray(step.missing)
+        ? step.missing.map((item) => String(item))
+        : []
+      const detail = asObject(step.detail)
+      const names = Array.isArray(detail?.unjudged_rule_names)
+        ? detail.unjudged_rule_names.map((item) => String(item))
+        : []
+      return {
+        type: 'coverage_failed',
+        n,
+        ms,
+        missing,
+        unjudgedRuleNames: names,
+        rulesTotal: num(detail?.rules_total),
+        text: str(step.text) ?? '',
+      }
     }
     case 'final':
       return {
@@ -127,8 +150,8 @@ function normalizeTrace(trace: AnalysisResultWire['trace']): TraceStep[] {
 }
 
 /**
- * A rule verdict always carries its matched-transaction evidence, but a run
- * that failed mid-flight can persist a row before the ids are known. The
+ * A rule verdict always carries the transactions the agent cited, but a run
+ * rebuilt from `risk_assessments` alone has no evidence ids to give. The
  * coverage table expands into that array, so it is defaulted here rather than
  * guarded at every call site.
  */
@@ -139,7 +162,6 @@ export function normalizeRuleEvaluation(wire: RuleEvaluationWire): RuleEvaluatio
     matchedTransactionIds: Array.isArray(wire.matchedTransactionIds)
       ? wire.matchedTransactionIds
       : [],
-    degradationNotes: Array.isArray(wire.degradationNotes) ? wire.degradationNotes : [],
   }
 }
 

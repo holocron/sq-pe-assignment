@@ -42,7 +42,7 @@ export function MatchedTransactions({ transactionIds, className }: MatchedTransa
   if (ids.length === 0) {
     return (
       <p className={cn('text-xs text-muted', className)}>
-        No transaction matched this rule.
+        The agent cited no transaction for this rule.
       </p>
     )
   }
@@ -58,7 +58,7 @@ export function MatchedTransactions({ transactionIds, className }: MatchedTransa
     <div className={cn('space-y-2', className)}>
       <div className="overflow-x-auto rounded-xs border border-border">
         <table className="w-full border-collapse text-xs">
-          <caption className="sr-only">Transactions that matched this rule</caption>
+          <caption className="sr-only">Transactions the agent cited as evidence</caption>
           <thead className="bg-surface-2">
             <tr>
               <th scope="col" className="px-2.5 py-1.5 text-left font-semibold text-2xs tracking-caption text-muted uppercase">

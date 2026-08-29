@@ -64,11 +64,15 @@ public class AnalysisRun {
     @Column(name = "rules_total", nullable = false)
     private int rulesTotal;
 
-    /** How many of those rules the agent itself evaluated. */
+    /** How many of those rules ended with an agent verdict. */
     @Column(name = "rules_evaluated", nullable = false)
     private int rulesEvaluated;
 
-    /** {@code false} when the deterministic backfill had to complete the coverage set. */
+    /**
+     * {@code true} only when every applicable rule was judged. A {@code COMPLETED} run always has
+     * {@code true}: a run that ran out of steps with rules unjudged is stored {@code FAILED}, with
+     * the verdicts it did obtain and the missing rules named in {@link #error}.
+     */
     @Column(name = "coverage_complete", nullable = false)
     private boolean coverageComplete;
 

@@ -17,7 +17,7 @@ package com.sq.caa.agent;
 @FunctionalInterface
 public interface AnalysisProgressListener {
 
-    /** Ignores progress; used by the deterministic-only path and by tests. */
+    /** Ignores progress; used by callers that do not report it, and by tests. */
     AnalysisProgressListener NONE = (steps, rulesEvaluated, rulesTotal) -> {
     };
 
