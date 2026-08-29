@@ -1,0 +1,61 @@
+spring:
+  application:
+    name: customer-activity-analytics
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/caa}
+    username: ${DB_USER:caa}
+    password: ${DB_PASSWORD:caa}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  servlet:
+    multipart:
+      max-file-size: 25MB
+      max-request-size: 25MB
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY:none}
+      chat:
+        base-url: ${LLM_CHAT_URL:http://localhost:8001}
+        options:
+          model: ${LLM_CHAT_MODEL:gpt-oss-120b}
+          temperature: 0.1
+          max-tokens: 4096
+      embedding:
+        base-url: ${LLM_EMBED_URL:http://localhost:8002}
+        options:
+          model: ${LLM_EMBED_MODEL:Qwen3-Embedding-4B}
+    vectorstore:
+      pgvector:
+        dimensions: 2560
+        distance-type: cosine-distance
+        index-type: hnsw
+        table-name: document_chunks
+        initialize-schema: false
+        schema-validation: false
+
+caa:
+  security:
+    jwt:
+      secret: ${JWT_SECRET:change-me-in-production-this-is-a-demo-secret-key-of-sufficient-length-256bits}
+      ttl-minutes: 480
+  agent:
+    max-steps: 40
+    max-coverage-reprompts: 3
+  cors:
+    allowed-origins: http://localhost:5173
+
+server:
+  port: 8080
+
+logging:
+  level:
+    com.sq.caa: DEBUG
