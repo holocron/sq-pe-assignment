@@ -133,7 +133,9 @@ class SeededRuleShapesTest {
     @Test
     void everySeededShapeSurvivesStrictValidation() {
         for (RiskRule seeded : seededRules()) {
-            assertThatCode(() -> RuleParser.parseStrict(seeded.getThresholdLogic()))
+            // Validated with the rule's own scope, which is what the write API applies: a seeded rule
+            // reaching for a field of another activity type would be one that can never fire.
+            assertThatCode(() -> RuleParser.parseStrict(seeded.getThresholdLogic(), seeded.getAppliesTo()))
                     .as(seeded.getRuleName())
                     .doesNotThrowAnyException();
         }

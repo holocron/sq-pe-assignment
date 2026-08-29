@@ -1,7 +1,7 @@
 import axios, { type AxiosRequestConfig, type AxiosResponse } from 'axios'
 import { clearStoredAuth, getAuthToken } from '../auth/storage'
 import { toApiError } from './errors'
-import type { PageResponse, SpringPage } from './types'
+import type { PageResponse, SpringPage, SpringPageMetadata } from './types'
 
 /** Same-origin base path; the Vite dev server proxies it to :8080. */
 export const API_BASE_URL = '/api'
@@ -124,14 +124,27 @@ export async function deleteJson(url: string, config?: AxiosRequestConfig): Prom
 /* -------------------------------------------------------------------------- */
 
 /**
- * Normalises both Spring serialisations (flattened `Page` and Boot 4
- * `PagedModel` with a nested `page` object) into `PageResponse<T>`.
+ * Normalises every paged serialisation this API can produce into
+ * `PageResponse<T>`.
+ *
+ * The shape this backend actually sends (`web/dto/PageResponse.java`) is flat
+ * and puts the **zero-based page index in `page`**:
+ * `{content, page: 1, size: 5, totalElements: 12, totalPages: 3}`. Reading
+ * `page` as a Boot 4 `PagedModel` metadata object silently yields `0` for every
+ * page, which pins `Pagination` to page 1 forever — so the numeric form is
+ * handled explicitly here rather than falling through to the default.
  */
 export function toPage<T>(wire: SpringPage<T> | null | undefined): PageResponse<T> {
   const content = Array.isArray(wire?.content) ? wire.content : []
-  const meta = wire?.page
+  const rawPage = wire?.page
+  /* Boot 4 PagedModel: `page` is the metadata object. */
+  const meta =
+    typeof rawPage === 'object' && rawPage !== null ? (rawPage as SpringPageMetadata) : undefined
+  /* This backend: `page` is the index itself. */
+  const flatIndex = typeof rawPage === 'number' && Number.isFinite(rawPage) ? rawPage : undefined
+
   const size = meta?.size ?? wire?.size ?? content.length
-  const number = meta?.number ?? wire?.number ?? 0
+  const number = meta?.number ?? flatIndex ?? wire?.number ?? 0
   const totalElements = meta?.totalElements ?? wire?.totalElements ?? content.length
   const totalPages =
     meta?.totalPages ?? wire?.totalPages ?? (size > 0 ? Math.ceil(totalElements / size) : 0)

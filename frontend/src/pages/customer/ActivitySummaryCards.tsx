@@ -37,10 +37,11 @@ function currencyHint(currencies: string[]): string {
   return `Mixed currencies: ${currencies.join(', ')}`
 }
 
+/** `byStatus[]` buckets are `{status, transactionCount, totalAmount}` on the wire. */
 function statusCount(summary: ActivitySummary, status: string): number {
   return summary.byStatus
     .filter((entry) => entry.status.toLowerCase() === status.toLowerCase())
-    .reduce((total, entry) => total + entry.count, 0)
+    .reduce((total, entry) => total + entry.transactionCount, 0)
 }
 
 const TYPE_ACCENTS: Record<ActivityType, string> = {
@@ -73,34 +74,29 @@ export function ActivitySummaryCards({
   const failedCount = summary ? statusCount(summary, 'Failed') : 0
   const reversedCount = summary ? statusCount(summary, 'Reversed') : 0
   const failedRatio = summary?.failedRatio ?? null
+  const countries = summary?.counterpartyCountries ?? []
+  const countryCodes = countries.map((entry) => entry.country)
   const byType = new Map<ActivityType, ActivitySummary['byActivityType'][number]>(
     (summary?.byActivityType ?? []).map((entry) => [entry.activityType, entry]),
   )
 
-  const velocity: Array<{ label: string; value: string }> = []
-  if (summary) {
-    if (summary.txCount24h !== null && summary.txCount24h !== undefined) {
-      velocity.push({ label: 'Transactions, 24h', value: formatNumber(summary.txCount24h) })
-    }
-    if (summary.amountSum24h !== null && summary.amountSum24h !== undefined) {
-      velocity.push({ label: 'Amount, 24h', value: money(summary.amountSum24h, currencies) })
-    }
-    if (summary.failedCount24h !== null && summary.failedCount24h !== undefined) {
-      velocity.push({ label: 'Failed, 24h', value: formatNumber(summary.failedCount24h) })
-    }
-    if (summary.distinctCountries30d !== null && summary.distinctCountries30d !== undefined) {
-      velocity.push({
-        label: 'Distinct countries, 30d',
-        value: formatNumber(summary.distinctCountries30d),
-      })
-    }
-    if (summary.cryptoRatio30d !== null && summary.cryptoRatio30d !== undefined) {
-      velocity.push({ label: 'Crypto share, 30d', value: formatPercent(summary.cryptoRatio30d) })
-    }
-    if (summary.maxAmount30d !== null && summary.maxAmount30d !== undefined) {
-      velocity.push({ label: 'Largest single, 30d', value: money(summary.maxAmount30d, currencies) })
-    }
-  }
+  /* The `agg.*` values the rule engine scored on. The server folds each rolling
+     window with `max` over the customer's whole history, so every figure is a
+     PEAK, not a reading taken at some instant — a threshold rule fires exactly
+     when the peak crosses it. The labels have to say so, otherwise "3" reads as
+     "3 transactions in the last day" when the customer may be long dormant.
+     Every tile is a field the summary endpoint really sends, so the block
+     renders for any customer instead of staying permanently empty. */
+  const velocity: Array<{ label: string; value: string }> = summary
+    ? [
+        { label: 'Peak transactions, 24h', value: formatNumber(summary.txCount24h) },
+        { label: 'Peak amount, 24h', value: money(summary.amountSum24h, currencies) },
+        { label: 'Peak failed, 24h', value: formatNumber(summary.failedCount24h) },
+        { label: 'Max distinct countries, 30d', value: formatNumber(summary.distinctCountries30d) },
+        { label: 'Max crypto share, 30d', value: formatPercent(summary.cryptoRatio30d) },
+        { label: 'Largest single amount', value: money(summary.maxAmount30d, currencies) },
+      ]
+    : []
 
   return (
     <div className="flex flex-col gap-4">
@@ -135,11 +131,11 @@ export function ActivitySummaryCards({
         />
         <StatCard
           label="Counterparty countries"
-          value={formatNumber(summary?.countries.length)}
+          value={formatNumber(summary?.distinctCounterpartyCountries)}
           hint={
-            summary && summary.countries.length > 0
-              ? summary.countries.slice(0, 6).join(', ') +
-                (summary.countries.length > 6 ? ` +${summary.countries.length - 6}` : '')
+            countryCodes.length > 0
+              ? countryCodes.slice(0, 6).join(', ') +
+                (countryCodes.length > 6 ? ` +${countryCodes.length - 6}` : '')
               : 'No counterparty country reported'
           }
           numeric
@@ -182,7 +178,7 @@ export function ActivitySummaryCards({
                   {ACTIVITY_TYPE_LABELS[type]}
                 </span>
                 <span className="numeric text-2xs text-subtle">
-                  {formatNumber(entry?.count ?? 0)} tx
+                  {formatNumber(entry?.transactionCount ?? 0)} tx
                 </span>
               </div>
               <p className="numeric mt-1 text-lg leading-tight font-semibold text-fg">
@@ -212,8 +208,10 @@ export function ActivitySummaryCards({
           <CardHeader>
             <CardTitle>Velocity and exposure</CardTitle>
             <p className="mt-0.5 text-xs text-muted">
-              The same aggregates the rule engine exposes as <code className="font-mono">agg.*</code>{' '}
-              fields.
+              The same aggregates the rule engine scores on, exposed as{' '}
+              <code className="font-mono">agg.*</code> fields. Each figure is the highest the
+              rolling window ever reached across this customer's history — the value a threshold
+              rule was measured against — not a reading for the last 24 hours or 30 days.
             </p>
           </CardHeader>
           <CardContent>

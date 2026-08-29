@@ -4,8 +4,8 @@
  * The three controls sit on a fixed grid — field, operator, value, actions — so
  * every row in a rule lines up on the same columns however deeply it is nested.
  * The field dropdown is populated from `GET /api/rules/field-catalog` and
- * grouped by category, the operator dropdown is filtered to the operators the
- * field's type supports, and the value control adapts to the field type.
+ * grouped by category, the operator dropdown offers exactly the operators that
+ * catalog entry declares, and the value control adapts to the field type.
  */
 import { Copy, Trash2 } from 'lucide-react'
 import type { RuleCondition, RuleOperator } from '../../../api/types'
@@ -16,7 +16,6 @@ import {
   RULE_OPERATOR_META,
   findCatalogEntry,
   groupFieldCatalog,
-  operatorsForFieldType,
   type RulePath,
 } from '../../../lib/rules'
 import {
@@ -26,6 +25,7 @@ import {
   conditionLabel,
   enumValuesOf,
   fieldOptionLabel,
+  operatorsForEntry,
   type Catalog,
 } from './ruleModel'
 import { ValueEditor } from './ValueEditor'
@@ -60,7 +60,8 @@ export function ConditionRow({
   const entry = findCatalogEntry(catalog, condition.field)
   const type = entry?.type ?? null
   const enumValues = enumValuesOf(catalog, condition.field)
-  const operators = operatorsForFieldType(type)
+  /* The catalog states, per field, which operators the backend will accept. */
+  const operators = operatorsForEntry(entry)
   const invalid = issues.length > 0
   const groups = groupFieldCatalog(catalog)
   const unknownField = catalog.length > 0 && !entry && condition.field.length > 0
@@ -117,6 +118,7 @@ export function ConditionRow({
             operator={condition.operator}
             type={type}
             enumValues={enumValues}
+            enumClosed={entry?.valuesClosed !== false}
             value={condition.value}
             invalid={invalid}
             disabled={disabled}

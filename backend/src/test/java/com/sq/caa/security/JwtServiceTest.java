@@ -1,6 +1,7 @@
 package com.sq.caa.security;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -148,6 +149,40 @@ class JwtServiceTest {
     void nonPositiveTtlFailsFast() {
         assertThrows(IllegalStateException.class, () -> new JwtService(new JwtProperties(SECRET, 0)));
         assertThrows(IllegalStateException.class, () -> new JwtService(new JwtProperties(SECRET, -5)));
+    }
+
+    @Test
+    @DisplayName("the built-in development secret is recognised, and still boots the demo")
+    void developmentSecretIsRecognisedWithoutBreakingTheDemo() {
+        JwtProperties properties = new JwtProperties(JwtProperties.DEVELOPMENT_SECRET, 480);
+
+        assertTrue(properties.usesDevelopmentSecret(),
+                "the committed fallback must be detectable so startup can warn about it");
+
+        // Zero configuration must keep working: the warning is loud, not fatal.
+        JwtService service = new JwtService(properties);
+        assertNotNull(service.parseClaims(service.issue(principal()).token()));
+    }
+
+    @Test
+    @DisplayName("a secret of your own is not flagged as the development one")
+    void configuredSecretIsNotFlagged() {
+        assertFalse(new JwtProperties(SECRET, 480).usesDevelopmentSecret());
+        assertFalse(new JwtProperties(null, 480).usesDevelopmentSecret());
+    }
+
+    @Test
+    @DisplayName("application.yml's fallback is exactly the value the startup warning is about")
+    void applicationYmlFallbackMatchesTheConstant() throws Exception {
+        String config;
+        try (var stream = JwtServiceTest.class.getResourceAsStream("/application.yml")) {
+            assertNotNull(stream, "application.yml must be on the test classpath");
+            config = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
+        }
+
+        assertTrue(config.contains("${JWT_SECRET:" + JwtProperties.DEVELOPMENT_SECRET + "}"),
+                "the configured fallback drifted from JwtProperties.DEVELOPMENT_SECRET, so the "
+                        + "startup warning would go silent");
     }
 
     private static String reverse(String value) {

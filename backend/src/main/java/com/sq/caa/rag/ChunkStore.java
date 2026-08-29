@@ -1,5 +1,6 @@
 package com.sq.caa.rag;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
 
@@ -37,11 +38,20 @@ public interface ChunkStore {
     void deleteByDocument(UUID documentId);
 
     /**
-     * Nearest chunks to a query, best first.
+     * Nearest chunks to a query, best first, restricted to the documents named by
+     * {@code documentIds}.
      *
-     * @param query free text, already validated as non-blank
-     * @param topK  number of hits to return, already clamped to a sane range
+     * <p>The restriction is not an optimisation: chunks are written batch by batch while the owning
+     * {@code knowledge_documents} row is still {@code PROCESSING}, and a compensating delete after
+     * a failed ingest is best effort. Ranking over the whole table would therefore surface passages
+     * from a half-written or failed document, which is precisely what both the operator screen and
+     * the admin screen promise cannot happen. It must be applied inside the query rather than by
+     * discarding hits afterwards, so a restricted search still returns {@code topK} results.
+     *
+     * @param query       free text, already validated as non-blank
+     * @param topK        number of hits to return, already clamped to a sane range
+     * @param documentIds the documents that may contribute hits; never null and never empty
      * @throws KnowledgeIndexException when the embedding model or the store is unavailable
      */
-    List<RetrievedChunk> search(String query, int topK);
+    List<RetrievedChunk> search(String query, int topK, Collection<UUID> documentIds);
 }

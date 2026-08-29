@@ -9,6 +9,7 @@
 import { FileText, ListChecks, RotateCw, TriangleAlert } from 'lucide-react'
 import { useMemo } from 'react'
 import type { AnalysisResult, RiskRule, TraceStep, UUID } from '../../api/types'
+import { ErrorBoundary, RouteErrorPanel } from '../../components/ErrorBoundary'
 import { Button } from '../../components/ui/Button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../../components/ui/Card'
 import { LiveRunPanel } from './LiveRunPanel'
@@ -61,22 +62,35 @@ export function AnalysisResultView({
     return map
   }, [rules, analysis.ruleEvaluations])
 
+  /* Both panels render whatever the run persisted, row by row. A malformed
+     evaluation or trace step must cost the operator that one panel, not the
+     verdict, the narrative and the other panel with it. */
   const coverage = (
-    <RuleCoverageTable
-      evaluations={analysis.ruleEvaluations}
-      stats={stats}
-      rules={rules}
-      running={running}
-    />
+    <ErrorBoundary
+      resetKeys={[analysis.assessmentId]}
+      fallback={(props) => <RouteErrorPanel {...props} />}
+    >
+      <RuleCoverageTable
+        evaluations={analysis.ruleEvaluations}
+        stats={stats}
+        rules={rules}
+        running={running}
+      />
+    </ErrorBoundary>
   )
 
   const trace = (
-    <TraceViewer
-      steps={traceSteps}
-      running={running}
-      ruleNames={ruleNames}
-      live={running && live ? { connected: live.connected } : undefined}
-    />
+    <ErrorBoundary
+      resetKeys={[analysis.assessmentId]}
+      fallback={(props) => <RouteErrorPanel {...props} />}
+    >
+      <TraceViewer
+        steps={traceSteps}
+        running={running}
+        ruleNames={ruleNames}
+        live={running && live ? { connected: live.connected } : undefined}
+      />
+    </ErrorBoundary>
   )
 
   return (

@@ -33,7 +33,7 @@ const STATUS_OPTIONS = [
 function tabCount(tab: ActivityTab, summary: ActivitySummary | undefined): number | null {
   if (!summary) return null
   if (tab === 'ALL') return summary.totalTransactions
-  return summary.byActivityType.find((entry) => entry.activityType === tab)?.count ?? 0
+  return summary.byActivityType.find((entry) => entry.activityType === tab)?.transactionCount ?? 0
 }
 
 /**

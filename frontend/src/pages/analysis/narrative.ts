@@ -15,12 +15,27 @@ export type NarrativeBlock =
 const BULLET = /^\s*(?:[-*•‣]|\d+[.)])\s+/
 const HEADING = /^\s*#{1,6}\s+/
 
-/** Drops the markdown emphasis markers the model sometimes emits. */
+/**
+ * Drops the markdown emphasis markers the model sometimes emits, and collapses
+ * runs of blank space.
+ *
+ * The collapse is not cosmetic. A degenerating model emits long runs of
+ * NO-BREAK SPACE (U+00A0), which the browser refuses to wrap: one real run of
+ * this system concluded with `1. File SARS ( S` followed by a hundred of them,
+ * which stretched the "Recommended actions" panel across the page. The server
+ * cleans new runs at the source, but rows written before that are still on
+ * file, so the renderer does not trust its input either. `\s` in JavaScript
+ * already covers U+00A0 and the other Unicode space separators; the
+ * zero-width characters it does not cover are listed explicitly.
+ */
+const BLANK_RUN = /[\s\u200b\ufeff]+/g
+
 function clean(text: string): string {
   return text
     .replace(/\*\*(.+?)\*\*/g, '$1')
     .replace(/__(.+?)__/g, '$1')
     .replace(/`([^`]+)`/g, '$1')
+    .replace(BLANK_RUN, ' ')
     .trim()
 }
 

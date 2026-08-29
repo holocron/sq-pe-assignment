@@ -4,6 +4,7 @@ import com.sq.caa.domain.DocumentStatus;
 import com.sq.caa.domain.KnowledgeDocument;
 import com.sq.caa.repository.KnowledgeDocumentRepository;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
@@ -11,6 +12,7 @@ import java.util.Optional;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -18,9 +20,10 @@ import org.springframework.transaction.annotation.Transactional;
  * The knowledge base: ingestion of policy documents and retrieval over them.
  *
  * <p>This is the whole RAG surface. Uploads are parsed into sections, cut into overlapping windows,
- * embedded and stored; searches return the nearest windows with their provenance. Both the admin
- * screen and the ReAct agent's {@code search_policy_knowledge} tool go through
- * {@link #search(String, int)}.
+ * embedded and stored; searches return the nearest windows with their provenance. The operator
+ * search screen and the ReAct agent's {@code search_policy_knowledge} tool go through one method,
+ * {@link #searchPolicy(String, Integer)}, so the screen that claims to show what the model reads
+ * really does.
  *
  * <p><b>Ingestion is synchronous.</b> A policy document is a handful of pages and embeds in
  * seconds, so the upload call returns the finished {@link KnowledgeDocument} with its real
@@ -32,8 +35,10 @@ import org.springframework.transaction.annotation.Transactional;
  * <p><b>Failure leaves evidence.</b> A file that is not a {@code .docx} or {@code .pdf} is refused
  * before any row exists. A file that is one but cannot be read, or that the embedding model refuses,
  * leaves a {@code FAILED} row carrying the reason, so the administrator can see what happened
- * instead of an upload that silently vanished. Any chunks written before the failure are removed,
- * so a failed document never contributes to a search result.
+ * instead of an upload that silently vanished. Any chunks written before the failure are removed -
+ * and because that clean-up is best effort, search is additionally restricted to {@code INDEXED}
+ * documents, so a failed or half-written document cannot contribute to a result even if its rows
+ * survive.
  */
 @Service
 public class RagService {
@@ -45,6 +50,19 @@ public class RagService {
 
     /** Cap on the stored failure message, so one stack trace cannot bloat the row. */
     private static final int MAX_ERROR_LENGTH = 2000;
+
+    /**
+     * Longest passage any caller is given, including {@link #TRUNCATION_MARKER}.
+     *
+     * <p>The cap belongs here rather than in a caller because the operator search screen exists to
+     * show a reviewer <em>what the model read</em>. A screen that renders the full chunk while the
+     * agent saw only its first 1,200 characters invites the reviewer to accept a citation the model
+     * could not have grounded, so both are cut to the same length by the same code.
+     */
+    public static final int MAX_PASSAGE_CHARS = 1200;
+
+    /** Appended to a passage that had to be cut, so a reader can see it is not the whole section. */
+    public static final String TRUNCATION_MARKER = " [...passage truncated]";
 
     private final KnowledgeDocumentRepository documentRepository;
     private final DocumentFormatDetector formatDetector;
@@ -87,43 +105,84 @@ public class RagService {
     /* ------------------------------------------------------------------ */
 
     /**
-     * Vector similarity search over the knowledge base.
+     * The one retrieval in the system: vector similarity search over the knowledge base.
      *
-     * <p>This is the entry point the ReAct agent's {@code search_policy_knowledge} tool calls, and
-     * the one behind {@code POST /api/knowledge/search}. It is deliberately forgiving about its
-     * arguments, because one caller is a language model: a blank query returns nothing rather than
-     * throwing, and {@code topK} is clamped into {@code [1, caa.rag.max-top-k]} - zero or negative
-     * means "use the default".
+     * <p>BUILD_SPEC section 5 gives the operator screen and the ReAct agent the same knowledge
+     * base, and the operator screen tells the reviewer that what it shows is what the model reads.
+     * That is only true if both go through <em>this</em> method - not merely through the same
+     * ranking, but through the same clamping, the same visibility rule and the same passage
+     * length. {@code POST /api/knowledge/search} and the agent's {@code search_policy_knowledge}
+     * tool therefore both call it, and neither applies a cap of its own.
+     *
+     * <p>It is deliberately forgiving about its arguments, because one caller is a language model:
+     * a blank or null query returns nothing rather than throwing, and {@code topK} is clamped into
+     * {@code [1, caa.rag.max-top-k]} - null, zero or negative means "use
+     * {@code caa.rag.default-top-k}".
+     *
+     * <p>Only chunks of {@code INDEXED} documents can be returned. A document is {@code PROCESSING}
+     * while its batches are being embedded and committed, and a failed ingest cleans its chunks up
+     * on a best-effort basis, so ranking over the raw chunk table would leak passages from
+     * half-written and failed documents into both the UI and the agent's citations.
      *
      * @param query free-text question or topic
-     * @param topK  desired number of hits
+     * @param topK  desired number of hits; null or non-positive means the configured default
      * @return the nearest chunks, best first; never null, possibly empty
      * @throws KnowledgeIndexException when the embedding model or the vector store is unavailable
      */
-    public List<RetrievedChunk> search(String query, int topK) {
+    public List<RetrievedChunk> searchPolicy(String query, Integer topK) {
         String question = query == null ? "" : query.strip();
         if (question.isEmpty()) {
             return List.of();
         }
-        int wanted = topK <= 0
+        int wanted = topK == null || topK <= 0
                 ? properties.defaultTopK()
                 : Math.min(topK, properties.maxTopK());
 
         // An empty corpus is the common case before the first upload. Answering it from the
         // document table saves an embedding round trip that could only ever return nothing.
-        if (!hasIndexedDocuments()) {
+        List<UUID> searchable = indexedDocumentIds();
+        if (searchable.isEmpty()) {
             log.debug("Knowledge search for '{}' skipped: no indexed documents", question);
             return List.of();
         }
 
-        List<RetrievedChunk> hits = chunkStore.search(question, wanted);
-        log.debug("Knowledge search for '{}' returned {} chunk(s)", question, hits.size());
-        return hits;
+        List<RetrievedChunk> hits = chunkStore.search(question, wanted, searchable);
+        List<RetrievedChunk> capped = new ArrayList<>(hits.size());
+        for (RetrievedChunk hit : hits) {
+            capped.add(cap(hit));
+        }
+        log.debug("Knowledge search for '{}' returned {} chunk(s) from {} indexed document(s)",
+                question, capped.size(), searchable.size());
+        return List.copyOf(capped);
+    }
+
+    /**
+     * {@link #searchPolicy(String, Integer)} under the name the existing callers use.
+     *
+     * @param topK desired number of hits; {@code 0} or negative means the configured default
+     */
+    public List<RetrievedChunk> search(String query, int topK) {
+        return searchPolicy(query, topK);
     }
 
     /** Search with the configured default {@code topK}. */
     public List<RetrievedChunk> search(String query) {
-        return search(query, properties.defaultTopK());
+        return searchPolicy(query, null);
+    }
+
+    /**
+     * Cuts a passage to {@link #MAX_PASSAGE_CHARS} <em>including</em> the marker, so a caller that
+     * applies the same cap again finds nothing left to do and cannot stack a second marker on.
+     */
+    private static RetrievedChunk cap(RetrievedChunk hit) {
+        String content = hit.content() == null ? "" : hit.content();
+        if (content.length() <= MAX_PASSAGE_CHARS) {
+            return hit;
+        }
+        String cut = content.substring(0, MAX_PASSAGE_CHARS - TRUNCATION_MARKER.length())
+                .stripTrailing() + TRUNCATION_MARKER;
+        return new RetrievedChunk(hit.chunkId(), hit.documentId(), hit.filename(), hit.title(),
+                hit.sectionTitle(), hit.chunkIndex(), cut, hit.score());
     }
 
     /* ------------------------------------------------------------------ */
@@ -189,7 +248,7 @@ public class RagService {
         replaceOrRejectExisting(filename);
 
         KnowledgeDocument document = newDocument(filename, format, content.length, uploadedBy);
-        documentRepository.saveAndFlush(document);
+        insert(document);
 
         try {
             ParsedDocument parsed = extractors.get(format).extract(content, filename);
@@ -224,14 +283,28 @@ public class RagService {
     /* Helpers                                                             */
     /* ------------------------------------------------------------------ */
 
-    private boolean hasIndexedDocuments() {
-        return !documentRepository.findByStatusOrderByUploadedAtDesc(DocumentStatus.INDEXED)
-                .isEmpty();
+    /**
+     * The documents a search may draw from: those that finished ingesting.
+     *
+     * <p>The corpus is a curated handful of policy documents, so listing their ids costs one small
+     * indexed read and lets the restriction be pushed into the vector query itself.
+     */
+    private List<UUID> indexedDocumentIds() {
+        return documentRepository.findByStatusOrderByUploadedAtDesc(DocumentStatus.INDEXED).stream()
+                .map(KnowledgeDocument::getDocumentId)
+                .toList();
     }
 
     /**
      * A previous upload of the same file name is either an operator mistake (409) or the remains of
      * an ingestion that failed, in which case it is cleared out so the retry can proceed.
+     *
+     * <p>This check alone is a read-then-write and two concurrent uploads of the same name would
+     * both pass it. The real guarantee is the unique index on {@code lower(filename)} added in
+     * {@code V4__rag_fixes.sql}; {@link #insert(KnowledgeDocument)} turns the resulting constraint
+     * violation into the same {@code 409} this check produces, so the loser of the race gets the
+     * documented answer instead of a 500, and no second row can ever exist to make
+     * {@code findByFilenameIgnoreCase} throw.
      */
     private void replaceOrRejectExisting(String filename) {
         Optional<KnowledgeDocument> existing = documentRepository.findByFilenameIgnoreCase(filename);
@@ -246,6 +319,23 @@ public class RagService {
         deleteChunksQuietly(previous.getDocumentId());
         documentRepository.delete(previous);
         documentRepository.flush();
+    }
+
+    /**
+     * Writes the {@code PROCESSING} row, translating the unique-filename violation that a
+     * concurrent upload of the same name produces into the documented {@code 409}.
+     */
+    private void insert(KnowledgeDocument document) {
+        try {
+            documentRepository.saveAndFlush(document);
+        } catch (DataIntegrityViolationException e) {
+            UUID winner = documentRepository.findByFilenameIgnoreCase(document.getFilename())
+                    .map(KnowledgeDocument::getDocumentId)
+                    .orElse(null);
+            log.info("Concurrent upload of '{}' lost the race to {}", document.getFilename(),
+                    winner);
+            throw new DuplicateDocumentException(document.getFilename(), winner);
+        }
     }
 
     private KnowledgeDocument newDocument(String filename, KnowledgeFormat format, long sizeBytes,

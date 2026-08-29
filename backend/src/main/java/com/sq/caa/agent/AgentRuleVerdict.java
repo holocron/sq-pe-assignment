@@ -22,5 +22,8 @@ public record AgentRuleVerdict(
 
     public AgentRuleVerdict {
         transactionIds = transactionIds == null ? List.of() : List.copyOf(transactionIds);
+        // The rationale is rendered verbatim in the coverage table, so it gets the same
+        // cleaning as the final narrative - see Narrative.
+        rationale = Narrative.clean(rationale);
     }
 }

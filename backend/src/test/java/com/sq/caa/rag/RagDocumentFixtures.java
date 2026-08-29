@@ -129,6 +129,70 @@ final class RagDocumentFixtures {
         }
     }
 
+    /**
+     * A PDF with a real table: cells drawn at fixed x offsets under a bold heading, the way a
+     * policy exported from a word processor or a reporting tool renders a threshold schedule.
+     *
+     * <p>PDF has no notion of a table, so the only thing distinguishing this from prose is the
+     * horizontal gap between the cells - which is exactly what the extractor has to measure.
+     */
+    static byte[] tabulatedPdf() {
+        try (PDDocument document = new PDDocument();
+                ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            PDPage page = new PDPage();
+            document.addPage(page);
+            try (PDPageContentStream content = new PDPageContentStream(document, page)) {
+                textAt(content, bold(), 16, 60, 740, "Sanctions and High-Risk Jurisdictions Policy");
+                textAt(content, bold(), 13, 60, 700, "2.1 Comprehensive measures");
+                textAt(content, regular(), 11, 60, 675,
+                        "The jurisdictions below are subject to the regimes named against them.");
+                float y = 650;
+                for (String[] row : new String[][] {
+                        {"ISO-2", "Jurisdiction", "Regime"},
+                        {"IR", "Iran", "Comprehensive - UN, EU, OFAC, SECO"},
+                        {"KP", "North Korea", "Comprehensive - UN, EU, OFAC, SECO"},
+                        {"SY", "Syria", "Comprehensive - EU, OFAC, SECO"},
+                        {"RU", "Russian Federation", "Sectoral and financial - EU, OFAC, OFSI"}}) {
+                    textAt(content, regular(), 11, 60, y, row[0]);
+                    textAt(content, regular(), 11, 130, y, row[1]);
+                    textAt(content, regular(), 11, 260, y, row[2]);
+                    y -= 18;
+                }
+                textAt(content, regular(), 11, 60, y - 12,
+                        "Any exposure to a jurisdiction listed above is escalated immediately.");
+            }
+            document.save(out);
+            return out.toByteArray();
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not build the tabulated .pdf fixture", e);
+        }
+    }
+
+    /**
+     * A Word document whose body text inherited a {@code Heading 2} style - a common authoring
+     * accident, and one nothing in the format prevents.
+     */
+    static byte[] docxWithARunawayHeading(int headingCharacters) {
+        try (XWPFDocument document = new XWPFDocument();
+                ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            heading(document, "Runaway Heading Policy", 1);
+            StringBuilder runaway = new StringBuilder();
+            while (runaway.length() < headingCharacters) {
+                runaway.append("a reportable instruction is one that the officer records ");
+            }
+            heading(document, runaway.toString().strip(), 2);
+            for (int i = 0; i < 6; i++) {
+                body(document, "Paragraph " + i + " of the body sets out the review the officer "
+                        + "performs before the instruction is released to the beneficiary bank, "
+                        + "and the evidence that must be retained for the statutory period.");
+            }
+            document.write(out);
+            return out.toByteArray();
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not build the runaway-heading .docx fixture", e);
+        }
+    }
+
     /** A PDF that contains no text at all - the shape of a scanned document. */
     static byte[] textlessPdf() {
         try (PDDocument document = new PDDocument();
@@ -206,5 +270,15 @@ final class RagDocumentFixtures {
         content.setFont(font, size);
         content.newLine();
         content.showText(text);
+    }
+
+    /** Draws one string at an absolute position, which is how table cells are laid out. */
+    private static void textAt(PDPageContentStream content, PDType1Font font, float size, float x,
+            float y, String text) throws Exception {
+        content.beginText();
+        content.setFont(font, size);
+        content.newLineAtOffset(x, y);
+        content.showText(text);
+        content.endText();
     }
 }

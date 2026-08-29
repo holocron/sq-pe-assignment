@@ -358,17 +358,29 @@ export function RulesPage() {
           </>
         }
       >
-        <p className="text-sm text-muted">
-          This cannot be undone. Future analyses will no longer evaluate this rule, and the
-          maximum attainable risk score drops by{' '}
-          <span className="numeric font-medium text-fg">
-            {formatNumber(pendingDelete?.weight ?? 0, {
-              minimumFractionDigits: 2,
-              maximumFractionDigits: 2,
-            })}
-          </span>
-          .
-        </p>
+        <div className="flex flex-col gap-2 text-sm text-muted">
+          <p>
+            This cannot be undone. Future analyses will no longer evaluate this rule, and the
+            maximum attainable risk score drops by{' '}
+            <span className="numeric font-medium text-fg">
+              {formatNumber(pendingDelete?.weight ?? 0, {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2,
+              })}
+            </span>
+            .
+          </p>
+          {/* `risk_assessments` cascades on the rule, so past evidence goes with it. Completed
+              analyses still render their coverage table from their own stored trace, but the
+              per-(transaction, rule) audit rows are gone. Say so - a compliance tool must not
+              destroy evidence behind a dialog that only mentions the future. */}
+          <p>
+            The recorded evidence this rule contributed to{' '}
+            <span className="font-medium text-fg">past analyses</span> is deleted with it. Completed
+            analyses keep the coverage table they were saved with, but their per-transaction rows
+            for this rule are removed from the audit table.
+          </p>
+        </div>
       </Modal>
     </div>
   )

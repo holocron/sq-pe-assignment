@@ -9,6 +9,10 @@ import com.sq.caa.security.JwtAuthenticationEntryPoint;
 import com.sq.caa.security.JwtAuthenticationFilter;
 import com.sq.caa.security.JwtProperties;
 import com.sq.caa.security.JwtService;
+import com.sq.caa.security.LoginThrottle;
+import com.sq.caa.security.LoginThrottleProperties;
+import com.sq.caa.security.ThrottledAuthenticationManager;
+import java.time.Clock;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -42,7 +46,7 @@ import org.springframework.web.cors.CorsConfigurationSource;
 @Configuration
 @EnableWebSecurity
 @EnableMethodSecurity
-@EnableConfigurationProperties(JwtProperties.class)
+@EnableConfigurationProperties({JwtProperties.class, LoginThrottleProperties.class})
 public class SecurityConfig {
 
     private final JwtService jwtService;
@@ -66,12 +70,25 @@ public class SecurityConfig {
         return new BCryptPasswordEncoder();
     }
 
-    /** Username/password authentication, used by {@code POST /api/auth/login}. */
+    /** The login brute-force brake; see {@link LoginThrottle} for the limit it enforces. */
     @Bean
-    public AuthenticationManager authenticationManager(PasswordEncoder passwordEncoder) {
+    public LoginThrottle loginThrottle(LoginThrottleProperties properties) {
+        return new LoginThrottle(properties, Clock.systemUTC());
+    }
+
+    /**
+     * Username/password authentication, used by {@code POST /api/auth/login}.
+     *
+     * <p>Wrapped in {@link ThrottledAuthenticationManager} so the endpoint cannot be ground for
+     * guesses: repeated failures for one username from one address are refused before the password
+     * is checked at all. See {@link LoginThrottle} for the limit and its scope.
+     */
+    @Bean
+    public AuthenticationManager authenticationManager(PasswordEncoder passwordEncoder,
+            LoginThrottle loginThrottle) {
         DaoAuthenticationProvider provider = new DaoAuthenticationProvider(userDetailsService);
         provider.setPasswordEncoder(passwordEncoder);
-        return new ProviderManager(provider);
+        return new ThrottledAuthenticationManager(new ProviderManager(provider), loginThrottle);
     }
 
     @Bean

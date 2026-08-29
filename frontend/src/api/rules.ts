@@ -10,14 +10,18 @@ import { deleteJson, getJson, postJson, putJson } from './client'
 import type { ApiError } from './errors'
 import type { MutationOpts, QueryOpts } from './query'
 import { queryKeys } from './queryKeys'
-import type {
-  FieldCatalogEntry,
-  RiskRule,
-  RiskRuleInput,
-  RiskRuleWire,
-  RuleTestRequest,
-  RuleTestResult,
-  UUID,
+import {
+  RULE_OPERATORS,
+  type FieldCatalogEntry,
+  type FieldCatalogEntryWire,
+  type FieldType,
+  type RiskRule,
+  type RiskRuleInput,
+  type RiskRuleWire,
+  type RuleOperator,
+  type RuleTestRequest,
+  type RuleTestResult,
+  type UUID,
 } from './types'
 
 /** `threshold_logic` is a TEXT column, so it may arrive as a JSON string. */
@@ -52,9 +56,60 @@ export function deleteRule(ruleId: UUID): Promise<void> {
   return deleteJson(`/rules/${ruleId}`)
 }
 
+/**
+ * `rules/FieldType` is a plain Java enum with no `@JsonValue`, so the catalog
+ * arrives with UPPER CASE type names. The editor's operator table, value
+ * widgets and validators all key off the lowercase `FieldType` union, so the
+ * name is folded here — the single place the two vocabularies meet.
+ */
+const FIELD_TYPE_ALIASES: Record<string, FieldType> = {
+  number: 'number',
+  integer: 'number',
+  decimal: 'number',
+  string: 'string',
+  text: 'string',
+  enum: 'enum',
+  boolean: 'boolean',
+  bool: 'boolean',
+  datetime: 'datetime',
+  timestamp: 'datetime',
+  instant: 'datetime',
+  date: 'date',
+}
+
+/** Unknown types degrade to `string`, which supports every text operator. */
+function toFieldType(wire: string | null | undefined): FieldType {
+  return FIELD_TYPE_ALIASES[String(wire ?? '').toLowerCase()] ?? 'string'
+}
+
+function toOperators(wire: readonly string[] | null | undefined): RuleOperator[] | null {
+  if (!Array.isArray(wire) || wire.length === 0) return null
+  const known = wire.filter((operator): operator is RuleOperator =>
+    (RULE_OPERATORS as readonly string[]).includes(operator),
+  )
+  return known.length > 0 ? known : null
+}
+
+/** Maps `RuleDtos.FieldCatalogEntry` onto the shape the visual editor reads. */
+export function normalizeFieldCatalogEntry(wire: FieldCatalogEntryWire): FieldCatalogEntry {
+  const options = Array.isArray(wire.options) ? wire.options.filter(Boolean) : []
+  return {
+    field: wire.field,
+    type: toFieldType(wire.type),
+    label: wire.label ?? null,
+    notes: wire.description ?? null,
+    values: options.length > 0 ? options : null,
+    valuesClosed: wire.optionsClosed ?? null,
+    operators: toOperators(wire.operators),
+    appliesTo: wire.appliesTo ?? null,
+    nullable: wire.nullable ?? null,
+  }
+}
+
 /** `GET /api/rules/field-catalog` (ADMIN) */
 export async function fetchFieldCatalog(): Promise<FieldCatalogEntry[]> {
-  return (await getJson<FieldCatalogEntry[]>('/rules/field-catalog')) ?? []
+  const wire = await getJson<FieldCatalogEntryWire[]>('/rules/field-catalog')
+  return (wire ?? []).map(normalizeFieldCatalogEntry)
 }
 
 /** `POST /api/rules/test` (ADMIN) */
@@ -64,6 +119,7 @@ export async function testRule(request: RuleTestRequest): Promise<RuleTestResult
     ...result,
     sampleMatches: result.sampleMatches ?? [],
     degraded: Boolean(result.degraded),
+    notes: Array.isArray(result.notes) ? result.notes.filter(Boolean) : [],
   }
 }
 

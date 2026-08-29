@@ -16,8 +16,14 @@ import { formatBytes } from '../../lib/format'
 const EXTENSIONS: readonly string[] = ACCEPTED_KNOWLEDGE_EXTENSIONS
 const MIME_TYPES: readonly string[] = ACCEPTED_KNOWLEDGE_MIME_TYPES
 
-/** Client-side ceiling; keeps a 100 MB drag-and-drop out of the upload queue. */
-export const MAX_KNOWLEDGE_FILE_BYTES = 25 * 1024 * 1024
+/**
+ * The server's own ceiling, mirrored exactly: `caa.rag.max-upload-bytes`
+ * defaults to 20 MiB and `RagService.ingest` rejects anything above it. Setting
+ * a higher value here would let the browser upload a file in full only for the
+ * server to refuse it, while the dropzone advertised a limit that does not
+ * exist. Keep the two in step.
+ */
+export const MAX_KNOWLEDGE_FILE_BYTES = 20 * 1024 * 1024
 
 /** Value for the `accept` attribute of the file input. */
 export const KNOWLEDGE_ACCEPT_ATTRIBUTE = [

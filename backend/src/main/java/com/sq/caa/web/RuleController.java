@@ -1,9 +1,11 @@
 package com.sq.caa.web;
 
 import com.sq.caa.domain.RiskRule;
+import com.sq.caa.domain.RuleScope;
 import com.sq.caa.rules.DuplicateRuleNameException;
 import com.sq.caa.rules.FieldDefinition;
 import com.sq.caa.rules.RuleNotFoundException;
+import com.sq.caa.rules.RuleParser;
 import com.sq.caa.rules.RuleValidationException;
 import com.sq.caa.rules.UnknownCustomerException;
 import com.sq.caa.security.SecurityRoles;
@@ -35,6 +37,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
+import tools.jackson.databind.JsonNode;
 
 /**
  * Risk rule administration.
@@ -70,6 +73,7 @@ public class RuleController {
     @PreAuthorize(SecurityRoles.IS_ADMIN)
     @ResponseStatus(HttpStatus.CREATED)
     public RiskRuleDto create(@Valid @RequestBody RuleUpsertRequest request) {
+        validateAgainstScope(request.thresholdLogic(), request.appliesTo());
         RiskRule rule = riskRuleService.create(request.ruleName(), request.appliesTo(),
                 request.thresholdLogic(), request.weight());
         return RiskRuleDto.from(rule);
@@ -79,6 +83,7 @@ public class RuleController {
     @PutMapping("/{ruleId}")
     @PreAuthorize(SecurityRoles.IS_ADMIN)
     public RiskRuleDto update(@PathVariable UUID ruleId, @Valid @RequestBody RuleUpsertRequest request) {
+        validateAgainstScope(request.thresholdLogic(), request.appliesTo());
         RiskRule rule = riskRuleService.update(ruleId, request.ruleName(), request.appliesTo(),
                 request.thresholdLogic(), request.weight());
         return RiskRuleDto.from(rule);
@@ -104,8 +109,25 @@ public class RuleController {
     @PostMapping("/test")
     @PreAuthorize(SecurityRoles.IS_ADMIN)
     public RuleTestResponse test(@Valid @RequestBody RuleTestRequest request) {
+        validateAgainstScope(request.thresholdLogic(), request.appliesTo());
         return RuleTestResponse.from(riskRuleService.testRule(request.thresholdLogic(),
                 request.appliesTo(), request.customerId()));
+    }
+
+    /**
+     * Refuses logic that cannot fire under the scope it is being saved with - a CARD rule reading
+     * {@code payment.*}, for instance, which would validate cleanly against the catalog and then
+     * evaluate to false on every transaction for ever.
+     *
+     * <p>Applied on create, replace and "Test rule" so the three give the same verdict. The service
+     * re-parses the same document when it canonicalises it for storage; this call is the scope-aware
+     * half of that contract and runs before anything is written.
+     */
+    private static void validateAgainstScope(JsonNode thresholdLogic, RuleScope appliesTo) {
+        if (thresholdLogic == null || thresholdLogic.isNull() || thresholdLogic.isMissingNode()) {
+            throw new RuleValidationException("$", null, "thresholdLogic is required");
+        }
+        RuleParser.parseStrict(thresholdLogic, appliesTo == null ? RuleScope.ALL : appliesTo);
     }
 
     // ------------------------------------------------------------------

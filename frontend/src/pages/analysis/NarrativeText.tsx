@@ -30,7 +30,7 @@ export function NarrativeText({
           return (
             <h4
               key={`heading-${index}`}
-              className="text-2xs font-semibold tracking-caption text-muted uppercase"
+              className="text-2xs font-semibold tracking-caption break-words text-muted uppercase"
             >
               {block.text}
             </h4>
@@ -45,14 +45,14 @@ export function NarrativeText({
                     aria-hidden="true"
                     className="mt-2 size-1.5 shrink-0 rounded-full bg-accent"
                   />
-                  <span className="min-w-0">{item}</span>
+                  <span className="min-w-0 break-words">{item}</span>
                 </li>
               ))}
             </ul>
           )
         }
         return (
-          <p key={`paragraph-${index}`} className="text-sm leading-relaxed text-fg">
+          <p key={`paragraph-${index}`} className="text-sm leading-relaxed break-words text-fg">
             {block.text}
           </p>
         )

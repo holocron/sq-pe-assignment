@@ -12,6 +12,7 @@ import {
   DocumentUploader,
   extractQueryTerms,
   highlightSegments,
+  MAX_KNOWLEDGE_FILE_BYTES,
   normalizeSimilarity,
   similarityBand,
   validateKnowledgeFile,
@@ -307,5 +308,36 @@ describe('KnowledgeSearchPage', () => {
 
     expect(await screen.findByText('Search failed')).toBeInTheDocument()
     expect(screen.getByText('The vector store is not reachable.')).toBeInTheDocument()
+  })
+})
+
+/**
+ * The client cap is a mirror of the server's, not a policy of its own:
+ * `caa.rag.max-upload-bytes` defaults to 20 MiB and `RagService.ingest`
+ * rejects above it. A larger client cap advertises a limit that does not
+ * exist and wastes a full-size upload before the 400 comes back.
+ */
+describe('knowledge upload size cap', () => {
+  function fileOfSize(bytes: number): File {
+    const file = new File(['x'], 'policy.pdf', { type: 'application/pdf' })
+    Object.defineProperty(file, 'size', { value: bytes })
+    return file
+  }
+
+  it('matches the 20 MiB ceiling the backend enforces', () => {
+    expect(MAX_KNOWLEDGE_FILE_BYTES).toBe(20 * 1024 * 1024)
+  })
+
+  it('rejects a document the server would refuse, before it is uploaded', () => {
+    const result = validateKnowledgeFile(fileOfSize(22 * 1024 * 1024))
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.reason).toBe('size')
+      expect(result.message).toContain('20 MB')
+    }
+  })
+
+  it('accepts a document inside the ceiling', () => {
+    expect(validateKnowledgeFile(fileOfSize(19 * 1024 * 1024)).ok).toBe(true)
   })
 })

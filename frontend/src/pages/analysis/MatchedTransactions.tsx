@@ -21,13 +21,15 @@ import { formatDateTime, formatMoney, shortId } from '../../lib/format'
 const DEFAULT_LIMIT = 8
 
 export interface MatchedTransactionsProps {
-  transactionIds: UUID[]
+  /** `RuleEvaluationView.matchedTransactionIds`; tolerates a missing array. */
+  transactionIds: UUID[] | null | undefined
   className?: string
 }
 
 export function MatchedTransactions({ transactionIds, className }: MatchedTransactionsProps) {
   const [showAll, setShowAll] = useState(false)
-  const visibleIds = showAll ? transactionIds : transactionIds.slice(0, DEFAULT_LIMIT)
+  const ids = Array.isArray(transactionIds) ? transactionIds : []
+  const visibleIds = showAll ? ids : ids.slice(0, DEFAULT_LIMIT)
 
   const results = useQueries({
     queries: visibleIds.map((transactionId) => ({
@@ -37,7 +39,7 @@ export function MatchedTransactions({ transactionIds, className }: MatchedTransa
     })),
   })
 
-  if (transactionIds.length === 0) {
+  if (ids.length === 0) {
     return (
       <p className={cn('text-xs text-muted', className)}>
         No transaction matched this rule.
@@ -50,7 +52,7 @@ export function MatchedTransactions({ transactionIds, className }: MatchedTransa
   const rows = results.flatMap((result, index) =>
     result.data ? [{ id: visibleIds[index] as UUID, transaction: result.data }] : [],
   )
-  const hidden = transactionIds.length - visibleIds.length
+  const hidden = ids.length - visibleIds.length
 
   return (
     <div className={cn('space-y-2', className)}>

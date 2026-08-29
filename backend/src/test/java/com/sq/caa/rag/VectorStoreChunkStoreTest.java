@@ -118,7 +118,8 @@ class VectorStoreChunkStoreTest {
                 .score(0.812345678d)
                 .build());
 
-        List<RetrievedChunk> chunks = chunkStore.search("reporting threshold", 5);
+        List<RetrievedChunk> chunks =
+                chunkStore.search("reporting threshold", 5, List.of(DOCUMENT_ID));
 
         assertThat(chunks).hasSize(1);
         RetrievedChunk chunk = chunks.get(0);
@@ -130,6 +131,32 @@ class VectorStoreChunkStoreTest {
         assertThat(chunk.citation()).isEqualTo("aml.docx > 2. Thresholds");
         assertThat(vectorStore.lastRequest.getTopK()).isEqualTo(5);
         assertThat(vectorStore.lastRequest.getQuery()).isEqualTo("reporting threshold");
+    }
+
+    @Test
+    @DisplayName("search is restricted to the given documents, inside the query rather than after it")
+    void searchFiltersOnTheOwningDocuments() {
+        UUID other = UUID.fromString("11111111-2222-4333-8444-555555555555");
+
+        chunkStore.search("reporting threshold", 5, List.of(DOCUMENT_ID, other));
+
+        Filter.Expression filter = vectorStore.lastRequest.getFilterExpression();
+        assertThat(filter)
+                .as("without a filter expression the query ranks over every row in the table, "
+                        + "including chunks of PROCESSING and FAILED documents")
+                .isNotNull();
+        assertThat(filter.type()).isEqualTo(Filter.ExpressionType.IN);
+        assertThat(filter.left()).isEqualTo(new Filter.Key("document_id"));
+        assertThat(filter.right()).isEqualTo(
+                new Filter.Value(List.of(DOCUMENT_ID.toString(), other.toString())));
+    }
+
+    @Test
+    @DisplayName("a search with no searchable document never reaches the embedding model")
+    void searchWithoutAnyDocumentShortCircuits() {
+        assertThat(chunkStore.search("reporting threshold", 5, List.of())).isEmpty();
+
+        assertThat(vectorStore.lastRequest).isNull();
     }
 
     @Test

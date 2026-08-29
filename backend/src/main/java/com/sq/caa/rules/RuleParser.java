@@ -1,5 +1,6 @@
 package com.sq.caa.rules;
 
+import com.sq.caa.domain.RuleScope;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -24,8 +25,9 @@ import tools.jackson.databind.node.ObjectNode;
  * <ul>
  *   <li>{@link #parse(String)} - structural only. Used at evaluation time, where a rule that
  *       references an unknown field must still evaluate (to false, degraded) instead of exploding.
- *   <li>{@link #parseStrict(String)} - structural plus unknown-key rejection plus the semantic
- *       checks of {@link RuleValidator}. Used on every write.
+ *   <li>{@link #parseStrict(String, RuleScope)} - structural plus unknown-key rejection plus the
+ *       semantic checks of {@link RuleValidator}, against the scope the rule will be evaluated with.
+ *       Used on every write; the scope-less overloads validate as {@code ALL}.
  * </ul>
  */
 public final class RuleParser {
@@ -64,13 +66,27 @@ public final class RuleParser {
 
     /** Structural parse plus unknown-key and semantic validation. Used for writes. */
     public static RuleNode parseStrict(String json) {
-        return parseStrict(readTree(json));
+        return parseStrict(readTree(json), RuleScope.ALL);
     }
 
     /** Structural parse plus unknown-key and semantic validation. Used for writes. */
     public static RuleNode parseStrict(JsonNode root) {
+        return parseStrict(root, RuleScope.ALL);
+    }
+
+    /**
+     * Structural parse plus unknown-key and semantic validation against the scope the rule will run
+     * with, which is what every write path must use: a leaf naming a field of another activity type
+     * can never match and is refused here rather than sitting in the table.
+     */
+    public static RuleNode parseStrict(String json, RuleScope scope) {
+        return parseStrict(readTree(json), scope);
+    }
+
+    /** Scope-aware strict parse of an already-read tree. */
+    public static RuleNode parseStrict(JsonNode root, RuleScope scope) {
         RuleNode node = parseInternal(root, true);
-        RuleValidator.validate(node);
+        RuleValidator.validate(node, scope);
         return node;
     }
 

@@ -105,6 +105,10 @@ function CoverageRow({ evaluation, rule, expanded, onToggle }: CoverageRowProps)
   const disputed = evaluation.disagreement === true
   const weight = evaluation.weight ?? rule?.weight ?? null
   const appliesTo = evaluation.appliesTo ?? rule?.appliesTo ?? null
+  /* `matchedTransactionIds` is the wire name; a run that failed before the
+     evidence was recorded may omit it, so never dereference it blind. */
+  const matchedIds = evaluation.matchedTransactionIds ?? []
+  const degradationNotes = evaluation.degradationNotes ?? []
 
   return (
     <Fragment>
@@ -173,7 +177,7 @@ function CoverageRow({ evaluation, rule, expanded, onToggle }: CoverageRowProps)
           )}
         >
           {triggered ? '+' : ''}
-          {formatNumber(evaluation.scoreContribution, {
+          {formatNumber(evaluation.score, {
             minimumFractionDigits: 2,
             maximumFractionDigits: 2,
           })}
@@ -213,6 +217,15 @@ function CoverageRow({ evaluation, rule, expanded, onToggle }: CoverageRowProps)
                   </p>
                 </section>
 
+                {evaluation.explanation ? (
+                  <section>
+                    <h4 className={CAPTION}>Deterministic engine</h4>
+                    <p className="mt-1 text-xs leading-relaxed text-muted">
+                      {evaluation.explanation}
+                    </p>
+                  </section>
+                ) : null}
+
                 <section>
                   <h4 className={CAPTION}>Verdict source</h4>
                   <p className="mt-1 text-xs leading-relaxed text-muted">
@@ -224,6 +237,17 @@ function CoverageRow({ evaluation, rule, expanded, onToggle }: CoverageRowProps)
                       : ''}
                   </p>
                 </section>
+
+                {degradationNotes.length > 0 ? (
+                  <section>
+                    <h4 className={CAPTION}>Degraded conditions</h4>
+                    <ul className="mt-1 space-y-1 text-xs leading-relaxed text-warning-fg">
+                      {degradationNotes.map((note) => (
+                        <li key={note}>{note}</li>
+                      ))}
+                    </ul>
+                  </section>
+                ) : null}
 
                 {rule ? (
                   <section>
@@ -241,14 +265,14 @@ function CoverageRow({ evaluation, rule, expanded, onToggle }: CoverageRowProps)
               <section>
                 <h4 className={CAPTION}>
                   Matched transactions
-                  {evaluation.transactionIds.length > 0 ? (
+                  {matchedIds.length > 0 ? (
                     <span className="numeric ml-1.5 font-normal text-subtle">
-                      {evaluation.transactionIds.length}
+                      {matchedIds.length}
                     </span>
                   ) : null}
                 </h4>
                 <div className="mt-1.5">
-                  <MatchedTransactions transactionIds={evaluation.transactionIds} />
+                  <MatchedTransactions transactionIds={matchedIds} />
                 </div>
               </section>
             </div>

@@ -16,16 +16,17 @@ import org.springframework.ai.chat.prompt.Prompt;
  *
  * <p>The coverage gate is a property of the loop, not of the model, so it has to be testable without
  * one. This fake lets a test say "on turn three the model tries to finish while two rules are still
- * open" and then assert what the loop did about it. Every prompt the loop built is recorded, so the
- * test can also check that the reprompt actually named the missing rules.
+ * open" - or "on turn three the model server dies" - and then assert what the loop did about it.
+ * Every prompt the loop built is recorded, so the test can also check that the reprompt actually
+ * named the missing rules.
  */
 final class ScriptedChatModel implements ChatModel {
 
-    private final List<AssistantMessage> script;
+    private final List<Turn> script;
     private final List<Prompt> prompts = new ArrayList<>();
     private final AtomicInteger turn = new AtomicInteger();
 
-    ScriptedChatModel(List<AssistantMessage> script) {
+    ScriptedChatModel(List<Turn> script) {
         this.script = List.copyOf(script);
     }
 
@@ -33,10 +34,10 @@ final class ScriptedChatModel implements ChatModel {
     public ChatResponse call(Prompt prompt) {
         prompts.add(prompt);
         int index = turn.getAndIncrement();
-        AssistantMessage message = index < script.size()
+        Turn scripted = index < script.size()
                 ? script.get(index)
-                : new AssistantMessage("I have nothing further to add.");
-        return new ChatResponse(List.of(new Generation(message)));
+                : new Speak(new AssistantMessage("I have nothing further to add."));
+        return scripted.respond();
     }
 
     /** How many turns the loop actually consumed. */
@@ -62,24 +63,67 @@ final class ScriptedChatModel implements ChatModel {
         return texts;
     }
 
+    /** The system message of the last prompt, i.e. the standing instructions the model was given. */
+    String systemMessage() {
+        for (Prompt prompt : prompts) {
+            for (Message message : prompt.getInstructions()) {
+                if (message.getMessageType() == MessageType.SYSTEM) {
+                    return message.getText();
+                }
+            }
+        }
+        return null;
+    }
+
     // ------------------------------------------------------------------
     // Script building
     // ------------------------------------------------------------------
 
+    /** One scripted model turn. */
+    interface Turn {
+
+        ChatResponse respond();
+    }
+
     /** A turn where the model just talks - which, for this loop, means "I am finished". */
-    static AssistantMessage says(String text) {
-        return new AssistantMessage(text);
+    static Turn says(String text) {
+        return new Speak(new AssistantMessage(text));
     }
 
     /** A turn where the model calls one tool. */
-    static AssistantMessage calls(String tool, String argumentsJson) {
+    static Turn calls(String tool, String argumentsJson) {
         return callsAll(new AssistantMessage.ToolCall("call-" + tool + "-" + COUNTER.incrementAndGet(),
                 "function", tool, argumentsJson));
     }
 
-    /** A turn where the model calls several tools at once. */
-    static AssistantMessage callsAll(AssistantMessage.ToolCall... calls) {
-        return AssistantMessage.builder().content("").toolCalls(List.of(calls)).build();
+    /** A turn where the model calls several tools at once, executed in the order given. */
+    static Turn callsAll(AssistantMessage.ToolCall... calls) {
+        return new Speak(AssistantMessage.builder().content("").toolCalls(List.of(calls)).build());
+    }
+
+    /** One tool call, for building a multi-call turn with {@link #callsAll}. */
+    static AssistantMessage.ToolCall call(String tool, String argumentsJson) {
+        return new AssistantMessage.ToolCall("call-" + tool + "-" + COUNTER.incrementAndGet(),
+                "function", tool, argumentsJson);
+    }
+
+    /**
+     * A turn where the model server fails - a dropped connection, a 500, an overloaded backend. The
+     * loop must settle the coverage set from whatever the agent had already established rather than
+     * losing the run.
+     */
+    static Turn fails(RuntimeException error) {
+        return () -> {
+            throw error;
+        };
+    }
+
+    private record Speak(AssistantMessage message) implements Turn {
+
+        @Override
+        public ChatResponse respond() {
+            return new ChatResponse(List.of(new Generation(message)));
+        }
     }
 
     private static final AtomicInteger COUNTER = new AtomicInteger();

@@ -191,11 +191,29 @@ public class RiskAgentLoop {
                 if (context.consumeConclusionRejected()) {
                     // The gate fired inside submit_final_assessment, which already recorded the
                     // coverage_reprompt step. Name the outstanding rules and keep going.
+                    List<RiskRule> stillMissing = context.missingRules();
+                    if (stillMissing.isEmpty()) {
+                        // A later tool call in the same batch closed the coverage set - the model
+                        // emitted [submit_final_assessment, submit_rule_evaluation] in one turn.
+                        // Telling it that "0 rule(s) still have no verdict" would be a lie and would
+                        // burn a coverage reprompt on a run that is now ready to conclude; ask it for
+                        // the conclusion instead.
+                        if (++conclusionReprompts > properties.maxCoverageReprompts()) {
+                            context.trace().reprompt("The model kept concluding before its own last "
+                                    + "verdict landed; the deterministic scores stand on their own.");
+                            break;
+                        }
+                        context.trace().reprompt("The final assessment was rejected because a rule was "
+                                + "still open when it arrived, but the same turn closed the coverage "
+                                + "set. Asking the model to submit the assessment again.");
+                        history.add(new UserMessage(AgentPrompts.conclusionReprompt()));
+                        continue;
+                    }
                     if (++coverageReprompts > properties.maxCoverageReprompts()) {
                         logExhausted(context);
                         break;
                     }
-                    history.add(new UserMessage(AgentPrompts.coverageReprompt(context.missingRules())));
+                    history.add(new UserMessage(AgentPrompts.coverageReprompt(stillMissing)));
                     continue;
                 }
                 if (context.isConcluded()) {
@@ -224,6 +242,21 @@ public class RiskAgentLoop {
                 continue;
             }
             if (!context.isConcluded()) {
+                // Coverage is complete at this point - the block above returned otherwise - so a
+                // conclusion the model wrote as prose instead of calling the tool is a formatting
+                // failure, not a missing analysis. Observed live: the model printed the exact JSON
+                // the tool wanted inside a paragraph, and the loop paid two more round trips of an
+                // 8m36s run to get the same answer through the tool. Accept it, and record in the
+                // trace that it arrived as prose.
+                FinalAssessment written = FinalAssessmentParser.parse(text, jsonMapper);
+                if (written != null) {
+                    context.conclude(written);
+                    context.trace().proseFinal(written.riskLevel().name(), written.summary());
+                    log.info("Analysis {}: the model wrote its final assessment as prose; every rule "
+                            + "already had a verdict, so it was accepted without another round trip",
+                            context.assessmentId());
+                    break;
+                }
                 if (++conclusionReprompts > properties.maxCoverageReprompts()) {
                     context.trace().reprompt("The model stopped without submitting an assessment; the "
                             + "deterministic scores stand on their own.");

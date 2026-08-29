@@ -11,14 +11,10 @@ import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.StringJoiner;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 import org.springframework.stereotype.Component;
 
 /**
@@ -41,6 +37,11 @@ import org.springframework.stereotype.Component;
  * a full-string match. Both choices favour the false positive over the false negative, which is the
  * asymmetric cost this domain has.
  *
+ * <p>Degenerate text operands are the exception: a blank {@code CONTAINS} / {@code NOT_CONTAINS}
+ * needle or {@code MATCHES} pattern would match every value or none regardless of the data, so it is
+ * reported as a degraded false instead of being silently honoured. {@code MATCHES} additionally runs
+ * under the length, backtracking and cache bounds of {@link Regexes}.
+ *
  * <p>Stateless and thread-safe.
  */
 @Component
@@ -51,8 +52,6 @@ public class RuleEvaluator {
 
     /** Longest degradation note list carried on a result. */
     private static final int MAX_NOTES = 10;
-
-    private static final Map<String, Optional<Pattern>> PATTERNS = new ConcurrentHashMap<>();
 
     // ------------------------------------------------------------------
     // Rule level
@@ -116,10 +115,11 @@ public class RuleEvaluator {
         if (node == null || batch == null) {
             return ScopedEvaluation.empty();
         }
-        List<Transaction> inScope = batch.transactionsFor(scope);
+        RuleScope effectiveScope = scope == null ? RuleScope.ALL : scope;
+        List<Transaction> inScope = batch.transactionsFor(effectiveScope);
         List<RuleMatch> matches = new ArrayList<>();
-        Set<String> notes = new LinkedHashSet<>();
-        boolean degraded = false;
+        Set<String> notes = new LinkedHashSet<>(unreachableFieldNotes(node, effectiveScope));
+        boolean degraded = !notes.isEmpty();
 
         for (Transaction transaction : inScope) {
             TransactionFacts facts = batch.factsFor(transaction);
@@ -137,6 +137,30 @@ public class RuleEvaluator {
             }
         }
         return new ScopedEvaluation(inScope.size(), matches, degraded, limit(notes));
+    }
+
+    /**
+     * Fields the rule reads that cannot exist on the activity type it is scoped to.
+     *
+     * <p>Writes are refused by {@link RuleValidator}, but a rule stored before that check - or
+     * written straight into {@code risk_rules} - would otherwise report "did not trigger" for ever,
+     * which is indistinguishable from a customer with nothing to find. Reported once per rule, not
+     * once per transaction, and only for a narrowed scope: an {@code ALL}-scoped rule reaching into
+     * one activity type is ordinary and stays clean.
+     */
+    private static Set<String> unreachableFieldNotes(RuleNode node, RuleScope scope) {
+        if (scope == RuleScope.ALL) {
+            return Set.of();
+        }
+        Set<String> notes = new LinkedHashSet<>();
+        for (String field : node.referencedFields()) {
+            FieldCatalog.find(field)
+                    .filter(definition -> !definition.availableIn(scope))
+                    .ifPresent(definition -> notes.add("'" + field + "' exists only on "
+                            + definition.appliesTo() + " activity, so it can never resolve on a "
+                            + scope + " rule"));
+        }
+        return notes;
     }
 
     private NodeOutcome evaluateSafely(RuleNode node, TransactionFacts facts) {
@@ -405,47 +429,49 @@ public class RuleEvaluator {
                 yield NodeOutcome.of(matched, trace(condition, rendered, matched, null));
             }
             case CONTAINS, NOT_CONTAINS -> {
-                List<Object> needles = Values.asList(value);
-                if (needles.isEmpty()) {
-                    yield mismatch(condition, rendered, operator + " needs a value");
-                }
+                // A blank needle is degenerate, not a filter: every string contains "" and none is
+                // missing it, so accepting one would silently fire the rule on every transaction
+                // (CONTAINS) or on none (NOT_CONTAINS). Writes reject it; stored rules that predate
+                // that check degrade here rather than lying. Blank elements of a list are skipped,
+                // mirroring how the numeric IN branch skips values it cannot compare.
                 boolean found = false;
-                for (Object needle : needles) {
+                boolean anyUsable = false;
+                for (Object needle : Values.asList(value)) {
                     String operand = Values.toText(needle);
-                    if (operand != null && !operand.isEmpty()
-                            && lower.contains(operand.trim().toLowerCase(Locale.ROOT))) {
+                    if (operand == null || operand.isBlank()) {
+                        continue;
+                    }
+                    anyUsable = true;
+                    if (lower.contains(operand.trim().toLowerCase(Locale.ROOT))) {
                         found = true;
                         break;
                     }
+                }
+                if (!anyUsable) {
+                    yield mismatch(condition, rendered, operator + " needs a non-blank text value");
                 }
                 boolean matched = operator == RuleOperator.CONTAINS ? found : !found;
                 yield NodeOutcome.of(matched, trace(condition, rendered, matched, null));
             }
             case MATCHES -> {
                 String regex = Values.toText(value);
-                if (regex == null) {
-                    yield mismatch(condition, rendered, "MATCHES needs a regular expression");
-                }
-                Optional<Pattern> pattern = pattern(regex);
-                if (pattern.isEmpty()) {
-                    yield mismatch(condition, rendered, "'" + regex + "' is not a valid regular expression");
-                }
-                boolean matched = pattern.get().matcher(actual).find();
-                yield NodeOutcome.of(matched, trace(condition, rendered, matched, null));
+                yield switch (Regexes.search(regex, actual)) {
+                    case MATCH -> NodeOutcome.of(true, trace(condition, rendered, true, null));
+                    case NO_MATCH -> NodeOutcome.of(false, trace(condition, rendered, false, null));
+                    case BLANK -> mismatch(condition, rendered,
+                            "MATCHES needs a non-blank regular expression");
+                    case TOO_LONG -> mismatch(condition, rendered, "regular expression is longer than "
+                            + Regexes.MAX_PATTERN_LENGTH + " characters");
+                    case INVALID -> mismatch(condition, rendered,
+                            "'" + regex + "' is not a valid regular expression");
+                    case BUDGET_EXCEEDED -> mismatch(condition, rendered,
+                            "regular expression was abandoned after " + Regexes.MAX_MATCH_STEPS
+                                    + " steps without deciding");
+                };
             }
             default -> mismatch(condition, rendered,
                     operator + " is not defined for the text field '" + condition.field() + "'");
         };
-    }
-
-    private static Optional<Pattern> pattern(String regex) {
-        return PATTERNS.computeIfAbsent(regex, key -> {
-            try {
-                return Optional.of(Pattern.compile(key, Pattern.CASE_INSENSITIVE));
-            } catch (PatternSyntaxException e) {
-                return Optional.empty();
-            }
-        });
     }
 
     // ------------------------------------------------------------------

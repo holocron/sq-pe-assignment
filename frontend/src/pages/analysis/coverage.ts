@@ -53,7 +53,7 @@ export function coverageStats(analysis: CoverageInput): CoverageStats {
   const agentCount = evaluations.filter((item) => item.source === 'AGENT').length
   const disagreements = evaluations.filter((item) => item.disagreement === true).length
   const scoreFromRules = evaluations.reduce(
-    (sum, item) => sum + (Number.isFinite(item.scoreContribution) ? item.scoreContribution : 0),
+    (sum, item) => sum + (Number.isFinite(item.score) ? item.score : 0),
     0,
   )
 
@@ -113,7 +113,7 @@ export function sortRuleEvaluations(evaluations: readonly RuleEvaluation[]): Rul
   return [...evaluations].sort((a, b) => {
     if (a.triggered !== b.triggered) return a.triggered ? -1 : 1
     if (a.triggered && b.triggered) {
-      const diff = (b.scoreContribution ?? 0) - (a.scoreContribution ?? 0)
+      const diff = (b.score ?? 0) - (a.score ?? 0)
       if (diff !== 0) return diff
     }
     return a.ruleName.localeCompare(b.ruleName)

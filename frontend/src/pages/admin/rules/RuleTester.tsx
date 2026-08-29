@@ -250,8 +250,15 @@ export function RuleTester({ thresholdLogic, appliesTo, issueCount, className }:
               ) : (
                 <Badge tone="neutral">All conditions evaluated</Badge>
               )}
-              {result.message ? (
-                <p className="w-full text-2xs text-muted">{result.message}</p>
+              {/* `notes` carries the concrete reason a leaf could not be
+                  evaluated — without it the badge alone tells the admin
+                  nothing about which condition to fix. */}
+              {result.notes.length > 0 ? (
+                <ul className="w-full space-y-0.5 text-2xs leading-relaxed text-warning-fg">
+                  {result.notes.map((note) => (
+                    <li key={note}>{note}</li>
+                  ))}
+                </ul>
               ) : null}
             </div>
             <Table

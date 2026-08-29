@@ -8,6 +8,7 @@ import com.sq.caa.repository.projection.CurrencyCount;
 import com.sq.caa.repository.projection.StatusCount;
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -118,6 +119,42 @@ public interface TransactionRepository
     // ---------------------------------------------------------------------
     // Dashboard aggregates
     // ---------------------------------------------------------------------
+
+    /**
+     * Per-(customer, currency) rollup for a whole page of customers in a single statement.
+     *
+     * <p>This is what keeps the customer list free of an N+1: the dashboard's activity columns are
+     * resolved for every id on the page at once instead of once per row. Grouping by currency as
+     * well as by customer keeps the sums honest - amounts in different currencies are never added
+     * together - and {@code max(createdAt)} rides along so the "last activity" column costs nothing
+     * extra.
+     */
+    @Query("""
+            select t.customer.customerId as customerId,
+                   t.currency as currency,
+                   count(t) as txCount,
+                   sum(t.amount) as totalAmount,
+                   max(t.createdAt) as lastActivityAt
+            from Transaction t
+            where t.customer.customerId in :customerIds
+            group by t.customer.customerId, t.currency
+            """)
+    List<CustomerCurrencyTotal> aggregateByCustomerAndCurrency(
+            @Param("customerIds") Collection<UUID> customerIds);
+
+    /** One (customer, currency) bucket of {@link #aggregateByCustomerAndCurrency}. */
+    interface CustomerCurrencyTotal {
+
+        UUID getCustomerId();
+
+        String getCurrency();
+
+        long getTxCount();
+
+        BigDecimal getTotalAmount();
+
+        Instant getLastActivityAt();
+    }
 
     /** Counts and sums per activity type. Returns one row per activity type the customer actually has. */
     @Query("""

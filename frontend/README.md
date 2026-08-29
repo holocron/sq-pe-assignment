@@ -120,8 +120,10 @@ Behaviour that depends on the backend beyond the plain contract:
    tolerate a JSON string because the column is `TEXT`.
 6. Knowledge `KnowledgeChunk.score` is treated as similarity (higher is better). A pgvector
    *distance* must be converted server-side or the similarity meter reads inverted.
-7. Uploads are rejected client-side above 25 MB, so
-   `spring.servlet.multipart.max-file-size` should be at least that.
+7. Uploads are rejected client-side above 20 MiB, which is the server's own
+   `caa.rag.max-upload-bytes` (20971520). `spring.servlet.multipart.max-file-size` is
+   deliberately larger (25 MB) so an oversized file is refused by the application with a
+   `problem+json` body rather than by the servlet container.
 
 ## Placeholder assets
 

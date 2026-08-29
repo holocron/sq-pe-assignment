@@ -1,5 +1,5 @@
 import { X } from 'lucide-react'
-import { useCallback, useEffect, useRef, type ReactNode } from 'react'
+import { useEffect, useRef, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { cn } from '../../lib/cn'
 import { Button } from './Button'
@@ -42,13 +42,27 @@ export function Modal({
   className,
 }: ModalProps) {
   const dialogRef = useRef<HTMLDivElement | null>(null)
-  const previouslyFocused = useRef<HTMLElement | null>(null)
 
-  const handleKeyDown = useCallback(
-    (event: KeyboardEvent) => {
+  /* The open effect must depend on `open` alone: every caller passes an inline
+     arrow for `onClose`, so anything derived from it changes identity on each
+     parent render. Re-running the effect would restore focus to the trigger and
+     then steal it back into the dialog on every keystroke or pending flag flip.
+     The listener therefore reads the handler through a ref instead. */
+  const onCloseRef = useRef(onClose)
+  useEffect(() => {
+    onCloseRef.current = onClose
+  })
+
+  useEffect(() => {
+    if (!open) return
+    const trigger = document.activeElement as HTMLElement | null
+    const { overflow } = document.body.style
+    document.body.style.overflow = 'hidden'
+
+    const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.stopPropagation()
-        onClose()
+        onCloseRef.current()
         return
       }
       if (event.key !== 'Tab' || !dialogRef.current) return
@@ -63,27 +77,23 @@ export function Modal({
         event.preventDefault()
         first.focus()
       }
-    },
-    [onClose],
-  )
+    }
 
-  useEffect(() => {
-    if (!open) return
-    previouslyFocused.current = document.activeElement as HTMLElement | null
-    const { overflow } = document.body.style
-    document.body.style.overflow = 'hidden'
     document.addEventListener('keydown', handleKeyDown, true)
     const focusTimer = window.setTimeout(() => {
       const target = dialogRef.current?.querySelector<HTMLElement>(FOCUSABLE)
       ;(target ?? dialogRef.current)?.focus()
     }, 0)
+
     return () => {
       window.clearTimeout(focusTimer)
       document.removeEventListener('keydown', handleKeyDown, true)
       document.body.style.overflow = overflow
-      previouslyFocused.current?.focus?.()
+      // Only if the trigger is still in the document; focusing a detached node
+      // is a no-op that would silently drop focus onto <body>.
+      if (trigger?.isConnected) trigger.focus?.()
     }
-  }, [open, handleKeyDown])
+  }, [open])
 
   if (!open || typeof document === 'undefined') return null
 

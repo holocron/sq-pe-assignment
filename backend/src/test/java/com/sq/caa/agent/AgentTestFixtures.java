@@ -95,11 +95,39 @@ final class AgentTestFixtures {
     }
 
     static AgentRunContext context(UUID assessmentId, AnalysisTrace trace, List<RiskRule> rules) {
+        return context(assessmentId, trace, rules, AnalysisProgressListener.NONE);
+    }
+
+    static AgentRunContext context(UUID assessmentId, AnalysisTrace trace, List<RiskRule> rules,
+            AnalysisProgressListener progress) {
         Customer customer = customer();
         EvaluationBatch batch = EvaluationBatch.forCustomer(customer, transactions());
         RuleEvaluator evaluator = new RuleEvaluator();
         return new AgentRunContext(assessmentId, customer, batch, rules,
-                rule -> evaluator.evaluate(rule, batch), trace);
+                rule -> evaluator.evaluate(rule, batch), trace, progress);
+    }
+
+    /** A context over a bespoke set of transactions, for tests that plant their own evidence. */
+    static AgentRunContext contextOver(UUID assessmentId, AnalysisTrace trace, List<RiskRule> rules,
+            List<Transaction> transactions) {
+        Customer customer = customer();
+        EvaluationBatch batch = EvaluationBatch.forCustomer(customer, transactions);
+        RuleEvaluator evaluator = new RuleEvaluator();
+        return new AgentRunContext(assessmentId, customer, batch, rules,
+                rule -> evaluator.evaluate(rule, batch), trace, AnalysisProgressListener.NONE);
+    }
+
+    /** One card transaction with caller-chosen free text, for the prompt-injection tests. */
+    static Transaction cardTransaction(String merchant, String declineReason) {
+        return card("120.00", "Completed", NOW.minusSeconds(600), merchant, "5411", false,
+                declineReason);
+    }
+
+    /** A rule whose administrator-authored name tries to give the model orders. */
+    static RiskRule ruleNamedByAnAttacker(String name) {
+        return rule(name, RuleScope.ALL, """
+                {"op":"AND","conditions":[{"field":"amount","operator":"GT","value":1000000}]}""",
+                "5.00");
     }
 
     // ------------------------------------------------------------------

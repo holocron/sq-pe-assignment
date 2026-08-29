@@ -1,4 +1,13 @@
 export { AccessDenied, type AccessDeniedProps } from './AccessDenied'
+export {
+  AppErrorPanel,
+  ErrorBoundary,
+  RouteErrorBoundary,
+  RouteErrorPanel,
+  type ErrorBoundaryFallback,
+  type ErrorBoundaryProps,
+  type ErrorFallbackProps,
+} from './ErrorBoundary'
 
 export { AppShell } from './layout/AppShell'
 export {

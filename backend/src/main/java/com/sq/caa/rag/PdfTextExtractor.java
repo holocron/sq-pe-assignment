@@ -39,6 +39,13 @@ import org.springframework.stereotype.Component;
  * page numbers. Body lines are then re-joined into paragraphs, since PDF hard-wraps every line and
  * chunking on raw wrapped lines would cut sentences in half.
  *
+ * <p><b>Tables</b> are the one shape that must <em>not</em> be re-joined. {@link PdfLineReader}
+ * measures the horizontal gaps inside a line and marks column boundaries with
+ * {@code |}; a line carrying those marks is kept as its own row rather than being folded into the
+ * surrounding prose, which is exactly what the DOCX parser does for a real Word table. Without
+ * this, a jurisdiction table flattens into a run-on string in which "SECO KP North Korea" reads as
+ * one entry and the agent can attribute the wrong sanctions regime to the wrong country.
+ *
  * <p>PDFBox 3 changed loading: documents are opened through {@code Loader.loadPDF(...)} rather than
  * the 2.x {@code PDDocument.load(...)}.
  */
@@ -220,10 +227,26 @@ public class PdfTextExtractor implements DocumentTextExtractor {
         if (pending.isEmpty()) {
             return;
         }
-        int fullMeasure = pending.stream().mapToInt(line -> line.text().length()).max().orElse(0);
+        int fullMeasure = pending.stream()
+                .filter(line -> !isTableRow(line.text()))
+                .mapToInt(line -> line.text().length())
+                .max()
+                .orElse(0);
         StringBuilder paragraph = new StringBuilder();
         for (int i = 0; i < pending.size(); i++) {
             String text = pending.get(i).text();
+
+            // A measured table row keeps its own line, so the row and cell boundaries survive into
+            // the embedded chunk instead of dissolving into the prose around it.
+            if (isTableRow(text)) {
+                if (paragraph.length() > 0) {
+                    builder.appendParagraph(paragraph.toString());
+                    paragraph.setLength(0);
+                }
+                builder.appendLine(text);
+                continue;
+            }
+
             if (paragraph.length() > 0) {
                 paragraph.append(' ');
             }
@@ -231,17 +254,23 @@ public class PdfTextExtractor implements DocumentTextExtractor {
 
             boolean last = i == pending.size() - 1;
             boolean nextIsBullet = !last && HeadingHeuristics.isBullet(pending.get(i + 1).text());
+            boolean nextIsTableRow = !last && isTableRow(pending.get(i + 1).text());
             boolean thisIsBullet = HeadingHeuristics.isBullet(text);
             boolean shortLastLine = text.length() < fullMeasure * 0.85;
             boolean sentenceEnd = endsSentence(text);
 
-            if (last || nextIsBullet || (sentenceEnd && shortLastLine)
+            if (last || nextIsBullet || nextIsTableRow || (sentenceEnd && shortLastLine)
                     || (thisIsBullet && sentenceEnd)) {
                 builder.appendParagraph(paragraph.toString());
                 paragraph.setLength(0);
             }
         }
         pending.clear();
+    }
+
+    /** True when {@link PdfLineReader} measured column boundaries inside the line. */
+    static boolean isTableRow(String text) {
+        return text != null && text.contains(PdfLineReader.COLUMN_SEPARATOR.strip());
     }
 
     private static boolean endsSentence(String text) {
@@ -255,7 +284,7 @@ public class PdfTextExtractor implements DocumentTextExtractor {
     /** Section-opening depth of a line: 0 when it is body text. */
     private int headingLevel(PdfLine line, float bodySize) {
         String text = line.text();
-        if (text.isBlank() || HeadingHeuristics.isBullet(text)) {
+        if (text.isBlank() || HeadingHeuristics.isBullet(text) || isTableRow(text)) {
             return 0;
         }
         if (HeadingHeuristics.isNumberedHeading(text)) {

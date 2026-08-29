@@ -260,7 +260,7 @@ export function ActivityBreakdownCard({
       type,
       name: ACTIVITY_TYPE_LABELS[type],
       amount: entry?.totalAmount ?? 0,
-      count: entry?.count ?? 0,
+      count: entry?.transactionCount ?? 0,
     }
   })
   const hasData = data.some((point) => point.count > 0)

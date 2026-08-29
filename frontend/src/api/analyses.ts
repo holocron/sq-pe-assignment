@@ -27,6 +27,8 @@ import {
   type JsonObject,
   type JsonValue,
   type RiskLevel,
+  type RuleEvaluation,
+  type RuleEvaluationWire,
   type TraceStep,
   type UUID,
 } from './types'
@@ -124,12 +126,29 @@ function normalizeTrace(trace: AnalysisResultWire['trace']): TraceStep[] {
   return steps.map((step, index) => normalizeTraceStep(step, index + 1))
 }
 
+/**
+ * A rule verdict always carries its matched-transaction evidence, but a run
+ * that failed mid-flight can persist a row before the ids are known. The
+ * coverage table expands into that array, so it is defaulted here rather than
+ * guarded at every call site.
+ */
+export function normalizeRuleEvaluation(wire: RuleEvaluationWire): RuleEvaluation {
+  return {
+    ...wire,
+    score: typeof wire.score === 'number' ? wire.score : Number(wire.score ?? 0),
+    matchedTransactionIds: Array.isArray(wire.matchedTransactionIds)
+      ? wire.matchedTransactionIds
+      : [],
+    degradationNotes: Array.isArray(wire.degradationNotes) ? wire.degradationNotes : [],
+  }
+}
+
 export function normalizeAnalysisResult(wire: AnalysisResultWire): AnalysisResult {
   return {
     ...wire,
     summary: wire.summary ?? null,
     recommendations: wire.recommendations ?? null,
-    ruleEvaluations: wire.ruleEvaluations ?? [],
+    ruleEvaluations: (wire.ruleEvaluations ?? []).map(normalizeRuleEvaluation),
     trace: normalizeTrace(wire.trace),
   }
 }

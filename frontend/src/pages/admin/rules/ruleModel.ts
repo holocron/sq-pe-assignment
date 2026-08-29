@@ -38,6 +38,7 @@ import {
   operatorsForFieldType,
   updateNodeAt,
   validateRuleNode,
+  type RuleOperatorMeta,
   type RulePath,
 } from '../../../lib/rules'
 
@@ -77,6 +78,19 @@ export function enumValuesOf(catalog: Catalog, field: string): string[] {
   return catalogEnumValues(findCatalogEntry(catalog, field))
 }
 
+/**
+ * The values a field may actually be restricted to.
+ *
+ * The catalog marks some option lists as suggestions rather than a closed set
+ * (`optionsClosed: false`, e.g. `crypto.blockchain`), and the backend accepts
+ * anything for those. Coercion and validation must therefore only enforce the
+ * closed lists — offering a suggestion is the picker's job, not the rule's.
+ */
+export function allowedValuesOf(entry: FieldCatalogEntry | null | undefined): string[] {
+  if (!entry || entry.valuesClosed === false) return []
+  return catalogEnumValues(entry)
+}
+
 /** `payment.receiver_bank_country` -> `Receiver bank country` (label wins). */
 export function fieldLabel(catalog: Catalog, field: string): string {
   const entry = findCatalogEntry(catalog, field)
@@ -110,9 +124,37 @@ export function catalogGroupTitle(group: string): string {
   return spaced.charAt(0).toUpperCase() + spaced.slice(1)
 }
 
-/** The default operator for a field type — first entry of the filtered list. */
+/**
+ * The operators offered for one field.
+ *
+ * `GET /api/rules/field-catalog` states, per field, exactly which operators the
+ * backend validator will accept — that list is authoritative and is used
+ * whenever it is present, intersected with the client metadata so every entry
+ * still has a label and an arity. Fields the catalog does not describe fall
+ * back to the type table.
+ */
+export function operatorsForEntry(entry: FieldCatalogEntry | null | undefined): RuleOperatorMeta[] {
+  const declared = entry?.operators
+  if (declared && declared.length > 0) {
+    const allowed = new Set<RuleOperator>(declared)
+    const matching = operatorsForFieldType(null).filter((meta) => allowed.has(meta.operator))
+    if (matching.length > 0) return matching
+  }
+  return operatorsForFieldType(entry?.type ?? null)
+}
+
+/** The operators offered for `field`, resolved through the catalog. */
+export function operatorsForField(catalog: Catalog, field: string): RuleOperatorMeta[] {
+  return operatorsForEntry(findCatalogEntry(catalog, field))
+}
+
+/** The default operator for a field — first entry of the offered list. */
 export function defaultOperatorForType(type: FieldType | null): RuleOperator {
   return operatorsForFieldType(type)[0]?.operator ?? 'EQ'
+}
+
+function defaultOperatorForEntry(entry: FieldCatalogEntry | null | undefined): RuleOperator {
+  return operatorsForEntry(entry)[0]?.operator ?? 'EQ'
 }
 
 /* -------------------------------------------------------------------------- */
@@ -211,8 +253,8 @@ export function applyFieldChange(
   const previousType = fieldTypeOf(catalog, condition.field)
   const entry = findCatalogEntry(catalog, field)
   const type = entry?.type ?? null
-  const allowed = catalogEnumValues(entry)
-  const valid = operatorsForFieldType(type).map((meta) => meta.operator)
+  const allowed = allowedValuesOf(entry)
+  const valid = operatorsForEntry(entry).map((meta) => meta.operator)
   const operator = valid.includes(condition.operator)
     ? condition.operator
     : (valid[0] ?? 'EQ')
@@ -233,7 +275,7 @@ export function applyOperatorChange(
   return {
     field: condition.field,
     operator,
-    value: coerceValue(condition.value, operator, entry?.type ?? null, catalogEnumValues(entry)),
+    value: coerceValue(condition.value, operator, entry?.type ?? null, allowedValuesOf(entry)),
   }
 }
 
@@ -302,7 +344,7 @@ function collectCatalogIssues(
     }
     return
   }
-  const allowed = catalogEnumValues(entry)
+  const allowed = allowedValuesOf(entry)
   const arity = operatorArity(node.operator)
   if (arity === 'none') return
   const values = Array.isArray(node.value) ? node.value : [node.value]
@@ -442,7 +484,7 @@ export function asRootGroup(node: RuleNode | null | undefined, fallback: RuleGro
 export function newCondition(catalog: Catalog): RuleCondition {
   const entry = findCatalogEntry(catalog, 'amount') ?? catalog[0]
   if (!entry) return createCondition()
-  const operator = defaultOperatorForType(entry.type)
+  const operator = defaultOperatorForEntry(entry)
   return { field: entry.field, operator, value: defaultValueForOperator(operator, entry.type) }
 }
 

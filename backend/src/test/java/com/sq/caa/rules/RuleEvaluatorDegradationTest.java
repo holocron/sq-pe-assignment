@@ -127,6 +127,39 @@ class RuleEvaluatorDegradationTest {
     }
 
     @Test
+    void aRuleReadingAnotherActivityTypesFieldsIsReportedAsDegradedNotAsQuietlyClean() {
+        // Refused on write, but a rule already in the table must not spend its life reporting
+        // "did not trigger", which reads exactly like a customer with nothing to find.
+        RiskRule misScoped = rule("Card rule reading payment fields", RuleScope.CARD,
+                "{\"field\":\"payment.receiver_bank_country\",\"operator\":\"EQ\",\"value\":\"IR\"}",
+                "20.00");
+
+        RuleEvaluationResult result = evaluator.evaluate(misScoped, batch(
+                card("100.00", "Completed", AT, "SHOP", "5411", "Debit", true, null),
+                payment("100.00", "Completed", AT, "SWIFT", "IR")));
+
+        assertThat(result.triggered()).isFalse();
+        assertThat(result.degraded()).isTrue();
+        assertThat(result.degradationNotes()).anyMatch(note ->
+                note.contains("'payment.receiver_bank_country' exists only on PAYMENT activity")
+                        && note.contains("can never resolve on a CARD rule"));
+    }
+
+    @Test
+    void anAllScopedRuleReachingIntoOneActivityTypeStaysClean() {
+        RiskRule allScoped = rule("Sanctioned beneficiary", RuleScope.ALL,
+                "{\"field\":\"payment.receiver_bank_country\",\"operator\":\"EQ\",\"value\":\"IR\"}",
+                "20.00");
+
+        RuleEvaluationResult result = evaluator.evaluate(allScoped, batch(
+                card("100.00", "Completed", AT, "SHOP", "5411", "Debit", true, null),
+                payment("100.00", "Completed", AT, "SWIFT", "IR")));
+
+        assertThat(result.triggered()).isTrue();
+        assertThat(result.degraded()).isFalse();
+    }
+
+    @Test
     void evaluationOfEveryOperatorAgainstEveryFieldNeverThrows() {
         EvaluationBatch fixture = batch(
                 card("100.00", "Completed", AT, "SHOP", "5411", "Debit", true, null),

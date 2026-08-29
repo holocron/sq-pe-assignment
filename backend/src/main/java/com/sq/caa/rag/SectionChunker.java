@@ -16,7 +16,9 @@ import java.util.regex.Pattern;
  * that straddles a window boundary still appears whole in one of them.
  *
  * <p>Windows are cut at natural boundaries, in decreasing order of preference: paragraph, then
- * sentence, then word. A single word is never split.
+ * sentence, then word. A single word is never split. The repeated overlap follows the same
+ * preference: whole paragraphs when they fit the overlap budget, otherwise the trailing sentences
+ * or words of the last paragraph, so consecutive windows always share text.
  *
  * <p>Every chunk is prefixed with its section heading. That costs a handful of tokens and buys two
  * things: the embedding carries the topic even when the window starts mid-argument, and a retrieved
@@ -93,7 +95,8 @@ public class SectionChunker {
         if (!section.hasText()) {
             return List.of();
         }
-        String heading = section.title() == null ? "" : section.title().strip();
+        String heading = HeadingHeuristics.capHeadingLength(
+                section.title() == null ? "" : section.title().strip());
         String prefix = heading.isEmpty() ? "" : heading + "\n\n";
         int budget = Math.max(targetTokens - TokenEstimator.estimate(prefix), MIN_WINDOW_TOKENS);
 
@@ -213,27 +216,89 @@ public class SectionChunker {
     }
 
     /**
-     * The trailing units of a window that should be repeated at the start of the next one.
+     * The trailing text of a window that should be repeated at the start of the next one.
      *
-     * <p>Never returns the whole window: a window that is one huge unit produces no overlap rather
-     * than an infinite loop.
+     * <p>Whole units are preferred, but a policy paragraph routinely runs 400-700 characters -
+     * comfortably more than the default 100-token overlap - so insisting on whole units would make
+     * the overlap silently empty for exactly the documents this knowledge base is built from. When
+     * the last unit alone does not fit the overlap budget, its own trailing sentences (or, failing
+     * that, its trailing words) are repeated instead. The overlap is therefore never empty unless
+     * it was configured to be.
+     *
+     * <p>The tail is capped at {@link #overlapTokens} and at half the window budget, so a window is
+     * never re-emitted whole. Termination does not depend on this cap: {@link #pack} always appends
+     * the unit that triggered the flush, so every window consumes at least one fresh unit.
      */
     private List<Unit> overlapTail(List<Unit> window, int budget) {
         List<Unit> tail = new ArrayList<>();
-        if (overlapTokens == 0 || window.size() < 2) {
+        int cap = Math.min(overlapTokens, budget / 2);
+        if (cap <= 0 || window.isEmpty()) {
             return tail;
         }
         int tokens = 0;
-        for (int i = window.size() - 1; i >= 1; i--) {
+        for (int i = window.size() - 1; i >= 0; i--) {
             Unit unit = window.get(i);
             int unitTokens = TokenEstimator.estimate(unit.text());
-            if (tokens + unitTokens > overlapTokens || tokens + unitTokens > budget / 2) {
+            if (tokens + unitTokens > cap) {
+                if (tail.isEmpty()) {
+                    String partial = trailingText(unit.text(), cap);
+                    if (!partial.isBlank()) {
+                        tail.add(new Unit(partial, unit.separator()));
+                    }
+                }
                 break;
             }
             tail.add(0, unit);
             tokens += unitTokens;
         }
         return tail;
+    }
+
+    /**
+     * The last {@code budget} tokens' worth of a single unit, cut at a sentence boundary where one
+     * is available and at a word boundary otherwise. Used when one paragraph is larger than the
+     * whole overlap budget, which is the normal case for policy prose.
+     */
+    private static String trailingText(String text, int budget) {
+        String[] sentences = SENTENCE_BOUNDARY.split(text);
+        String fromSentences = trailingJoin(sentences, budget, " ");
+        if (!fromSentences.isBlank()) {
+            return fromSentences;
+        }
+        return trailingJoin(text.split("\\s+"), budget, " ");
+    }
+
+    /** Joins as many trailing elements as fit the budget, in their original order. */
+    private static String trailingJoin(String[] parts, int budget, String separator) {
+        int tokens = 0;
+        int from = parts.length;
+        for (int i = parts.length - 1; i >= 0; i--) {
+            String part = parts[i].strip();
+            if (part.isEmpty()) {
+                continue;
+            }
+            int partTokens = TokenEstimator.estimate(part);
+            if (tokens + partTokens > budget) {
+                break;
+            }
+            tokens += partTokens;
+            from = i;
+        }
+        if (from >= parts.length) {
+            return "";
+        }
+        StringBuilder joined = new StringBuilder();
+        for (int i = from; i < parts.length; i++) {
+            String part = parts[i].strip();
+            if (part.isEmpty()) {
+                continue;
+            }
+            if (joined.length() > 0) {
+                joined.append(separator);
+            }
+            joined.append(part);
+        }
+        return joined.toString();
     }
 
     private static int totalTokens(List<Unit> units) {

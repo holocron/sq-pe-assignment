@@ -2,6 +2,7 @@ package com.sq.caa.rag;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -115,11 +116,15 @@ public class VectorStoreChunkStore implements ChunkStore {
     /* ------------------------------------------------------------------ */
 
     @Override
-    public List<RetrievedChunk> search(String query, int topK) {
+    public List<RetrievedChunk> search(String query, int topK, Collection<UUID> documentIds) {
+        if (documentIds == null || documentIds.isEmpty()) {
+            return List.of();
+        }
         SearchRequest request = SearchRequest.builder()
                 .query(query)
                 .topK(topK)
                 .similarityThreshold(properties.similarityThreshold())
+                .filterExpression(ownedBy(documentIds))
                 .build();
         List<Document> hits;
         try {
@@ -136,6 +141,18 @@ public class VectorStoreChunkStore implements ChunkStore {
             chunks.add(toRetrievedChunk(hit));
         }
         return List.copyOf(chunks);
+    }
+
+    /**
+     * {@code document_id IN (...)}.
+     *
+     * <p>Spring AI's {@code PgVectorFilterExpressionConverter} renders this as
+     * {@code metadata::jsonb @@ '($.document_id == "a" || $.document_id == "b")'::jsonpath}, which
+     * the GIN {@code jsonb_path_ops} index added in {@code V4__rag_fixes.sql} can serve.
+     */
+    private static Filter.Expression ownedBy(Collection<UUID> documentIds) {
+        Object[] ids = documentIds.stream().map(String::valueOf).toArray();
+        return new FilterExpressionBuilder().in(ChunkMetadata.DOCUMENT_ID, ids).build();
     }
 
     /* ------------------------------------------------------------------ */

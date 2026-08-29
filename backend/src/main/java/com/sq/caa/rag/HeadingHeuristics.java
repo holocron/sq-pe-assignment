@@ -136,7 +136,34 @@ public final class HeadingHeuristics {
                 break;
             }
         }
-        return title;
+        return capHeadingLength(title);
+    }
+
+    /**
+     * Caps a heading at {@link #MAX_HEADING_LENGTH}.
+     *
+     * <p>A heading is prepended to <em>every</em> window cut from its section and is copied into
+     * every chunk's {@code section_title} metadata, so its length multiplies through the whole
+     * document. Nothing in a {@code .docx} stops an author from applying {@code Heading 2} to a
+     * page of prose, and the heuristic length guards do not apply once a document has any styled
+     * heading at all - so the cap is enforced here, at the one point every parser funnels through.
+     * The cut is made at a word boundary where one is close enough, and marked with an ellipsis so
+     * a reader can see the title was shortened.
+     */
+    public static String capHeadingLength(String title) {
+        if (title == null) {
+            return "";
+        }
+        String trimmed = title.strip();
+        if (trimmed.length() <= MAX_HEADING_LENGTH) {
+            return trimmed;
+        }
+        String cut = trimmed.substring(0, MAX_HEADING_LENGTH - 1);
+        int lastSpace = cut.lastIndexOf(' ');
+        if (lastSpace >= MAX_HEADING_LENGTH / 2) {
+            cut = cut.substring(0, lastSpace);
+        }
+        return cut.stripTrailing() + '…';
     }
 
     /** Turns a file name into a readable fallback title: {@code aml-policy_v2.pdf} to {@code Aml policy v2}. */

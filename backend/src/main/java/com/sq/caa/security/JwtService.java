@@ -11,6 +11,8 @@ import java.time.Instant;
 import java.util.Date;
 import java.util.UUID;
 import javax.crypto.SecretKey;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 /**
@@ -34,6 +36,8 @@ public class JwtService {
 
     private static final String ISSUER = "customer-activity-analytics";
 
+    private static final Logger log = LoggerFactory.getLogger(JwtService.class);
+
     private final SecretKey signingKey;
     private final Duration ttl;
 
@@ -48,8 +52,39 @@ public class JwtService {
         if (properties.ttlMinutes() <= 0) {
             throw new IllegalStateException("caa.security.jwt.ttl-minutes must be positive");
         }
+        warnIfDevelopmentSecret(properties);
         this.signingKey = Keys.hmacShaKeyFor(secret);
         this.ttl = properties.ttl();
+    }
+
+    /**
+     * The zero-configuration demo must keep working, so a missing {@code JWT_SECRET} is not a boot
+     * failure - but it must never be silent either. The built-in fallback is committed to the
+     * repository, so with it in place anyone holding the source can sign a token for any existing
+     * username and the {@link JwtAuthenticationFilter} will load that user's real role from the
+     * database. That is a full authentication bypass, and the only thing standing between a demo and
+     * a deployment is this line in the log.
+     */
+    private static void warnIfDevelopmentSecret(JwtProperties properties) {
+        if (!properties.usesDevelopmentSecret()) {
+            log.info("JWT signing secret loaded from configuration ({} bytes), token ttl {} minutes.",
+                    properties.secret().getBytes(StandardCharsets.UTF_8).length, properties.ttlMinutes());
+            return;
+        }
+        log.warn("""
+
+                ********************************************************************
+                * SECURITY WARNING - signing JWTs with the built-in DEVELOPMENT secret.
+                *
+                * caa.security.jwt.secret fell back to the value committed in
+                * application.yml, which is public. Anyone who has read this repository
+                * can forge a token for any account, including admin, without ever
+                * calling /api/auth/login.
+                *
+                * Fine for the local demo, never for anything else. Set a private key:
+                *   export JWT_SECRET="$(openssl rand -base64 48)"
+                ********************************************************************
+                """);
     }
 
     /** Signs a token for an authenticated principal. */

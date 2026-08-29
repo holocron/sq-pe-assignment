@@ -17,6 +17,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Mutable state of one analysis run, shared between the ReAct loop and the tools it exposes.
@@ -37,6 +39,8 @@ import java.util.function.Function;
  */
 public final class AgentRunContext {
 
+    private static final Logger log = LoggerFactory.getLogger(AgentRunContext.class);
+
     private final UUID assessmentId;
     private final Customer customer;
     private final EvaluationBatch batch;
@@ -45,6 +49,7 @@ public final class AgentRunContext {
     private final List<UUID> orderedRuleIds;
     private final Function<RiskRule, RuleEvaluationResult> evaluator;
     private final AnalysisTrace trace;
+    private final AnalysisProgressListener progress;
 
     private final Map<UUID, RuleEvaluationResult> deterministic = new ConcurrentHashMap<>();
     private final Map<UUID, AgentRuleVerdict> verdicts = new ConcurrentHashMap<>();
@@ -57,11 +62,18 @@ public final class AgentRunContext {
     public AgentRunContext(UUID assessmentId, Customer customer, EvaluationBatch batch,
             Collection<RiskRule> coverageSet, Function<RiskRule, RuleEvaluationResult> evaluator,
             AnalysisTrace trace) {
+        this(assessmentId, customer, batch, coverageSet, evaluator, trace, AnalysisProgressListener.NONE);
+    }
+
+    public AgentRunContext(UUID assessmentId, Customer customer, EvaluationBatch batch,
+            Collection<RiskRule> coverageSet, Function<RiskRule, RuleEvaluationResult> evaluator,
+            AnalysisTrace trace, AnalysisProgressListener progress) {
         this.assessmentId = assessmentId;
         this.customer = customer;
         this.batch = batch;
         this.evaluator = evaluator;
         this.trace = trace;
+        this.progress = progress == null ? AnalysisProgressListener.NONE : progress;
         Map<UUID, RiskRule> rules = new LinkedHashMap<>();
         for (RiskRule rule : coverageSet) {
             rules.put(rule.getRuleId(), rule);
@@ -133,6 +145,7 @@ public final class AgentRunContext {
 
     public void recordVerdict(AgentRuleVerdict verdict) {
         verdicts.put(verdict.ruleId(), verdict);
+        publishProgress();
     }
 
     public AgentRuleVerdict verdict(UUID ruleId) {
@@ -190,6 +203,19 @@ public final class AgentRunContext {
     /** Counts one model turn. Kept on the context so a failed run can still report how far it got. */
     public void recordStep() {
         stepsTaken.incrementAndGet();
+        publishProgress();
+    }
+
+    /**
+     * Reports the current counters to the progress listener. A listener that fails must not take the
+     * analysis down with it - progress reporting is a view of the run, never part of it.
+     */
+    public void publishProgress() {
+        try {
+            progress.onProgress(stepsTaken.get(), verdicts.size(), orderedRuleIds.size());
+        } catch (RuntimeException e) {
+            log.warn("Could not report the progress of analysis {}", assessmentId, e);
+        }
     }
 
     /** Model turns taken so far. */

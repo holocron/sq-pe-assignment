@@ -71,6 +71,11 @@ public record TraceStep(
         public static final String DISAGREEMENT = "disagreement";
         /** A rule the agent never ruled on was completed by the deterministic engine. */
         public static final String BACKFILL = "backfill";
+        /**
+         * The model's conclusion arrived as prose rather than through
+         * {@code submit_final_assessment} and was accepted, coverage already being complete.
+         */
+        public static final String PROSE_FINAL = "prose_final";
         /** Terminal step: the banded risk level and the total score. */
         public static final String FINAL = "final";
         /** The run failed. */

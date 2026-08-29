@@ -8,10 +8,8 @@ import com.sq.caa.domain.KnowledgeDocument;
 import com.sq.caa.repository.KnowledgeDocumentRepository;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -21,6 +19,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
@@ -29,8 +28,11 @@ import org.springframework.transaction.annotation.Transactional;
  * <p>The vector store is faked - embedding is a network call to a local model and has nothing to
  * say about whether a failed upload is recorded correctly - but everything else is the production
  * path: real Postgres, real POI and PDFBox, real chunker.
+ *
+ * <p>Bootstrap seeding is switched off: it would otherwise commit documents from a background
+ * thread while these transactional assertions run against an empty corpus.
  */
-@SpringBootTest
+@SpringBootTest(properties = "caa.knowledge.bootstrap.enabled=false")
 @Transactional
 class RagServiceTest {
 
@@ -124,6 +126,31 @@ class RagServiceTest {
     }
 
     @Test
+    @DisplayName("the duplicate-name rule is backed by a constraint, not just by a lookup")
+    void duplicateFilenamesAreImpossibleAtTheDatabaseLevel() {
+        ragService.ingest("aml-policy.docx", RagDocumentFixtures.styledDocx(), "admin");
+
+        // Bypasses the service check the way a concurrent upload does: two callers both find no
+        // existing row and both insert. Without the unique index on lower(filename) both rows
+        // land, and every later upload of that name turns into a 500 instead of the documented
+        // 409 because findByFilenameIgnoreCase then finds two.
+        KnowledgeDocument racing = KnowledgeDocument.builder()
+                .documentId(UUID.randomUUID())
+                .filename("AML-Policy.DOCX")
+                .title("Aml policy")
+                .mimeType(KnowledgeFormat.DOCX.mimeType())
+                .sizeBytes(10)
+                .chunkCount(0)
+                .status(DocumentStatus.PROCESSING)
+                .uploadedBy("admin2")
+                .uploadedAt(Instant.now())
+                .build();
+
+        assertThatThrownBy(() -> documentRepository.saveAndFlush(racing))
+                .isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    @Test
     @DisplayName("a failed upload does not block the retry: it is replaced")
     void replacesAPreviouslyFailedUpload() {
         KnowledgeDocument failed = documentRepository.saveAndFlush(KnowledgeDocument.builder()
@@ -213,14 +240,14 @@ class RagServiceTest {
     void blankQueriesShortCircuit() {
         assertThat(ragService.search("   ", 5)).isEmpty();
         assertThat(ragService.search(null, 5)).isEmpty();
-        assertThat(chunkStore.searches).isEmpty();
+        assertThat(chunkStore.searches()).isEmpty();
     }
 
     @Test
     @DisplayName("an empty corpus answers from the document table instead of embedding the query")
     void emptyCorpusShortCircuits() {
         assertThat(ragService.search("reporting threshold", 5)).isEmpty();
-        assertThat(chunkStore.searches).isEmpty();
+        assertThat(chunkStore.searches()).isEmpty();
     }
 
     @Test
@@ -232,7 +259,89 @@ class RagServiceTest {
         ragService.search("thresholds", 1_000);
         ragService.search("thresholds", 3);
 
-        assertThat(chunkStore.searches).containsExactly(5, 25, 3);
+        assertThat(chunkStore.searches()).containsExactly(5, 25, 3);
+    }
+
+    @Test
+    @DisplayName("only INDEXED documents are searchable: a half-written upload cannot be cited")
+    void chunksOfDocumentsThatAreNotIndexedAreNotRetrievable() {
+        KnowledgeDocument indexed = ragService.ingest("aml-policy.docx",
+                RagDocumentFixtures.styledDocx(), "admin");
+        // A second document whose chunks are in the store while its row is still PROCESSING -
+        // exactly the state ingestion passes through, since each batch commits on its own.
+        KnowledgeDocument halfWritten = documentRepository.saveAndFlush(KnowledgeDocument.builder()
+                .documentId(UUID.randomUUID())
+                .filename("crypto-policy.docx")
+                .title("Crypto policy")
+                .mimeType(KnowledgeFormat.DOCX.mimeType())
+                .sizeBytes(10)
+                .chunkCount(0)
+                .status(DocumentStatus.PROCESSING)
+                .uploadedBy("admin")
+                .uploadedAt(Instant.now())
+                .build());
+        chunkStore.index(halfWritten.getDocumentId(), "crypto-policy.docx", "Crypto policy",
+                List.of(new TextChunk(0, 0, "3.2 Mixers", 0, 1,
+                        "Mixing services are prohibited and every reporting threshold applies.",
+                        12)));
+
+        List<RetrievedChunk> hits = ragService.search("reporting threshold", 10);
+
+        assertThat(hits).isNotEmpty();
+        assertThat(hits).extracting(RetrievedChunk::documentId)
+                .containsOnly(indexed.getDocumentId())
+                .doesNotContain(halfWritten.getDocumentId());
+        // The restriction is pushed into the query, not applied to the results afterwards.
+        assertThat(chunkStore.searchedDocuments()).containsExactly(Set.of(indexed.getDocumentId()));
+
+        // The same document once it FAILS and its compensating chunk delete did not get through.
+        halfWritten.setStatus(DocumentStatus.FAILED);
+        documentRepository.saveAndFlush(halfWritten);
+        assertThat(ragService.search("reporting threshold", 10))
+                .extracting(RetrievedChunk::documentId)
+                .doesNotContain(halfWritten.getDocumentId());
+    }
+
+    @Test
+    @DisplayName("passages are cut to one length for every caller, so the screen shows what the "
+            + "agent read")
+    void passagesAreCappedIdenticallyForEveryCaller() {
+        KnowledgeDocument document = documentRepository.saveAndFlush(KnowledgeDocument.builder()
+                .documentId(UUID.randomUUID())
+                .filename("long-policy.docx")
+                .title("Long policy")
+                .mimeType(KnowledgeFormat.DOCX.mimeType())
+                .sizeBytes(10)
+                .chunkCount(1)
+                .status(DocumentStatus.INDEXED)
+                .uploadedBy("admin")
+                .uploadedAt(Instant.now())
+                .build());
+        String oversized = "Threshold clause that the reviewing officer must apply. "
+                .repeat(60);
+        assertThat(oversized.length()).isGreaterThan(RagService.MAX_PASSAGE_CHARS);
+        chunkStore.index(document.getDocumentId(), "long-policy.docx", "Long policy",
+                List.of(new TextChunk(0, 0, "2. Thresholds", 0, 1, oversized, 400)));
+
+        String uiContent = ragService.searchPolicy("threshold clause", 5).get(0).content();
+        String agentContent = ragService.searchPolicy("threshold clause", 3).get(0).content();
+
+        assertThat(uiContent).isEqualTo(agentContent);
+        assertThat(uiContent).endsWith(RagService.TRUNCATION_MARKER);
+        // Exactly the cap, including the marker, so a caller applying the same cap again is a
+        // no-op and cannot stack a second marker on the end.
+        assertThat(uiContent.length()).isLessThanOrEqualTo(RagService.MAX_PASSAGE_CHARS);
+    }
+
+    @Test
+    @DisplayName("searchPolicy treats a null topK as the configured default")
+    void searchPolicyDefaultsTopK() {
+        ragService.ingest("aml-policy.docx", RagDocumentFixtures.styledDocx(), "admin");
+
+        ragService.searchPolicy("thresholds", null);
+        ragService.searchPolicy("thresholds", -4);
+
+        assertThat(chunkStore.searches()).containsExactly(5, 5);
     }
 
     @Test
@@ -263,88 +372,6 @@ class RagServiceTest {
         @Primary
         InMemoryChunkStore inMemoryChunkStore() {
             return new InMemoryChunkStore();
-        }
-    }
-
-    /**
-     * A chunk store that keeps everything in a list. Retrieval is a keyword overlap score rather
-     * than a vector distance, which is enough to assert that provenance survives the round trip.
-     */
-    static class InMemoryChunkStore implements ChunkStore {
-
-        private final List<Map<String, Object>> chunks = new ArrayList<>();
-        private final List<Integer> searches = new ArrayList<>();
-        private int failAfterChunks = Integer.MAX_VALUE;
-
-        void reset() {
-            chunks.clear();
-            searches.clear();
-            failAfterChunks = Integer.MAX_VALUE;
-        }
-
-        void failAfter(int writtenChunks) {
-            this.failAfterChunks = writtenChunks;
-        }
-
-        int size() {
-            return chunks.size();
-        }
-
-        List<Map<String, Object>> chunksOf(UUID documentId) {
-            return chunks.stream()
-                    .filter(chunk -> documentId.toString().equals(chunk.get("document_id")))
-                    .toList();
-        }
-
-        @Override
-        public int index(UUID documentId, String filename, String title, List<TextChunk> textChunks) {
-            for (TextChunk textChunk : textChunks) {
-                if (chunks.size() >= failAfterChunks) {
-                    throw new KnowledgeIndexException("the embedding model went away");
-                }
-                Map<String, Object> chunk = new LinkedHashMap<>();
-                chunk.put("document_id", documentId.toString());
-                chunk.put("filename", filename);
-                chunk.put("title", title);
-                chunk.put("section_title", textChunk.sectionTitle().isBlank()
-                        ? title : textChunk.sectionTitle());
-                chunk.put("chunk_index", textChunk.chunkIndex());
-                chunk.put("content", textChunk.content());
-                chunks.add(chunk);
-            }
-            return textChunks.size();
-        }
-
-        @Override
-        public void deleteByDocument(UUID documentId) {
-            chunks.removeIf(chunk -> documentId.toString().equals(chunk.get("document_id")));
-        }
-
-        @Override
-        public List<RetrievedChunk> search(String query, int topK) {
-            searches.add(topK);
-            return chunks.stream()
-                    .map(chunk -> new RetrievedChunk(
-                            UUID.randomUUID().toString(),
-                            UUID.fromString((String) chunk.get("document_id")),
-                            (String) chunk.get("filename"),
-                            (String) chunk.get("title"),
-                            (String) chunk.get("section_title"),
-                            (Integer) chunk.get("chunk_index"),
-                            (String) chunk.get("content"),
-                            overlap(query, (String) chunk.get("content"))))
-                    .sorted((left, right) -> Double.compare(right.score(), left.score()))
-                    .limit(topK)
-                    .toList();
-        }
-
-        private static double overlap(String query, String content) {
-            String haystack = content.toLowerCase();
-            long matched = query.toLowerCase().lines()
-                    .flatMap(line -> List.of(line.split("\\s+")).stream())
-                    .filter(word -> word.length() > 3 && haystack.contains(word))
-                    .count();
-            return Math.min(1d, matched / 4d);
         }
     }
 }

@@ -4,10 +4,12 @@ import com.sq.caa.agent.AgentProperties;
 import com.sq.caa.agent.AgentRunFailedException;
 import com.sq.caa.agent.AgentRunResult;
 import com.sq.caa.agent.AnalysisExecutor;
+import com.sq.caa.agent.AnalysisProgressListener;
 import com.sq.caa.agent.AnalysisStreamRegistry;
 import com.sq.caa.agent.AnalysisTrace;
 import com.sq.caa.agent.ReActRiskAgent;
 import com.sq.caa.agent.RiskAssessmentRows;
+import com.sq.caa.agent.RiskAssessmentWriter;
 import com.sq.caa.agent.RuleVerdictSource;
 import com.sq.caa.domain.AnalysisRun;
 import com.sq.caa.domain.AnalysisStatus;
@@ -20,6 +22,8 @@ import com.sq.caa.web.dto.AnalysisDtos.AnalysisAccepted;
 import com.sq.caa.web.dto.AnalysisDtos.AnalysisResult;
 import com.sq.caa.web.dto.AnalysisDtos.AnalysisSummary;
 import com.sq.caa.web.dto.AnalysisDtos.RuleEvaluationView;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.EntityManagerFactory;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -34,6 +38,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.http.HttpStatus;
+import org.springframework.orm.jpa.SharedEntityManagerCreator;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
@@ -60,6 +65,13 @@ import tools.jackson.databind.node.ObjectNode;
  * lost but the rule coverage is not, so "every applicable rule was evaluated" holds on every run,
  * not only on the happy path.
  *
+ * <p><b>Why progress is written while the run is still going.</b> A run is minutes of model time,
+ * and a client that loses the SSE stream falls back to polling {@code GET /api/analyses/{id}}. If
+ * {@code steps} and {@code rules_evaluated} only appeared at the end, that fallback would show
+ * "0/12, 0 steps" for the whole run and look frozen. The agent therefore reports its counters as it
+ * goes and they are written with one small UPDATE, rate-limited so the cost stays negligible next to
+ * a model turn.
+ *
  * <p><b>How a rule's score is written.</b> {@code risk_assessments} carries one row per
  * (transaction, rule) pair evaluated, and a rule's score is capped at its weight. Those two
  * requirements are reconciled by distributing the rule's weight across the transactions that
@@ -76,6 +88,12 @@ public class RiskAnalysisService {
     private static final String EMPTY_TRACE = "{\"steps\":[]}";
     private static final int MAX_ERROR_LENGTH = 2000;
 
+    /**
+     * Shortest gap between two progress writes of the same run. A model turn takes seconds, so this
+     * only ever collapses a burst; a rule verdict is written immediately whatever the gap.
+     */
+    private static final long MIN_PROGRESS_INTERVAL_MS = 2000L;
+
     private final ReActRiskAgent agent;
     private final AnalysisStreamRegistry streams;
     private final AnalysisRunRepository analysisRuns;
@@ -86,6 +104,7 @@ public class RiskAnalysisService {
     private final AgentProperties properties;
     private final AnalysisExecutor executor;
     private final TransactionTemplate transactions;
+    private final EntityManager entityManager;
 
     public RiskAnalysisService(ReActRiskAgent agent,
             AnalysisStreamRegistry streams,
@@ -96,7 +115,8 @@ public class RiskAnalysisService {
             JsonMapper jsonMapper,
             AgentProperties properties,
             AnalysisExecutor executor,
-            PlatformTransactionManager transactionManager) {
+            PlatformTransactionManager transactionManager,
+            EntityManagerFactory entityManagerFactory) {
         this.agent = agent;
         this.streams = streams;
         this.analysisRuns = analysisRuns;
@@ -107,6 +127,9 @@ public class RiskAnalysisService {
         this.properties = properties;
         this.executor = executor;
         this.transactions = new TransactionTemplate(transactionManager);
+        // A transaction-aware shared proxy: the rows of a run are written through the EntityManager
+        // rather than through the repository, see RiskAssessmentWriter.
+        this.entityManager = SharedEntityManagerCreator.createSharedEntityManager(entityManagerFactory);
     }
 
     /**
@@ -192,7 +215,8 @@ public class RiskAnalysisService {
     private void execute(UUID assessmentId, UUID customerId, AnalysisTrace trace) {
         long startedAt = System.currentTimeMillis();
         try {
-            AgentRunResult result = agent.run(assessmentId, customerId, trace);
+            AgentRunResult result = agent.run(assessmentId, customerId, trace,
+                    new ProgressWriter(assessmentId, trace));
             persist(result, trace, AnalysisStatus.COMPLETED, null,
                     System.currentTimeMillis() - startedAt);
             log.info("Analysis {} completed: {} ({}), {}/{} rules evaluated by the agent, coverage {}",
@@ -259,9 +283,9 @@ public class RiskAnalysisService {
 
         transactions.executeWithoutResult(tx -> {
             riskAssessments.deleteByAssessmentId(result.assessmentId());
-            if (!rows.isEmpty()) {
-                riskAssessments.saveAll(rows);
-            }
+            // Written before the run header is loaded: the writer clears the persistence context as
+            // it batches, which would detach anything already loaded here.
+            RiskAssessmentWriter.write(entityManager, rows);
             AnalysisRun run = analysisRuns.findById(result.assessmentId()).orElseThrow(
                     () -> new IllegalStateException("Analysis run " + result.assessmentId()
                             + " disappeared while it was executing"));
@@ -286,7 +310,60 @@ public class RiskAnalysisService {
 
         trace.publishStatus(statusPayload(result.assessmentId(), status, result.riskLevel(),
                 result.totalScore(), result.rulesTotal(), result.ruleOutcomes().size(),
-                result.coverageComplete(), error));
+                result.coverageComplete(), error, result.steps()));
+    }
+
+    /**
+     * Publishes the counters of a run that is still going, to the database and to the stream.
+     *
+     * <p>Called from the analysis worker thread, so it is deliberately cheap: one indexed UPDATE of
+     * two integer columns, at most once every {@value #MIN_PROGRESS_INTERVAL_MS} ms unless a rule
+     * verdict just landed, and never a write per token. A failure here is logged and dropped - the
+     * analysis is the product, the progress report is a view of it.
+     */
+    private final class ProgressWriter implements AnalysisProgressListener {
+
+        private final UUID assessmentId;
+        private final AnalysisTrace trace;
+        private int lastSteps = -1;
+        private int lastRulesEvaluated = -1;
+        private long lastWriteAt;
+
+        private ProgressWriter(UUID assessmentId, AnalysisTrace trace) {
+            this.assessmentId = assessmentId;
+            this.trace = trace;
+        }
+
+        @Override
+        public synchronized void onProgress(int steps, int rulesEvaluated, int rulesTotal) {
+            boolean coverageMoved = rulesEvaluated != lastRulesEvaluated;
+            if (!coverageMoved && steps == lastSteps) {
+                return;
+            }
+            long now = System.currentTimeMillis();
+            if (!coverageMoved && now - lastWriteAt < MIN_PROGRESS_INTERVAL_MS) {
+                return;
+            }
+            lastSteps = steps;
+            lastRulesEvaluated = rulesEvaluated;
+            lastWriteAt = now;
+            try {
+                transactions.executeWithoutResult(tx -> entityManager.createQuery("""
+                        update AnalysisRun run
+                        set run.steps = :steps, run.rulesEvaluated = :evaluated
+                        where run.assessmentId = :assessmentId and run.status = :status
+                        """)
+                        .setParameter("steps", steps)
+                        .setParameter("evaluated", rulesEvaluated)
+                        .setParameter("assessmentId", assessmentId)
+                        .setParameter("status", AnalysisStatus.RUNNING)
+                        .executeUpdate());
+            } catch (RuntimeException e) {
+                log.debug("Could not record the progress of analysis {}", assessmentId, e);
+            }
+            trace.publishStatus(statusPayload(assessmentId, AnalysisStatus.RUNNING, null, null,
+                    rulesTotal, rulesEvaluated, false, null, steps));
+        }
     }
 
     /** Last-resort end state: the run is marked failed even if nothing else could be written. */
@@ -486,12 +563,19 @@ public class RiskAnalysisService {
     private String statusPayload(AnalysisRun run) {
         return statusPayload(run.getAssessmentId(), run.getStatus(), run.getRiskLevel(),
                 run.getTotalScore(), run.getRulesTotal(), run.getRulesEvaluated(),
-                run.isCoverageComplete(), run.getError());
+                run.isCoverageComplete(), run.getError(), run.getSteps());
     }
 
     private String statusPayload(UUID assessmentId, AnalysisStatus status,
             RiskLevel riskLevel, BigDecimal totalScore, int rulesTotal,
             int rulesEvaluated, boolean coverageComplete, String error) {
+        return statusPayload(assessmentId, status, riskLevel, totalScore, rulesTotal, rulesEvaluated,
+                coverageComplete, error, 0);
+    }
+
+    private String statusPayload(UUID assessmentId, AnalysisStatus status,
+            RiskLevel riskLevel, BigDecimal totalScore, int rulesTotal,
+            int rulesEvaluated, boolean coverageComplete, String error, int steps) {
         ObjectNode node = JsonNodeFactory.instance.objectNode();
         node.put("assessmentId", assessmentId.toString());
         node.put("status", status.name());
@@ -501,6 +585,7 @@ public class RiskAnalysisService {
         node.put("rulesEvaluated", rulesEvaluated);
         node.put("coverageComplete", coverageComplete);
         node.put("coveragePercent", coveragePercent(rulesEvaluated, rulesTotal));
+        node.put("steps", steps);
         node.put("error", error);
         return node.toString();
     }

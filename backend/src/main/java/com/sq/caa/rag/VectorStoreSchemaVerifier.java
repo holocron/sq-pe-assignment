@@ -34,6 +34,14 @@ import org.springframework.stereotype.Component;
  *
  * <p>A mismatch aborts startup with a message naming the exact problem, which is the same failure
  * mode as the built-in validator but arrives before the first request instead of during it.
+ *
+ * <p>It also reports, once, whether an approximate-nearest-neighbour index is reachable by the
+ * query {@code PgVectorStore} issues. At the configured 2,560 dimensions there is none - pgvector
+ * refuses {@code hnsw} and {@code ivfflat} on a {@code vector} column above 2,000 dimensions, and
+ * an index on a cast expression cannot serve a query that filters the raw column. That is a real
+ * property of the deployment rather than a defect, and stating it at startup is what stops the next
+ * maintainer from re-adding an index that looks like an optimisation and is not. See
+ * {@code V4__rag_fixes.sql}.
  */
 @Component
 public class VectorStoreSchemaVerifier implements InitializingBean {
@@ -48,6 +56,13 @@ public class VectorStoreSchemaVerifier implements InitializingBean {
             SELECT column_name
               FROM information_schema.columns
              WHERE table_schema = ? AND table_name = ?
+            """;
+
+    /** Any index whose definition mentions the embedding column, however it is expressed. */
+    private static final String EMBEDDING_INDEX_SQL = """
+            SELECT indexname
+              FROM pg_indexes
+             WHERE schemaname = ? AND tablename = ? AND indexdef LIKE '%embedding%'
             """;
 
     private static final String EMBEDDING_DIMENSION_SQL = """
@@ -117,6 +132,31 @@ public class VectorStoreSchemaVerifier implements InitializingBean {
 
         log.info("PgVectorStore schema verified: {} (id, content, metadata, embedding vector({}))",
                 qualifiedName(), dimensions);
+        reportVectorIndex();
+    }
+
+    /**
+     * Says out loud whether knowledge search is index-assisted or an exact scan, so the answer is
+     * in the log rather than in someone's assumption.
+     */
+    private void reportVectorIndex() {
+        List<String> indexes;
+        try {
+            indexes = jdbcTemplate.queryForList(EMBEDDING_INDEX_SQL, String.class, schemaName,
+                    tableName);
+        } catch (RuntimeException e) {
+            log.debug("Could not inspect the indexes on {}", qualifiedName(), e);
+            return;
+        }
+        if (indexes.isEmpty()) {
+            log.info("Knowledge search over {} is an exact nearest-neighbour scan: pgvector "
+                    + "supports no ANN index on a vector({}) column, and PgVectorStore orders by "
+                    + "the raw column so an index on a cast could not be used. Results are exact; "
+                    + "cost grows linearly with the corpus. See V4__rag_fixes.sql.",
+                    qualifiedName(), dimensions);
+        } else {
+            log.info("Vector index(es) present on {}: {}", qualifiedName(), indexes);
+        }
     }
 
     private String qualifiedName() {

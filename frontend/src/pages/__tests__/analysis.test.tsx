@@ -9,6 +9,7 @@ import type {
   TraceStep,
   UUID,
 } from '../../api/types'
+import { normalizeRuleEvaluation } from '../../api/analyses'
 import { AnalysisResultView } from '../analysis/AnalysisResultView'
 import { TraceViewer } from '../analysis/TraceViewer'
 import { coverageStats } from '../analysis/coverage'
@@ -61,6 +62,12 @@ const RULE_IDS = {
   dormantSpike: 'a0000000-0000-4000-8000-000000000006',
 } as const
 
+/**
+ * `AnalysisDtos.RuleEvaluationView` as it really arrives — key names copied
+ * from a live `GET /api/analyses/{id}`: the score is `score` and the evidence
+ * is `matchedTransactionIds`. Hand-written fixtures in the frontend's own
+ * invented vocabulary are what let a crashing screen ship with a green suite.
+ */
 const EVALUATIONS: RuleEvaluation[] = [
   {
     ruleId: RULE_IDS.structuring,
@@ -68,9 +75,13 @@ const EVALUATIONS: RuleEvaluation[] = [
     appliesTo: 'PAYMENT',
     weight: 30,
     triggered: true,
-    scoreContribution: 30,
+    score: 30,
+    matchedCount: 2,
+    evaluatedTransactionCount: 14,
     rationale: 'Eleven payments between 9,500 and 9,999 USD across nine days.',
-    transactionIds: [TX_ONE, TX_TWO],
+    explanation:
+      "Rule 'Structuring pattern under reporting threshold' triggered on 2 of 14 PAYMENT transaction(s).",
+    matchedTransactionIds: [TX_ONE, TX_TWO],
     source: 'AGENT',
   },
   {
@@ -79,11 +90,15 @@ const EVALUATIONS: RuleEvaluation[] = [
     appliesTo: 'PAYMENT',
     weight: 40,
     triggered: true,
-    scoreContribution: 32.5,
+    score: 32.5,
+    matchedCount: 1,
+    evaluatedTransactionCount: 14,
     rationale: 'One SWIFT wire of 48,000 USD to a bank in a listed jurisdiction.',
-    transactionIds: [TX_TWO],
+    matchedTransactionIds: [TX_TWO],
     source: 'DETERMINISTIC_FALLBACK',
     disagreement: true,
+    degraded: true,
+    degradationNotes: ["'payment.receiver_bank_country' has no value on at least one transaction"],
   },
   {
     ruleId: RULE_IDS.cryptoMixer,
@@ -91,9 +106,10 @@ const EVALUATIONS: RuleEvaluation[] = [
     appliesTo: 'CRYPTO',
     weight: 25,
     triggered: false,
-    scoreContribution: 0,
+    score: 0,
+    matchedCount: 0,
     rationale: 'No crypto activity in the review window.',
-    transactionIds: [],
+    matchedTransactionIds: [],
     source: 'AGENT',
   },
   {
@@ -102,9 +118,10 @@ const EVALUATIONS: RuleEvaluation[] = [
     appliesTo: 'CARD',
     weight: 20,
     triggered: false,
-    scoreContribution: 0,
+    score: 0,
+    matchedCount: 0,
     rationale: 'Only two declines, below the threshold of five.',
-    transactionIds: [],
+    matchedTransactionIds: [],
     source: 'AGENT',
   },
   {
@@ -113,9 +130,10 @@ const EVALUATIONS: RuleEvaluation[] = [
     appliesTo: 'CARD',
     weight: 15,
     triggered: false,
-    scoreContribution: 0,
+    score: 0,
+    matchedCount: 0,
     rationale: 'Highest card-not-present amount was 1,240 USD.',
-    transactionIds: [],
+    matchedTransactionIds: [],
     source: 'AGENT',
   },
   {
@@ -124,9 +142,10 @@ const EVALUATIONS: RuleEvaluation[] = [
     appliesTo: 'ALL',
     weight: 10,
     triggered: false,
-    scoreContribution: 0,
+    score: 0,
+    matchedCount: 0,
     rationale: 'Account has been continuously active for 90 days.',
-    transactionIds: [],
+    matchedTransactionIds: [],
     source: 'AGENT',
   },
 ]
@@ -234,6 +253,32 @@ describe('AnalysisResultView — completed analysis', () => {
     expect(within(table).getByText('Deterministic fallback')).toBeInTheDocument()
   })
 
+  /* `score` on the wire, not `scoreContribution`: reading the wrong key
+     rendered '+—' in the Score column of every triggered rule. */
+  it('shows each rule score contribution in the Score column', () => {
+    renderWithQueryClient(<AnalysisResultView analysis={COMPLETED} />)
+
+    const table = screen.getByRole('table', { name: /Rule coverage/ })
+    // Triggered rows carry a leading '+'; a missing key would render '+—'.
+    expect(within(table).getByText('+30.00')).toBeInTheDocument()
+    expect(within(table).getByText('+32.50')).toBeInTheDocument()
+    expect(within(table).getAllByText('0.00')).toHaveLength(4)
+    expect(within(table).queryByText('—')).not.toBeInTheDocument()
+    expect(within(table).queryByText('+—')).not.toBeInTheDocument()
+  })
+
+  it('ranks triggered rules by contribution, not alphabetically', () => {
+    renderWithQueryClient(<AnalysisResultView analysis={COMPLETED} />)
+
+    const names = within(screen.getByRole('table', { name: /Rule coverage/ }))
+      .getAllByRole('row')
+      .map((row) => row.textContent ?? '')
+    const sanctioned = names.findIndex((text) => text.includes('sanctioned jurisdiction'))
+    const structuring = names.findIndex((text) => text.includes('Structuring pattern'))
+    expect(sanctioned).toBeGreaterThan(-1)
+    expect(sanctioned).toBeLessThan(structuring)
+  })
+
   it('flags a disagreement between the agent and the deterministic engine', () => {
     renderWithQueryClient(<AnalysisResultView analysis={COMPLETED} />)
 
@@ -259,6 +304,37 @@ describe('AnalysisResultView — completed analysis', () => {
     const matched = screen.getByRole('table', { name: /matched this rule/ })
     expect(await within(matched).findByText('11111111')).toBeInTheDocument()
     expect(await within(matched).findByText('22222222')).toBeInTheDocument()
+
+    // The deterministic engine's own account of the verdict.
+    expect(screen.getByText(/triggered on 2 of 14 PAYMENT transaction/)).toBeInTheDocument()
+  })
+
+  it('surfaces the degradation notes of a degraded rule when it is expanded', () => {
+    renderWithQueryClient(<AnalysisResultView analysis={COMPLETED} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /High-value wire to sanctioned/ }))
+
+    expect(screen.getByText('Degraded conditions')).toBeInTheDocument()
+    expect(
+      screen.getByText(
+        "'payment.receiver_bank_country' has no value on at least one transaction",
+      ),
+    ).toBeInTheDocument()
+  })
+
+  /* A run that stopped before recording its evidence must not blank the page:
+     the coverage table is the whole point of the screen. */
+  it('renders a verdict whose matched transactions were never recorded', () => {
+    const partial: AnalysisResult = {
+      ...COMPLETED,
+      ruleEvaluations: [
+        normalizeRuleEvaluation({ ...EVALUATIONS[0], matchedTransactionIds: undefined }),
+      ],
+    }
+    renderWithQueryClient(<AnalysisResultView analysis={partial} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Structuring pattern/ }))
+    expect(screen.getByText('No transaction matched this rule.')).toBeInTheDocument()
   })
 
   it('reports an incomplete coverage set while the run is still going', () => {

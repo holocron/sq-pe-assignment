@@ -35,6 +35,7 @@ import {
   formatCountry,
   formatDate,
   formatDateTime,
+  formatMoney,
   formatNumber,
   formatRelativeTime,
   fullName,
@@ -219,34 +220,62 @@ export function DashboardPage() {
       className: 'w-40 hidden md:table-cell',
       headerClassName: 'hidden md:table-cell',
     },
+    /* The four aggregate columns below read `transactionCount`, `totalAmount`,
+       `lastActivityAt` and `lastRiskLevel` from `CustomerDtos.CustomerSummary`.
+       Each one degrades to an em dash (or, for risk, to the analysis fan-out)
+       when the value is absent, so a row is never blank without saying so. */
     {
       key: 'transactions',
       header: 'Activity',
       align: 'right',
       cell: (customer) => (
-        <span className="numeric text-muted">{formatNumber(customer.transactionCount)}</span>
+        <span
+          className="numeric text-muted"
+          title={
+            customer.transactionCount === null || customer.transactionCount === undefined
+              ? 'No transaction count reported for this customer'
+              : 'Transactions on file'
+          }
+        >
+          {formatNumber(customer.transactionCount)}
+        </span>
       ),
       className: 'w-20',
     },
     {
       key: 'totalAmount',
-      // The customer list carries no currency, so the column says so rather
-      // than implying a single one.
+      /* There are no FX rates in this system, so the API sums the customer's
+         dominant currency only. Saying "all currencies" would be a fabricated
+         figure; the header states what the number really is. */
       header: (
         <span className="flex flex-col items-end leading-tight">
           <span>Total amount</span>
-          <span className="text-2xs font-normal normal-case text-subtle">all currencies</span>
+          <span className="text-2xs font-normal normal-case text-subtle">main currency</span>
         </span>
       ),
       align: 'right',
-      cell: (customer) => (
-        <span
-          className="numeric whitespace-nowrap font-medium text-fg"
-          title="Sum across all currencies on file"
-        >
-          {formatAmount(customer.totalAmount)}
-        </span>
-      ),
+      cell: (customer) => {
+        const amount = customer.totalAmount
+        const currency = customer.totalAmountCurrency
+        if (amount === null || amount === undefined) {
+          return <span className="numeric text-muted">{EM_DASH}</span>
+        }
+        return (
+          <span
+            className="numeric flex flex-col items-end leading-tight whitespace-nowrap font-medium text-fg"
+            title={
+              currency
+                ? `Sum of ${currency} transactions${customer.mixedCurrency ? '; this customer also transacts in other currencies, which are not included' : ''}`
+                : 'Sum of the transactions on file'
+            }
+          >
+            <span>{currency ? formatMoney(amount, currency) : formatAmount(amount)}</span>
+            {customer.mixedCurrency ? (
+              <span className="text-2xs font-normal text-subtle">+ other currencies</span>
+            ) : null}
+          </span>
+        )
+      },
       className: 'w-36 hidden lg:table-cell',
       headerClassName: 'hidden lg:table-cell',
     },

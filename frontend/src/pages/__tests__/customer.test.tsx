@@ -3,12 +3,19 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import type { ReactNode } from 'react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { CustomerSummary, SpringPage, TransactionWire } from '../../api/types'
+import type {
+  ActivitySummaryWire,
+  CustomerSummary,
+  SpringPage,
+  TransactionWire,
+} from '../../api/types'
 import { ToastProvider } from '../../components/ui/Toast'
-import { formatMoney } from '../../lib/format'
+import { EM_DASH, formatDateTime, formatMoney } from '../../lib/format'
+import { normalizeActivitySummary } from '../../api/customers'
 import { CustomerPage } from '../CustomerPage'
 import { DashboardPage } from '../DashboardPage'
 import { ActivityPanel } from '../customer/ActivityPanel'
+import { ActivitySummaryCards } from '../customer/ActivitySummaryCards'
 
 /* The HTTP layer is the only thing mocked — the real query hooks, normalisers
    and formatters all run, so a contract drift shows up here. */
@@ -32,8 +39,11 @@ const CUSTOMERS: CustomerSummary[] = [
     age: 38,
     transactionCount: 48,
     totalAmount: 128400.5,
+    totalAmountCurrency: 'EUR',
+    mixedCurrency: true,
     lastActivityAt: '2026-08-27T09:15:00Z',
     lastRiskLevel: 'HIGH',
+    lastAnalysisAt: '2026-08-28T10:01:30Z',
   },
   {
     customerId: OTHER_CUSTOMER_ID,
@@ -44,8 +54,11 @@ const CUSTOMERS: CustomerSummary[] = [
     age: 46,
     transactionCount: 12,
     totalAmount: 4200,
+    totalAmountCurrency: 'GBP',
+    mixedCurrency: false,
     lastActivityAt: '2026-08-20T11:00:00Z',
     lastRiskLevel: 'LOW',
+    lastAnalysisAt: '2026-08-19T08:00:00Z',
   },
 ]
 
@@ -106,39 +119,83 @@ const CRYPTO_TRANSACTION: TransactionWire = {
 
 const TRANSACTIONS = [CARD_TRANSACTION, PAYMENT_TRANSACTION, CRYPTO_TRANSACTION]
 
-const SUMMARY = {
+/**
+ * The exact payload `GET /api/customers/{id}/summary` returns — key names
+ * copied from a live response, not invented. The counts are `transactionCount`,
+ * the currency and country rollups are objects under `byCurrency` /
+ * `counterpartyCountries`, and there is no `count`, `currencies` or `countries`
+ * key anywhere. Typed as the wire shape so a drift is a compile error.
+ */
+const SUMMARY: ActivitySummaryWire = {
   customerId: CUSTOMER_ID,
+  customer: {
+    customerId: CUSTOMER_ID,
+    firstName: 'Mila',
+    lastName: 'Novak',
+    fullName: 'Mila Novak',
+    dob: '1988-04-12',
+    age: 38,
+    country: 'SI',
+  },
   totalTransactions: 3,
   totalAmount: 26500,
-  currencies: ['USD', 'EUR'],
-  countries: ['IR', 'US'],
-  byActivityType: [
-    { activityType: 'CARD', count: 1, totalAmount: 12500 },
-    { activityType: 'PAYMENT', count: 1, totalAmount: 9800 },
-    { activityType: 'CRYPTO', count: 1, totalAmount: 4200 },
-  ],
-  byStatus: [
-    { status: 'Completed', count: 1 },
-    { status: 'Failed', count: 1 },
-    { status: 'Pending', count: 1 },
-  ],
   firstActivityAt: '2026-08-25T22:41:00Z',
   lastActivityAt: '2026-08-27T09:15:00Z',
+  completedCount: 1,
+  pendingCount: 1,
+  failedCount: 1,
+  reversedCount: 0,
+  failedAmount: 12500,
+  reversedAmount: 0,
+  failedRatio: 0.3333,
+  distinctCurrencies: 2,
+  distinctCounterpartyCountries: 2,
+  txCount24h: 2,
+  amountSum24h: 22300,
+  failedCount24h: 1,
+  distinctCountries30d: 2,
+  cryptoRatio30d: 0.3333,
+  maxAmount30d: 12500,
+  byActivityType: [
+    { activityType: 'CARD', transactionCount: 1, totalAmount: 12500 },
+    { activityType: 'PAYMENT', transactionCount: 1, totalAmount: 9800 },
+    { activityType: 'CRYPTO', transactionCount: 1, totalAmount: 4200 },
+  ],
+  byStatus: [
+    { status: 'Completed', transactionCount: 1, totalAmount: 4200 },
+    { status: 'Failed', transactionCount: 1, totalAmount: 12500 },
+    { status: 'Pending', transactionCount: 1, totalAmount: 9800 },
+  ],
+  byCurrency: [
+    { currency: 'USD', transactionCount: 2, totalAmount: 16700 },
+    { currency: 'EUR', transactionCount: 1, totalAmount: 9800 },
+  ],
+  counterpartyCountries: [
+    { country: 'IR', transactionCount: 1, totalAmount: 9800 },
+    { country: 'US', transactionCount: 1, totalAmount: 12500 },
+  ],
+  dailyTimeline: [
+    { date: '2026-08-25', transactionCount: 1, totalAmount: 4200 },
+    { date: '2026-08-26', transactionCount: 0, totalAmount: 0 },
+    { date: '2026-08-27', transactionCount: 2, totalAmount: 22300 },
+  ],
+  latestAnalysis: null,
 }
 
 type Params = Record<string, string | number | undefined>
 
+/** The backend's own envelope: flat, with `page` as the zero-based index. */
 function page<T>(content: T[], params: Params): SpringPage<T> {
   const size = Number(params.size ?? 20)
+  const index = Number(params.page ?? 0)
+  const start = index * size
+  const rows = content.slice(start, start + size)
   return {
-    content,
+    content: rows,
+    page: index,
     size,
-    number: Number(params.page ?? 0),
     totalElements: content.length,
     totalPages: content.length === 0 ? 0 : Math.ceil(content.length / size),
-    first: true,
-    last: true,
-    empty: content.length === 0,
   }
 }
 
@@ -169,9 +226,12 @@ function respond(url: string, params: Params): unknown {
       customerId: CUSTOMER_ID,
       firstName: 'Mila',
       lastName: 'Novak',
+      fullName: 'Mila Novak',
       dob: '1988-04-12',
       country: 'SI',
       age: 38,
+      transactionCount: 3,
+      analysisCount: 0,
     }
   }
   if (url.startsWith('/transactions/')) {
@@ -346,6 +406,50 @@ describe('dashboard customer search', () => {
     expect(await screen.findByText('Customer profile route')).toBeInTheDocument()
   })
 
+  /* The four aggregate columns are served by CustomerDtos.CustomerSummary.
+     They must render the figures when present and an em dash when not — the
+     one thing they must never do is look like the data does not exist. */
+  it('renders the activity, amount, last-activity and risk columns', async () => {
+    renderDashboard()
+
+    const row = (await screen.findByText('Mila Novak')).closest('tr') as HTMLElement
+    expect(within(row).getByText('48')).toBeInTheDocument()
+    // The API sums the dominant currency only, so the cell names it and flags
+    // that other currencies exist rather than implying a grand total.
+    expect(within(row).getByText(formatMoney(128400.5, 'EUR'))).toBeInTheDocument()
+    expect(within(row).getByText('+ other currencies')).toBeInTheDocument()
+    expect(within(row).getByTitle(formatDateTime('2026-08-27T09:15:00Z'))).toBeInTheDocument()
+    expect(within(row).getByText('HIGH')).toBeInTheDocument()
+
+    const single = (screen.getByText('Ada Sterling')).closest('tr') as HTMLElement
+    expect(within(single).getByText(formatMoney(4200, 'GBP'))).toBeInTheDocument()
+    expect(within(single).queryByText('+ other currencies')).not.toBeInTheDocument()
+  })
+
+  it('degrades each aggregate column to an em dash when the API omits it', async () => {
+    getJsonMock.mockImplementation((url: string, config?: { params?: Params }) => {
+      if (url === '/customers') {
+        const bare: CustomerSummary[] = [
+          {
+            customerId: CUSTOMER_ID,
+            firstName: 'Mila',
+            lastName: 'Novak',
+            dob: '1988-04-12',
+            country: 'SI',
+            age: 38,
+          },
+        ]
+        return Promise.resolve(page(bare, config?.params ?? {}))
+      }
+      return Promise.resolve(respond(url, config?.params ?? {}))
+    })
+    renderDashboard()
+
+    const row = (await screen.findByText('Mila Novak')).closest('tr') as HTMLElement
+    expect(within(row).getAllByText(EM_DASH).length).toBeGreaterThanOrEqual(3)
+    expect(within(row).getByText('Not assessed')).toBeInTheDocument()
+  })
+
   it('shows an empty state when the search matches nothing', async () => {
     renderDashboard()
     await screen.findByText('Mila Novak')
@@ -375,11 +479,114 @@ describe('customer profile page', () => {
     )
     expect(screen.getByText(CUSTOMER_ID)).toBeInTheDocument()
 
-    // Aggregates from GET /customers/{id}/summary.
-    expect(await screen.findByText('Counterparty countries')).toBeInTheDocument()
+    // Aggregates read from `counterpartyCountries`, the real wire key.
+    expect(await screen.findAllByText('Counterparty countries')).not.toHaveLength(0)
     expect(screen.getByText('IR, US')).toBeInTheDocument()
 
     // The activity ledger is wired to the same customer.
     expect(await screen.findByText('Aurora Electronics · MCC 5732')).toBeInTheDocument()
+  })
+
+  /* Guards the two field-name mismatches that used to blank this screen:
+     `countries`/`currencies` (which crashed the whole SPA) and `count` vs
+     `transactionCount` (which rendered zeros and an em dash). */
+  it('renders every aggregate tile from the real summary payload', async () => {
+    renderWithProviders(
+      <ActivitySummaryCards
+        summary={normalizeActivitySummary(SUMMARY)}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    const countryTile = screen.getByText('Counterparty countries').closest('div')
+      ?.parentElement as HTMLElement
+    expect(within(countryTile).getByText('2')).toBeInTheDocument()
+    expect(within(countryTile).getByText('IR, US')).toBeInTheDocument()
+
+    // byStatus[].transactionCount — an em dash here means the key drifted.
+    expect(screen.getByText('1 / 0')).toBeInTheDocument()
+    expect(screen.getByText('33.3% of activity failed')).toBeInTheDocument()
+
+    // The agg.* peaks render for every customer. The server folds each rolling
+    // window with max over the whole history, so the labels must say "peak" -
+    // a bare "Transactions, 24h" would misreport a dormant customer's history
+    // as current activity.
+    expect(screen.getByText('Velocity and exposure')).toBeInTheDocument()
+    expect(screen.getByText('Max distinct countries, 30d')).toBeInTheDocument()
+    expect(screen.getByText('Peak transactions, 24h')).toBeInTheDocument()
+    expect(screen.getByText(/highest the rolling window ever reached/)).toBeInTheDocument()
+    expect(screen.queryByText(/windows end at/)).not.toBeInTheDocument()
+    const cryptoShare = screen.getByText('Max crypto share, 30d').closest('div') as HTMLElement
+    expect(within(cryptoShare).getByText('33.3%')).toBeInTheDocument()
+
+    // One tile per activity type, each with its own transaction count.
+    expect(screen.getAllByText('1 tx')).toHaveLength(3)
+
+    // Two currencies on file, so amounts stay unlabelled rather than guessing.
+    expect(screen.getByText('Mixed currencies: USD, EUR')).toBeInTheDocument()
+  })
+
+  it('labels a single-currency customer with its currency symbol', () => {
+    const single = normalizeActivitySummary({
+      ...SUMMARY,
+      distinctCurrencies: 1,
+      byCurrency: [{ currency: 'CHF', transactionCount: 3, totalAmount: 26500 }],
+    })
+    renderWithProviders(
+      <ActivitySummaryCards summary={single} loading={false} error={null} onRetry={() => {}} />,
+    )
+
+    expect(screen.getByText('Currency CHF')).toBeInTheDocument()
+    expect(screen.getAllByText(formatMoney(26500, 'CHF')).length).toBeGreaterThan(0)
+  })
+
+  it('counts each activity tab from byActivityType[].transactionCount', async () => {
+    renderWithProviders(
+      <ActivityPanel customerId={CUSTOMER_ID} summary={normalizeActivitySummary(SUMMARY)} />,
+    )
+
+    await screen.findByRole('tab', { name: /All activity\s*3/ })
+    expect(screen.getByRole('tab', { name: /^Card\s*1$/ })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /^Payment\s*1$/ })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /^Crypto\s*1$/ })).toBeInTheDocument()
+  })
+})
+
+describe('paging against the backend envelope', () => {
+  it('advances through pages instead of sticking on the first one', async () => {
+    const many: CustomerSummary[] = Array.from({ length: 7 }, (_, index) => ({
+      customerId: `0000000${index}-0000-4000-8000-00000000000${index}`,
+      firstName: 'Customer',
+      lastName: `Number ${index}`,
+      country: 'CH',
+      dob: '1990-01-01',
+      age: 36,
+    }))
+    getJsonMock.mockImplementation((url: string, config?: { params?: Params }) => {
+      if (url === '/customers') return Promise.resolve(page(many, { ...config?.params, size: 5 }))
+      return Promise.resolve(respond(url, config?.params ?? {}))
+    })
+
+    renderWithProviders(
+      <Routes>
+        <Route path="/dashboard" element={<DashboardPage />} />
+      </Routes>,
+      ['/dashboard'],
+    )
+
+    expect(await screen.findByText('Customer Number 0')).toBeInTheDocument()
+    const previous = screen.getByRole('button', { name: /previous page/i })
+    expect(previous).toBeDisabled()
+
+    fireEvent.click(screen.getByRole('button', { name: /next page/i }))
+
+    // Page 2 of 2: the widget must now read the server's `page: 1`.
+    expect(await screen.findByText('Customer Number 5')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /previous page/i })).toBeEnabled()
+    })
+    expect(screen.queryByText('Customer Number 0')).not.toBeInTheDocument()
   })
 })

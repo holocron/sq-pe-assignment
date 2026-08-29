@@ -218,6 +218,12 @@ public class DocxTextExtractor implements DocumentTextExtractor {
             return 0;
         }
         if (block.styleLevel() > 0) {
+            // A styled paragraph longer than a plausible heading is a paragraph that inherited a
+            // heading style, not a heading. Treating it as one would prepend the whole thing to
+            // every window of the section and copy it into every chunk's section_title.
+            if (block.text().length() > HeadingHeuristics.MAX_HEADING_LENGTH) {
+                return 0;
+            }
             return block.styleLevel() <= MAX_SECTION_HEADING_LEVEL ? block.styleLevel() : 0;
         }
         if (styledHeadings) {
@@ -244,7 +250,8 @@ public class DocxTextExtractor implements DocumentTextExtractor {
             return HeadingHeuristics.normaliseTitle(fromProperties);
         }
         for (Block block : blocks) {
-            if (block.styleLevel() == 1 && !block.text().isBlank()) {
+            if (block.styleLevel() == 1 && !block.text().isBlank()
+                    && block.text().length() <= HeadingHeuristics.MAX_HEADING_LENGTH) {
                 return HeadingHeuristics.normaliseTitle(block.text());
             }
         }

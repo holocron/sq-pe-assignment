@@ -7,6 +7,7 @@ import { normalizeTransaction } from './transactions'
 import type {
   ActivityQueryParams,
   ActivitySummary,
+  ActivitySummaryWire,
   Customer,
   CustomerSearchParams,
   CustomerSummary,
@@ -18,6 +19,27 @@ import type {
 } from './types'
 
 export const DEFAULT_PAGE_SIZE = 20
+
+/**
+ * The summary endpoint reports currencies as `byCurrency` rollup objects. The
+ * UI only ever needs the codes — to decide whether one currency symbol may be
+ * used on the aggregate amounts — so they are derived here rather than each
+ * component reaching into the rollup. Every other field keeps its wire name.
+ */
+export function normalizeActivitySummary(wire: ActivitySummaryWire): ActivitySummary {
+  const byCurrency = wire.byCurrency ?? []
+  return {
+    ...wire,
+    byActivityType: wire.byActivityType ?? [],
+    byStatus: wire.byStatus ?? [],
+    byCurrency,
+    counterpartyCountries: wire.counterpartyCountries ?? [],
+    dailyTimeline: wire.dailyTimeline ?? [],
+    currencies: byCurrency
+      .map((entry) => entry.currency)
+      .filter((code): code is string => Boolean(code)),
+  }
+}
 
 /** `GET /api/customers?query=&page=&size=` */
 export async function searchCustomers(
@@ -39,8 +61,10 @@ export function fetchCustomer(customerId: UUID): Promise<Customer> {
 }
 
 /** `GET /api/customers/{customerId}/summary` */
-export function fetchCustomerSummary(customerId: UUID): Promise<ActivitySummary> {
-  return getJson<ActivitySummary>(`/customers/${customerId}/summary`)
+export async function fetchCustomerSummary(customerId: UUID): Promise<ActivitySummary> {
+  return normalizeActivitySummary(
+    await getJson<ActivitySummaryWire>(`/customers/${customerId}/summary`),
+  )
 }
 
 /** `GET /api/customers/{customerId}/activity?type=&status=&from=&to=&page=&size=` */

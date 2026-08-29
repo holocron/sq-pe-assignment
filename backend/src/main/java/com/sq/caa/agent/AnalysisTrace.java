@@ -3,10 +3,13 @@ package com.sq.caa.agent;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Deque;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.Executor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -24,7 +27,11 @@ import tools.jackson.databind.node.ObjectNode;
  * registration.
  *
  * <p>A dead subscriber is dropped rather than allowed to fail the run - the analysis is the product,
- * the stream is only a view of it.
+ * the stream is only a view of it. That principle also decides who does the writing: recording a
+ * step never touches a socket. Each subscriber owns a bounded queue and is drained on a shared
+ * fan-out executor, so a browser that has stopped reading - a suspended tab, a paused proxy, a full
+ * TCP window - can at worst fill its own queue and be dropped. It can never hold up the analysis
+ * thread, and it cannot delay the other subscribers of the same run either.
  */
 public final class AnalysisTrace {
 
@@ -36,17 +43,38 @@ public final class AnalysisTrace {
     /** SSE event carrying the run header / status transitions. */
     public static final String EVENT_STATUS = "status";
 
+    /**
+     * Events one subscriber may fall behind by before it is dropped. Generous next to a run's ~40
+     * steps, so only a client that has genuinely stopped reading ever hits it - and dropping it is
+     * harmless, because reconnecting replays the whole transcript.
+     */
+    private static final int MAX_QUEUED_EVENTS = 512;
+
+    /** Queue marker meaning "nothing more is coming; complete this client". */
+    private static final String[] COMPLETE = new String[0];
+
     private final UUID assessmentId;
     private final JsonNodeFactory nodes;
+    private final Executor dispatcher;
     private final List<TraceStep> steps = new ArrayList<>();
-    private final List<SseEmitter> subscribers = new ArrayList<>();
+    private final List<Subscription> subscribers = new ArrayList<>();
     private final Object lock = new Object();
     private String lastStatusEvent;
     private boolean closed;
 
+    /**
+     * A transcript that fans out on the calling thread. Only for callers that never subscribe -
+     * tests, and the deterministic-only path; production goes through
+     * {@link AnalysisStreamRegistry}, which supplies the fan-out executor.
+     */
     public AnalysisTrace(UUID assessmentId, JsonNodeFactory nodes) {
+        this(assessmentId, nodes, Runnable::run);
+    }
+
+    public AnalysisTrace(UUID assessmentId, JsonNodeFactory nodes, Executor dispatcher) {
         this.assessmentId = assessmentId;
         this.nodes = nodes == null ? JsonNodeFactory.instance : nodes;
+        this.dispatcher = dispatcher == null ? Runnable::run : dispatcher;
     }
 
     public UUID assessmentId() {
@@ -133,6 +161,24 @@ public final class AnalysisTrace {
                         + ")."));
     }
 
+    /**
+     * The model wrote its conclusion as prose instead of calling {@code submit_final_assessment},
+     * and the loop accepted it because every rule already had a verdict.
+     */
+    public TraceStep proseFinal(String riskLevel, String summary) {
+        ObjectNode detail = nodes.objectNode();
+        detail.put("risk_level", riskLevel);
+        detail.put("source", "assistant_message");
+        return add(builder(TraceStep.Type.PROSE_FINAL)
+                .riskLevel(riskLevel)
+                .detail(detail)
+                .text("The model wrote its final assessment as prose instead of calling "
+                        + "submit_final_assessment. Every rule already had a verdict, so the "
+                        + "assessment was parsed out of the message and accepted rather than "
+                        + "costing another round trip. Proposed level: " + riskLevel + ". "
+                        + TraceStep.truncate(summary, TraceStep.TEXT_LIMIT / 4)));
+    }
+
     public TraceStep finalStep(String riskLevel, String summary, BigDecimal totalScore,
             int rulesTotal, boolean coverageComplete) {
         ObjectNode detail = nodes.objectNode();
@@ -155,7 +201,7 @@ public final class AnalysisTrace {
 
     private TraceStep add(StepBuilder builder) {
         TraceStep step;
-        List<SseEmitter> targets;
+        List<Subscription> targets;
         String payload;
         synchronized (lock) {
             step = builder.build(steps.size() + 1);
@@ -163,6 +209,8 @@ public final class AnalysisTrace {
             payload = step.toJson(nodes).toString();
             targets = List.copyOf(subscribers);
         }
+        // Queue only - the actual socket writes happen on the fan-out executor, so this returns at
+        // the speed of an ArrayDeque no matter how slowly the browsers are reading.
         dispatch(targets, EVENT_STEP, payload);
         return step;
     }
@@ -175,43 +223,46 @@ public final class AnalysisTrace {
      * Replays the transcript into {@code emitter} and, when the run is still open, registers it for
      * every later step. Returns {@code false} when the run has already finished, in which case the
      * caller must complete the emitter itself.
+     *
+     * <p>Registration and replay happen under the same monitor and into the same per-subscriber
+     * queue, so the stream is gap-free <em>and</em> in order: a step recorded while the replay is
+     * still being written cannot overtake it.
      */
     public boolean subscribe(SseEmitter emitter, String statusPayload) {
-        List<String> replay;
-        boolean live;
-        String status;
+        Subscription subscription;
         synchronized (lock) {
-            replay = steps.stream().map(step -> step.toJson(nodes).toString()).toList();
-            status = lastStatusEvent != null ? lastStatusEvent : statusPayload;
-            live = !closed;
-            if (live) {
-                subscribers.add(emitter);
-                emitter.onCompletion(() -> unsubscribe(emitter));
-                emitter.onTimeout(() -> {
-                    unsubscribe(emitter);
-                    emitter.complete();
-                });
-                emitter.onError(error -> unsubscribe(emitter));
+            if (closed) {
+                return false;
+            }
+            subscription = new Subscription(emitter);
+            subscribers.add(subscription);
+            emitter.onCompletion(() -> unsubscribe(subscription));
+            emitter.onTimeout(() -> {
+                unsubscribe(subscription);
+                emitter.complete();
+            });
+            emitter.onError(error -> unsubscribe(subscription));
+            String status = lastStatusEvent != null ? lastStatusEvent : statusPayload;
+            if (status != null) {
+                subscription.offer(EVENT_STATUS, status);
+            }
+            for (TraceStep step : steps) {
+                subscription.offer(EVENT_STEP, step.toJson(nodes).toString());
             }
         }
-        if (status != null) {
-            send(emitter, EVENT_STATUS, status);
-        }
-        for (String step : replay) {
-            send(emitter, EVENT_STEP, step);
-        }
-        return live;
+        subscription.kick();
+        return true;
     }
 
-    private void unsubscribe(SseEmitter emitter) {
+    private void unsubscribe(Subscription subscription) {
         synchronized (lock) {
-            subscribers.remove(emitter);
+            subscribers.remove(subscription);
         }
     }
 
     /** Broadcasts a status transition and remembers it so late subscribers still see it. */
     public void publishStatus(String payload) {
-        List<SseEmitter> targets;
+        List<Subscription> targets;
         synchronized (lock) {
             lastStatusEvent = payload;
             targets = List.copyOf(subscribers);
@@ -219,36 +270,147 @@ public final class AnalysisTrace {
         dispatch(targets, EVENT_STATUS, payload);
     }
 
-    /** Closes the stream: no further steps are accepted for fan-out and every client is completed. */
+    /**
+     * Closes the stream: no further steps are accepted for fan-out and every client is completed
+     * once whatever it has already been sent has drained.
+     */
     public void close() {
-        List<SseEmitter> targets;
+        List<Subscription> targets;
         synchronized (lock) {
+            if (closed) {
+                return;
+            }
             closed = true;
             targets = List.copyOf(subscribers);
             subscribers.clear();
         }
-        for (SseEmitter emitter : targets) {
+        for (Subscription subscription : targets) {
+            subscription.offer(null, null);
+            subscription.kick();
+        }
+    }
+
+    /** Subscribers currently attached; used by the tests that assert nothing is left behind. */
+    public int subscriberCount() {
+        synchronized (lock) {
+            return subscribers.size();
+        }
+    }
+
+    private void dispatch(List<Subscription> targets, String event, String payload) {
+        for (Subscription subscription : targets) {
+            subscription.offer(event, payload);
+            subscription.kick();
+        }
+    }
+
+    /**
+     * One SSE client, its backlog and the guarantee that exactly one thread writes to it at a time.
+     *
+     * <p>{@link #offer} is called from the analysis thread and never blocks; {@link #drain} runs on
+     * the fan-out executor and does the blocking write. Ordering is preserved because a subscriber
+     * is only ever being drained by one task, which the {@code draining} flag enforces.
+     */
+    private final class Subscription {
+
+        private final SseEmitter emitter;
+        private final Deque<String[]> pending = new ArrayDeque<>();
+        private boolean draining;
+        private boolean finished;
+
+        private Subscription(SseEmitter emitter) {
+            this.emitter = emitter;
+        }
+
+        /** Queues one event, or the completion sentinel when {@code event} is null. */
+        private void offer(String event, String payload) {
+            synchronized (this) {
+                if (finished) {
+                    return;
+                }
+                if (event != null && pending.size() >= MAX_QUEUED_EVENTS) {
+                    // The client has stopped reading. Drop it rather than grow without bound; it can
+                    // reconnect and the replay will give it everything it missed.
+                    log.info("SSE subscriber of analysis {} fell {} events behind and was dropped",
+                            assessmentId, pending.size());
+                    pending.clear();
+                    pending.add(COMPLETE);
+                    return;
+                }
+                pending.add(event == null ? COMPLETE : new String[] {event, payload});
+            }
+        }
+
+        /** Makes sure a drain task is running for this subscriber, without ever blocking. */
+        private void kick() {
+            synchronized (this) {
+                if (draining || finished || pending.isEmpty()) {
+                    return;
+                }
+                draining = true;
+            }
+            try {
+                dispatcher.execute(this::drain);
+            } catch (RuntimeException e) {
+                // Executor gone (shutdown). Give the queue back so nothing is silently lost if
+                // another kick arrives, and stop pretending we are draining.
+                synchronized (this) {
+                    draining = false;
+                }
+                log.debug("Could not schedule the SSE fan-out of analysis {}", assessmentId, e);
+            }
+        }
+
+        private void drain() {
+            while (true) {
+                String[] event;
+                synchronized (this) {
+                    if (finished || pending.isEmpty()) {
+                        draining = false;
+                        return;
+                    }
+                    event = pending.poll();
+                }
+                if (event.length == 0) {
+                    complete();
+                    return;
+                }
+                if (!send(event[0], event[1])) {
+                    return;
+                }
+            }
+        }
+
+        /** @return false when the client went away and this subscriber is done */
+        private boolean send(String event, String payload) {
+            try {
+                emitter.send(SseEmitter.event().name(event).data(payload));
+                return true;
+            } catch (IOException | RuntimeException e) {
+                // The client went away mid-run. Drop it; the analysis itself is unaffected.
+                log.debug("Dropping SSE subscriber of analysis {}: {}", assessmentId, e.toString());
+                discard();
+                unsubscribe(this);
+                return false;
+            }
+        }
+
+        private void complete() {
+            discard();
+            unsubscribe(this);
             try {
                 emitter.complete();
             } catch (RuntimeException e) {
                 log.debug("Could not complete SSE subscriber of analysis {}", assessmentId, e);
             }
         }
-    }
 
-    private void dispatch(List<SseEmitter> targets, String event, String payload) {
-        for (SseEmitter emitter : targets) {
-            send(emitter, event, payload);
-        }
-    }
-
-    private void send(SseEmitter emitter, String event, String payload) {
-        try {
-            emitter.send(SseEmitter.event().name(event).data(payload));
-        } catch (IOException | IllegalStateException e) {
-            // The client went away mid-run. Drop it; the analysis itself is unaffected.
-            log.debug("Dropping SSE subscriber of analysis {}: {}", assessmentId, e.toString());
-            unsubscribe(emitter);
+        private void discard() {
+            synchronized (this) {
+                finished = true;
+                draining = false;
+                pending.clear();
+            }
         }
     }
 

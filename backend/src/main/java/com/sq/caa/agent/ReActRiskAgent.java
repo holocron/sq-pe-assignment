@@ -65,7 +65,16 @@ public class ReActRiskAgent {
 
     /** Runs one full analysis. Blocking and slow - the caller must already be off the request thread. */
     public AgentRunResult run(UUID assessmentId, UUID customerId, AnalysisTrace trace) {
-        AgentRunContext context = context(assessmentId, customerId, trace);
+        return run(assessmentId, customerId, trace, AnalysisProgressListener.NONE);
+    }
+
+    /**
+     * Runs one full analysis, reporting turn and coverage counters to {@code progress} as it goes so
+     * a RUNNING analysis is not a black box for the minutes it takes.
+     */
+    public AgentRunResult run(UUID assessmentId, UUID customerId, AnalysisTrace trace,
+            AnalysisProgressListener progress) {
+        AgentRunContext context = context(assessmentId, customerId, trace, progress);
         RiskAgentTools tools = new RiskAgentTools(context, activitySummaryService, transactionService,
                 ragServiceProvider.getIfAvailable(), jsonMapper, properties.transactionPageSize());
         return loop.execute(context, tools);
@@ -80,15 +89,17 @@ public class ReActRiskAgent {
      */
     public AgentRunResult deterministicOnly(UUID assessmentId, UUID customerId, AnalysisTrace trace) {
         long startedAt = System.currentTimeMillis();
-        AgentRunContext context = context(assessmentId, customerId, trace);
+        AgentRunContext context = context(assessmentId, customerId, trace,
+                AnalysisProgressListener.NONE);
         return loop.settle(context, 0, System.currentTimeMillis() - startedAt);
     }
 
-    private AgentRunContext context(UUID assessmentId, UUID customerId, AnalysisTrace trace) {
+    private AgentRunContext context(UUID assessmentId, UUID customerId, AnalysisTrace trace,
+            AnalysisProgressListener progress) {
         Customer customer = customerService.requireCustomer(customerId);
         EvaluationBatch batch = riskRuleService.batchFor(customer);
         List<RiskRule> rules = riskRuleService.coverageSetFor(customerId);
         return new AgentRunContext(assessmentId, customer, batch, rules,
-                rule -> ruleEvaluator.evaluate(rule, batch), trace);
+                rule -> ruleEvaluator.evaluate(rule, batch), trace, progress);
     }
 }

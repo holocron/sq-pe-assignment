@@ -10,7 +10,7 @@
 import { render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
-  ActivitySummary,
+  ActivitySummaryWire,
   AnalysisResultWire,
   AnalysisSummary,
   AppUser,
@@ -42,34 +42,67 @@ const CUSTOMER: Customer = {
   customerId: CUSTOMER_ID,
   firstName: 'Mila',
   lastName: 'Novak',
+  fullName: 'Mila Novak',
   dob: '1988-04-12',
   country: 'SI',
   age: 38,
+  transactionCount: 48,
+  analysisCount: 1,
 }
 
 const CUSTOMER_ROW: CustomerSummary = {
   customerId: CUSTOMER_ID,
   firstName: 'Mila',
   lastName: 'Novak',
+  fullName: 'Mila Novak',
   dob: '1988-04-12',
   country: 'SI',
+  age: 38,
   transactionCount: 48,
   totalAmount: 128_400.5,
   lastActivityAt: '2026-08-27T09:15:00Z',
+  lastRiskLevel: 'HIGH',
 }
 
-const SUMMARY: ActivitySummary = {
+/** Exactly the payload GET /api/customers/{id}/summary returns. */
+const SUMMARY: ActivitySummaryWire = {
   customerId: CUSTOMER_ID,
   totalTransactions: 48,
   totalAmount: 128_400.5,
-  currencies: ['EUR'],
-  countries: ['SI', 'IR'],
+  firstActivityAt: '2026-06-01T08:00:00Z',
+  lastActivityAt: '2026-08-27T09:15:00Z',
+  completedCount: 46,
+  pendingCount: 1,
+  failedCount: 1,
+  reversedCount: 0,
+  failedAmount: 120,
+  reversedAmount: 0,
+  failedRatio: 0.0208,
+  distinctCurrencies: 1,
+  distinctCounterpartyCountries: 2,
+  txCount24h: 3,
+  amountSum24h: 4_800,
+  failedCount24h: 0,
+  distinctCountries30d: 2,
+  cryptoRatio30d: 0.0625,
+  maxAmount30d: 40_000,
   byActivityType: [
-    { activityType: 'CARD', count: 30, totalAmount: 40_000 },
-    { activityType: 'PAYMENT', count: 15, totalAmount: 80_000 },
-    { activityType: 'CRYPTO', count: 3, totalAmount: 8_400.5 },
+    { activityType: 'CARD', transactionCount: 30, totalAmount: 40_000 },
+    { activityType: 'PAYMENT', transactionCount: 15, totalAmount: 80_000 },
+    { activityType: 'CRYPTO', transactionCount: 3, totalAmount: 8_400.5 },
   ],
-  byStatus: [{ status: 'Completed', count: 46 }],
+  byStatus: [
+    { status: 'Completed', transactionCount: 46, totalAmount: 128_280.5 },
+    { status: 'Pending', transactionCount: 1, totalAmount: 0 },
+    { status: 'Failed', transactionCount: 1, totalAmount: 120 },
+  ],
+  byCurrency: [{ currency: 'EUR', transactionCount: 48, totalAmount: 128_400.5 }],
+  counterpartyCountries: [
+    { country: 'SI', transactionCount: 40, totalAmount: 48_400.5 },
+    { country: 'IR', transactionCount: 8, totalAmount: 80_000 },
+  ],
+  dailyTimeline: [],
+  latestAnalysis: null,
 }
 
 const ANALYSIS_ROW: AnalysisSummary = {
@@ -97,9 +130,10 @@ const ANALYSIS: AnalysisResultWire = {
       appliesTo: 'PAYMENT',
       weight: 30,
       triggered: true,
-      scoreContribution: 30,
+      score: 30,
       rationale: 'Nine payments between 9,000 and 9,999 in 30 days.',
-      transactionIds: [],
+      matchedCount: 0,
+      matchedTransactionIds: [],
       source: 'AGENT',
     },
   ],
@@ -131,10 +165,14 @@ const DOCUMENTS: KnowledgeDocument[] = [
   },
 ]
 
+/** The flat envelope PageResponse.java serialises: `page` is the index. */
 function page<T>(content: T[]): SpringPage<T> {
   return {
     content,
-    page: { size: 20, number: 0, totalElements: content.length, totalPages: 1 },
+    page: 0,
+    size: 20,
+    totalElements: content.length,
+    totalPages: 1,
   }
 }
 

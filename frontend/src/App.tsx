@@ -6,6 +6,7 @@ import { AuthProvider } from './auth/AuthContext'
 import { ProtectedRoute } from './auth/ProtectedRoute'
 import { RoleGate } from './auth/RoleGate'
 import { AccessDenied } from './components/AccessDenied'
+import { ErrorBoundary, RouteErrorBoundary } from './components/ErrorBoundary'
 import { AppShell } from './components/layout/AppShell'
 import { ToastProvider } from './components/ui/Toast'
 import { ThemeProvider } from './lib/theme'
@@ -52,51 +53,60 @@ export default function App() {
         <ToastProvider>
           <BrowserRouter>
             <AuthProvider>
-              <Routes>
-                <Route path="/login" element={<LoginPage />} />
+              {/* Last resort inside the router: a crash in the shell, the login
+                  screen or a provider renders the full-page panel instead of
+                  unmounting the root to a blank page. */}
+              <ErrorBoundary>
+                <Routes>
+                  <Route path="/login" element={<LoginPage />} />
 
-                <Route element={<ProtectedRoute />}>
-                  <Route element={<AppShell />}>
-                    <Route index element={<Navigate to="/dashboard" replace />} />
-                    <Route path="dashboard" element={<DashboardPage />} />
-                    <Route path="customers/:customerId" element={<CustomerPage />} />
-                    <Route
-                      path="customers/:customerId/analyses"
-                      element={<AnalysisHistoryPage />}
-                    />
-                    <Route path="analyses" element={<AnalysisHistoryPage />} />
-                    <Route path="analyses/:assessmentId" element={<AnalysisPage />} />
-                    <Route path="knowledge-search" element={<KnowledgeSearchPage />} />
+                  <Route element={<ProtectedRoute />}>
+                    <Route element={<AppShell />}>
+                      {/* Screen-level boundary: keeps the chrome alive and
+                          resets when the operator navigates away. */}
+                      <Route element={<RouteErrorBoundary />}>
+                        <Route index element={<Navigate to="/dashboard" replace />} />
+                        <Route path="dashboard" element={<DashboardPage />} />
+                        <Route path="customers/:customerId" element={<CustomerPage />} />
+                        <Route
+                          path="customers/:customerId/analyses"
+                          element={<AnalysisHistoryPage />}
+                        />
+                        <Route path="analyses" element={<AnalysisHistoryPage />} />
+                        <Route path="analyses/:assessmentId" element={<AnalysisPage />} />
+                        <Route path="knowledge-search" element={<KnowledgeSearchPage />} />
 
-                    <Route
-                      path="admin/rules"
-                      element={
-                        <AdminRoute resource="risk rules">
-                          <RulesPage />
-                        </AdminRoute>
-                      }
-                    />
-                    <Route
-                      path="admin/knowledge"
-                      element={
-                        <AdminRoute resource="the knowledge base">
-                          <KnowledgePage />
-                        </AdminRoute>
-                      }
-                    />
-                    <Route
-                      path="admin/users"
-                      element={
-                        <AdminRoute resource="user administration">
-                          <UsersPage />
-                        </AdminRoute>
-                      }
-                    />
+                        <Route
+                          path="admin/rules"
+                          element={
+                            <AdminRoute resource="risk rules">
+                              <RulesPage />
+                            </AdminRoute>
+                          }
+                        />
+                        <Route
+                          path="admin/knowledge"
+                          element={
+                            <AdminRoute resource="the knowledge base">
+                              <KnowledgePage />
+                            </AdminRoute>
+                          }
+                        />
+                        <Route
+                          path="admin/users"
+                          element={
+                            <AdminRoute resource="user administration">
+                              <UsersPage />
+                            </AdminRoute>
+                          }
+                        />
 
-                    <Route path="*" element={<NotFoundPage />} />
+                        <Route path="*" element={<NotFoundPage />} />
+                      </Route>
+                    </Route>
                   </Route>
-                </Route>
-              </Routes>
+                </Routes>
+              </ErrorBoundary>
             </AuthProvider>
           </BrowserRouter>
         </ToastProvider>

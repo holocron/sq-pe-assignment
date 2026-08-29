@@ -1,5 +1,6 @@
 package com.sq.caa.config;
 
+import com.sq.caa.security.TooManyLoginAttemptsException;
 import jakarta.persistence.EntityNotFoundException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolation;
@@ -102,13 +103,40 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     /* Authentication and authorisation                                        */
     /* ---------------------------------------------------------------------- */
 
+    /**
+     * One indistinguishable answer for every rejected sign-in.
+     *
+     * <p>Spring's {@code DaoAuthenticationProvider} runs its pre-authentication checks before it
+     * compares the password, so telling a caller that an account is disabled would confirm that the
+     * username exists to anyone submitting an arbitrary password - an enumeration oracle over the
+     * staff directory (CWE-204). Unknown, disabled and locked accounts and wrong passwords therefore
+     * all read the same on the wire; the reason is kept in the log, where it belongs.
+     */
     @ExceptionHandler({BadCredentialsException.class, DisabledException.class, LockedException.class})
     public ResponseEntity<ProblemDetail> handleFailedLogin(AuthenticationException ex, HttpServletRequest request) {
-        log.debug("Rejected sign-in attempt on {}: {}", request.getRequestURI(), ex.getMessage());
-        String detail = ex instanceof DisabledException
-                ? "This account has been disabled."
-                : "Invalid username or password.";
-        return respond(problem(HttpStatus.UNAUTHORIZED, "Unauthorized", detail, request));
+        log.debug("Rejected sign-in attempt on {}: {}: {}", request.getRequestURI(),
+                ex.getClass().getSimpleName(), ex.getMessage());
+        return respond(problem(HttpStatus.UNAUTHORIZED, "Unauthorized",
+                "Invalid username or password.", request));
+    }
+
+    /**
+     * Sign-in refused by {@link com.sq.caa.security.LoginThrottle} before the password was checked.
+     * {@code Retry-After} carries the wait in seconds, as RFC 9110 requires for a 429.
+     */
+    @ExceptionHandler(TooManyLoginAttemptsException.class)
+    public ResponseEntity<ProblemDetail> handleThrottledLogin(TooManyLoginAttemptsException ex,
+            HttpServletRequest request) {
+        long retryAfter = ex.retryAfterSeconds();
+        log.warn("Throttled sign-in attempt on {} from {}; {} seconds remaining.",
+                request.getRequestURI(), request.getRemoteAddr(), retryAfter);
+        ProblemDetail problem = problem(HttpStatus.TOO_MANY_REQUESTS, "Too many sign-in attempts",
+                "Too many failed sign-in attempts. Try again in " + retryAfter + " seconds.", request);
+        problem.setProperty("retryAfterSeconds", retryAfter);
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                .contentType(MediaType.APPLICATION_PROBLEM_JSON)
+                .header(HttpHeaders.RETRY_AFTER, String.valueOf(retryAfter))
+                .body(problem);
     }
 
     @ExceptionHandler(AuthenticationException.class)

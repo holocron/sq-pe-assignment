@@ -111,12 +111,23 @@ export interface SpringPageMetadata {
 }
 
 /**
- * Either Spring serialisation is accepted on the wire: the classic flattened
- * `Page` or the Boot 4 `PagedModel` with a nested `page` object.
+ * Three serialisations are accepted on the wire, and `page` means a different
+ * thing in two of them:
+ *
+ *  - **this backend** (`web/dto/PageResponse.java`) sends a flat envelope where
+ *    `page` is the zero-based page *index*:
+ *    `{content, page: 1, size: 5, totalElements: 12, totalPages: 3}` — verified
+ *    live against `GET /api/customers?page=1&size=5`;
+ *  - Boot 4 `PagedModel` nests the metadata under `page` as an *object*;
+ *  - the classic flattened `Page` puts the index in `number`.
+ *
+ * `toPage` in `api/client` collapses all three; the numeric form is the one
+ * that actually arrives.
  */
 export interface SpringPage<T> {
   content: T[]
-  page?: SpringPageMetadata
+  /** Zero-based page index (this backend) or the `PagedModel` metadata object. */
+  page?: number | SpringPageMetadata
   totalElements?: number
   totalPages?: number
   size?: number
@@ -148,27 +159,48 @@ export interface PageParams {
 /* Customers                                                                   */
 /* -------------------------------------------------------------------------- */
 
+/** `GET /api/customers/{customerId}` — `CustomerDtos.CustomerDetail`. */
 export interface Customer {
   customerId: UUID
   firstName: string
   lastName: string
+  /** Composed server-side; the pages fall back to `firstName lastName`. */
+  fullName?: string | null
   dob: IsoDate | null
   country: string
   /** Derived server-side from `dob` (also exposed as `customer.age` in the DSL). */
   age?: number | null
+  transactionCount?: number | null
+  analysisCount?: number | null
 }
 
-/** Row shape of `GET /api/customers` — core fields plus optional aggregates. */
+/**
+ * Row shape of `GET /api/customers` — `CustomerDtos.CustomerSummary`.
+ *
+ * `customerId, firstName, lastName, fullName, dob, age, country` are always
+ * present. The aggregates below are served by the same DTO; every consumer
+ * still treats them as optional and renders an em dash when they are absent, so
+ * the table degrades rather than lying.
+ *
+ * `totalAmount` is **not** a cross-currency total — there are no FX rates in
+ * this system. It is the sum for the customer's dominant currency, named by
+ * `totalAmountCurrency`, with `mixedCurrency` set when other currencies exist
+ * on file. Label it accordingly.
+ */
 export interface CustomerSummary {
   customerId: UUID
   firstName: string
   lastName: string
+  fullName?: string | null
   dob?: IsoDate | null
   country: string
   age?: number | null
   transactionCount?: number | null
   totalAmount?: number | null
+  totalAmountCurrency?: string | null
+  mixedCurrency?: boolean | null
   lastActivityAt?: IsoDateTime | null
+  /** Verdict of the most recent COMPLETED analysis; null when never analysed. */
   lastRiskLevel?: RiskLevel | null
   lastAnalysisAt?: IsoDateTime | null
 }
@@ -178,41 +210,115 @@ export interface CustomerSearchParams extends PageParams {
   query?: string
 }
 
-/** One bucket of `ActivitySummary.byActivityType`. */
-export interface ActivityTypeSummary {
+/**
+ * One bucket of `ActivitySummary.byActivityType`
+ * (`CustomerDtos.ActivityTypeBreakdown`). All three types are always present,
+ * zero-filled when the customer has no activity of that kind.
+ */
+export interface ActivityTypeBreakdown {
   activityType: ActivityType
-  count: number
+  transactionCount: number
   totalAmount: number
-  avgAmount?: number | null
+  minAmount?: number | null
   maxAmount?: number | null
+  avgAmount?: number | null
+  firstAt?: IsoDateTime | null
+  lastAt?: IsoDateTime | null
 }
 
-/** One bucket of `ActivitySummary.byStatus`. */
-export interface StatusSummary {
+/** One bucket of `ActivitySummary.byStatus` (`CustomerDtos.StatusBreakdown`). */
+export interface StatusBreakdown {
   status: string
-  count: number
-  totalAmount?: number | null
+  transactionCount: number
+  totalAmount: number
 }
 
-/** `GET /api/customers/{customerId}/summary` — dashboard aggregates. */
-export interface ActivitySummary {
+/** One bucket of `ActivitySummary.byCurrency`. */
+export interface CurrencyBreakdown {
+  currency: string
+  transactionCount: number
+  totalAmount: number
+}
+
+/** One bucket of `ActivitySummary.counterpartyCountries`. */
+export interface CountryBreakdown {
+  country: string
+  transactionCount: number
+  totalAmount: number
+}
+
+/** One day of `ActivitySummary.dailyTimeline`; zero-filled, oldest first. */
+export interface DailyActivityPoint {
+  date: IsoDate
+  transactionCount: number
+  totalAmount: number
+}
+
+/** The most recent run for this customer, inlined in the summary. */
+export interface LatestAnalysisSummary {
+  assessmentId: UUID
+  status: AnalysisStatus
+  riskLevel: RiskLevel | null
+  totalScore: number | null
+  coverageComplete?: boolean | null
+  createdAt: IsoDateTime
+  completedAt?: IsoDateTime | null
+}
+
+/**
+ * `GET /api/customers/{customerId}/summary` — exactly what
+ * `CustomerDtos.CustomerActivitySummary` serialises. Verified against the live
+ * endpoint: the counts are `transactionCount` (never `count`), the currency and
+ * country rollups are `byCurrency` / `counterpartyCountries` objects (never the
+ * `currencies` / `countries` string arrays this type used to claim).
+ */
+export interface ActivitySummaryWire {
   customerId: UUID
+  customer?: CustomerSummary | null
   totalTransactions: number
   totalAmount: number
-  currencies: string[]
-  countries: string[]
-  byActivityType: ActivityTypeSummary[]
-  byStatus: StatusSummary[]
-  failedRatio?: number | null
   firstActivityAt?: IsoDateTime | null
   lastActivityAt?: IsoDateTime | null
-  /** Velocity/aggregate features mirroring the `agg.*` DSL fields. */
-  txCount24h?: number | null
-  amountSum24h?: number | null
-  failedCount24h?: number | null
-  distinctCountries30d?: number | null
-  cryptoRatio30d?: number | null
-  maxAmount30d?: number | null
+  completedCount: number
+  pendingCount: number
+  failedCount: number
+  reversedCount: number
+  failedAmount: number
+  reversedAmount: number
+  failedRatio?: number | null
+  distinctCurrencies: number
+  distinctCounterpartyCountries: number
+  /**
+   * The same `agg.*` values the rule engine scores on, taken verbatim from the
+   * customer's evaluation batch. Each is the PEAK of its rolling window over
+   * the customer's whole history (the server folds every per-transaction
+   * snapshot with `max`), which is the figure a threshold rule was measured
+   * against. They are not readings for the last 24 hours or 30 days, and there
+   * is no single instant they are "as of" — the UI must label them as peaks.
+   */
+  txCount24h: number
+  amountSum24h: number
+  failedCount24h: number
+  distinctCountries30d: number
+  cryptoRatio30d: number
+  maxAmount30d: number
+  byActivityType: ActivityTypeBreakdown[]
+  byStatus: StatusBreakdown[]
+  byCurrency: CurrencyBreakdown[]
+  counterpartyCountries: CountryBreakdown[]
+  dailyTimeline: DailyActivityPoint[]
+  latestAnalysis?: LatestAnalysisSummary | null
+}
+
+/**
+ * The wire payload plus the one value the UI needs that the API does not send
+ * as such: the plain list of currency codes, derived from `byCurrency` by
+ * `normalizeActivitySummary`. Money is only labelled with a currency symbol
+ * when the customer used exactly one.
+ */
+export interface ActivitySummary extends ActivitySummaryWire {
+  /** Derived client-side from `byCurrency[].currency` — not a wire field. */
+  currencies: string[]
 }
 
 /* -------------------------------------------------------------------------- */
@@ -381,17 +487,48 @@ export const FIELD_TYPES = [
   'datetime',
   'date',
 ] as const
+/** Editor-side field type. Lowercase — see `FieldCatalogEntryWire.type`. */
 export type FieldType = (typeof FIELD_TYPES)[number]
 
-/** `GET /api/rules/field-catalog` — drives the field/operator/value inputs. */
+/**
+ * `GET /api/rules/field-catalog` exactly as the backend serialises it
+ * (`RuleDtos.FieldCatalogEntry`). Verified live: 26 entries, `type` is the Java
+ * enum name in UPPER CASE (`NUMBER | STRING | ENUM | BOOLEAN | DATETIME`), the
+ * allowed enum members arrive under `options` (not `values`), the prose is
+ * `description` (not `notes`), and every entry carries the authoritative list
+ * of `operators` the backend will accept for that field.
+ *
+ * `normalizeFieldCatalogEntry` in `api/rules` maps this onto the editor shape.
+ */
+export interface FieldCatalogEntryWire {
+  field: string
+  label?: string | null
+  type: string
+  appliesTo?: RuleScope | null
+  operators?: string[] | null
+  options?: string[] | null
+  optionsClosed?: boolean | null
+  nullable?: boolean | null
+  description?: string | null
+}
+
+/** Normalised catalog entry — what the visual rule editor consumes. */
 export interface FieldCatalogEntry {
   field: string
   type: FieldType
   /** Human label; falls back to the field path when absent. */
   label?: string | null
+  /** Prose description of the field (wire: `description`). */
   notes?: string | null
-  /** Allowed values for `enum` fields. May be encoded in `notes` instead. */
+  /** Allowed values for `enum` fields (wire: `options`). */
   values?: string[] | null
+  /** True when `values` is exhaustive, so free text must be rejected. */
+  valuesClosed?: boolean | null
+  /** The operators the backend accepts for this field — authoritative. */
+  operators?: RuleOperator[] | null
+  /** Activity scope the field is available on. */
+  appliesTo?: RuleScope | null
+  nullable?: boolean | null
   /** Optional grouping hint, e.g. `card`, `payment`, `agg`. */
   group?: string | null
 }
@@ -405,21 +542,30 @@ export interface RuleTestRequest {
 export interface RuleTestMatch {
   transactionId: UUID
   customerId?: UUID
+  customerName?: string | null
   activityType?: ActivityType
   amount?: number
   currency?: string
   status?: string
   createdAt?: IsoDateTime
+  /** Per-leaf trace of why the row matched, e.g. `(amount=12500 GT 10000 [true])`. */
+  explanation?: string | null
 }
 
-/** `POST /api/rules/test`. */
+/** `POST /api/rules/test` — `RuleDtos.RuleTestResponse`. */
 export interface RuleTestResult {
   matchedCount: number
   sampleMatches: RuleTestMatch[]
   /** True when a leaf could not be evaluated (unknown field / type mismatch). */
   degraded: boolean
   evaluatedCount?: number | null
-  message?: string | null
+  customerCount?: number | null
+  /**
+   * The concrete degradation reasons the evaluator collected, e.g.
+   * `"'card.decline_reason' has no value on at least one transaction"`.
+   * Always present (possibly empty) whenever `degraded` is true.
+   */
+  notes: string[]
 }
 
 /* -------------------------------------------------------------------------- */
@@ -436,6 +582,7 @@ export interface AnalysisRun {
 export interface AnalysisSummary {
   assessmentId: UUID
   customerId: UUID
+  customerName?: string | null
   status: AnalysisStatus
   riskLevel: RiskLevel | null
   totalScore: number | null
@@ -451,7 +598,14 @@ export interface AnalysisSummary {
   error?: string | null
 }
 
-/** One row of `risk_assessments`, joined with its rule for display. */
+/**
+ * One row of `risk_assessments`, joined with its rule for display —
+ * `AnalysisDtos.RuleEvaluationView`.
+ *
+ * Verified live against `GET /api/analyses/{assessmentId}`: the score is
+ * `score` (never `scoreContribution`) and the evidence ids are
+ * `matchedTransactionIds` (never `transactionIds`).
+ */
 export interface RuleEvaluation {
   ruleId: UUID
   ruleName: string
@@ -459,14 +613,24 @@ export interface RuleEvaluation {
   weight?: number | null
   triggered: boolean
   /** `risk_assessments.score_contribution` — 0.00 when not triggered. */
-  scoreContribution: number
-  rationale?: string | null
-  transactionIds: UUID[]
+  score: number
   source: EvaluationSource
+  /** How many transactions the rule was run against. */
+  evaluatedTransactionCount?: number | null
   matchedCount?: number | null
+  /** The transactions that satisfied the rule. Empty, never absent. */
+  matchedTransactionIds: UUID[]
+  /** True when a leaf could not be evaluated; see `degradationNotes`. */
+  degraded?: boolean | null
+  degradationNotes?: string[] | null
+  /** The DSL engine's own account of the verdict. */
+  explanation?: string | null
+  /** The agent's narrative justification. */
+  rationale?: string | null
+  agentTriggered?: boolean | null
+  agentScore?: number | null
   /** True when the agent verdict differed from the deterministic engine. */
   disagreement?: boolean | null
-  triggeredAt?: IsoDateTime | null
 }
 
 export interface ToolCallTraceStep {
@@ -527,8 +691,21 @@ export interface AnalysisTrace {
   steps: TraceStep[]
 }
 
+/** Coverage counters the backend derives; rendered by the coverage panel. */
+interface AnalysisCoverageCounters {
+  /** Rules the agent itself submitted a verdict for. */
+  rulesEvaluatedByAgent?: number | null
+  /** Rules closed by the deterministic backfill. */
+  rulesBackfilled?: number | null
+  coveragePercent?: number | null
+  triggeredRuleCount?: number | null
+  disagreementCount?: number | null
+  /** The level the agent proposed, before the deterministic scoring won. */
+  agentRiskLevel?: RiskLevel | null
+}
+
 /** `GET /api/analyses/{assessmentId}`. */
-export interface AnalysisResult extends AnalysisSummary {
+export interface AnalysisResult extends AnalysisSummary, AnalysisCoverageCounters {
   summary: string | null
   recommendations: string | null
   ruleEvaluations: RuleEvaluation[]
@@ -536,11 +713,16 @@ export interface AnalysisResult extends AnalysisSummary {
 }
 
 /** Raw `GET /api/analyses/{assessmentId}` payload before normalisation. */
-export interface AnalysisResultWire extends AnalysisSummary {
+export interface AnalysisResultWire extends AnalysisSummary, AnalysisCoverageCounters {
   summary?: string | null
   recommendations?: string | null
-  ruleEvaluations?: RuleEvaluation[] | null
+  ruleEvaluations?: RuleEvaluationWire[] | null
   trace?: AnalysisTrace | JsonObject | JsonObject[] | string | null
+}
+
+/** `matchedTransactionIds` is defaulted to `[]` by `normalizeRuleEvaluation`. */
+export interface RuleEvaluationWire extends Omit<RuleEvaluation, 'matchedTransactionIds'> {
+  matchedTransactionIds?: UUID[] | null
 }
 
 /** Payload pushed over `GET /api/analyses/{assessmentId}/stream`. */

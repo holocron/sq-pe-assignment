@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { deleteJson, getJson, postJson } from '../../api/client'
-import type { FieldCatalogEntry, RiskRuleWire } from '../../api/types'
+import type { FieldCatalogEntryWire, RiskRuleWire } from '../../api/types'
 import { ToastProvider } from '../../components/ui/Toast'
 import { RulesPage } from '../admin/RulesPage'
 
@@ -21,17 +21,129 @@ const mockGet = vi.mocked(getJson)
 const mockPost = vi.mocked(postJson)
 const mockDelete = vi.mocked(deleteJson)
 
-/** Subset of the catalog served by `GET /api/rules/field-catalog` (spec §3). */
-const CATALOG: FieldCatalogEntry[] = [
-  { field: 'amount', type: 'number' },
-  { field: 'currency', type: 'string' },
-  { field: 'status', type: 'enum', values: ['Completed', 'Pending', 'Failed', 'Reversed'] },
-  { field: 'created_at', type: 'datetime' },
-  { field: 'customer.country', type: 'string' },
-  { field: 'card.card_present', type: 'boolean' },
-  { field: 'card.decline_reason', type: 'string' },
-  { field: 'payment.receiver_bank_country', type: 'string' },
-  { field: 'agg.tx_count_24h', type: 'number' },
+/**
+ * Subset of `GET /api/rules/field-catalog` copied verbatim from a live
+ * response: `type` is the Java enum name in UPPER CASE, the allowed members
+ * are `options` (not `values`), the prose is `description` (not `notes`), and
+ * every entry states the `operators` the backend will accept. Typed as the
+ * wire shape so the fixture cannot drift back into the editor's vocabulary.
+ */
+const NUMBER_OPERATORS = ['GT', 'GTE', 'LT', 'LTE', 'EQ', 'NEQ', 'BETWEEN', 'IN', 'NOT_IN', 'IS_NULL', 'NOT_NULL']
+const STRING_OPERATORS = ['EQ', 'NEQ', 'IN', 'NOT_IN', 'CONTAINS', 'NOT_CONTAINS', 'MATCHES', 'IS_NULL', 'NOT_NULL']
+const ENUM_OPERATORS = ['EQ', 'NEQ', 'IN', 'NOT_IN', 'IS_NULL', 'NOT_NULL']
+
+const CATALOG: FieldCatalogEntryWire[] = [
+  {
+    field: 'amount',
+    label: 'Amount',
+    type: 'NUMBER',
+    appliesTo: 'ALL',
+    operators: NUMBER_OPERATORS,
+    options: [],
+    optionsClosed: false,
+    nullable: false,
+    description: 'Transaction amount in the transaction currency.',
+  },
+  {
+    field: 'currency',
+    label: 'Currency',
+    type: 'STRING',
+    appliesTo: 'ALL',
+    operators: STRING_OPERATORS,
+    options: [],
+    optionsClosed: false,
+    nullable: false,
+    description: 'ISO-4217 code of the transaction.',
+  },
+  {
+    field: 'status',
+    label: 'Status',
+    type: 'ENUM',
+    appliesTo: 'ALL',
+    operators: ENUM_OPERATORS,
+    options: ['Completed', 'Pending', 'Failed', 'Reversed'],
+    optionsClosed: true,
+    nullable: false,
+    description: 'Processing outcome of the transaction.',
+  },
+  {
+    field: 'created_at',
+    label: 'Created at (UTC)',
+    type: 'DATETIME',
+    appliesTo: 'ALL',
+    operators: ['GT', 'GTE', 'LT', 'LTE', 'BETWEEN', 'EQ', 'NEQ', 'IS_NULL', 'NOT_NULL'],
+    options: [],
+    optionsClosed: false,
+    nullable: false,
+    description: 'Instant the transaction occurred.',
+  },
+  {
+    field: 'customer.country',
+    label: 'Customer country',
+    type: 'STRING',
+    appliesTo: 'ALL',
+    operators: STRING_OPERATORS,
+    options: [],
+    optionsClosed: false,
+    nullable: false,
+    description: 'ISO-2 country of residence.',
+  },
+  {
+    field: 'card.card_present',
+    label: 'Card present',
+    type: 'BOOLEAN',
+    appliesTo: 'CARD',
+    operators: ['EQ', 'NEQ', 'IS_NULL', 'NOT_NULL'],
+    options: ['true', 'false'],
+    optionsClosed: true,
+    nullable: false,
+    description: 'False means a card-not-present authorisation.',
+  },
+  {
+    field: 'card.decline_reason',
+    label: 'Decline reason',
+    type: 'STRING',
+    appliesTo: 'CARD',
+    operators: STRING_OPERATORS,
+    options: [],
+    optionsClosed: false,
+    nullable: true,
+    description: 'Populated only for declined authorisations.',
+  },
+  {
+    field: 'payment.receiver_bank_country',
+    label: 'Receiver bank country',
+    type: 'STRING',
+    appliesTo: 'PAYMENT',
+    operators: STRING_OPERATORS,
+    options: [],
+    optionsClosed: false,
+    nullable: false,
+    description: 'ISO-2 country of the receiving bank.',
+  },
+  {
+    field: 'crypto.blockchain',
+    label: 'Blockchain',
+    type: 'ENUM',
+    appliesTo: 'CRYPTO',
+    operators: ENUM_OPERATORS,
+    options: ['BTC', 'ETH', 'USDT', 'XMR'],
+    // The backend calls this list a suggestion, so any value is accepted.
+    optionsClosed: false,
+    nullable: false,
+    description: 'Chain or token the transfer settled on.',
+  },
+  {
+    field: 'agg.tx_count_24h',
+    label: 'Tx count in previous 24h',
+    type: 'NUMBER',
+    appliesTo: 'ALL',
+    operators: NUMBER_OPERATORS,
+    options: [],
+    optionsClosed: false,
+    nullable: false,
+    description: 'Customer-level velocity relative to the transaction.',
+  },
 ]
 
 const EXISTING_RULE: RiskRuleWire = {
@@ -119,8 +231,14 @@ describe('RulesPage', () => {
     fireEvent.click(
       await screen.findByRole('button', { name: 'Delete High-value SWIFT to sanctioned country' }),
     )
-    expect(await screen.findByRole('dialog')).toBeInTheDocument()
+    const dialog = await screen.findByRole('dialog')
     expect(mockDelete).not.toHaveBeenCalled()
+
+    /* DELETE cascades to risk_assessments, so the admin is destroying the
+       recorded evidence of every past analysis, not only changing future ones.
+       The dialog has to say that out loud. */
+    expect(dialog).toHaveTextContent(/past analyses/)
+    expect(dialog).toHaveTextContent(/removed from the audit table/)
 
     fireEvent.click(screen.getByRole('button', { name: 'Delete rule' }))
     await waitFor(() => {
@@ -354,5 +472,98 @@ describe('rule tester', () => {
     expect(await within(panel).findByText('2')).toBeInTheDocument()
     expect(within(panel).getByText('Degraded evaluation')).toBeInTheDocument()
     expect(within(panel).getByText('99999999')).toBeInTheDocument()
+  })
+
+  /* `notes` is where the evaluator explains WHY it degraded. The tester used
+     to read a `message` key the API never sends, so the badge appeared with no
+     explanation and the admin had nothing to act on. */
+  it('shows the backend degradation notes next to the degraded badge', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+
+    mockPost.mockResolvedValue({
+      matchedCount: 0,
+      evaluatedCount: 233,
+      customerCount: 12,
+      degraded: true,
+      notes: [
+        "'card.decline_reason' has no value on at least one transaction",
+        "unknown field 'card.mystery'",
+      ],
+      sampleMatches: [],
+    } as never)
+
+    const panel = screen.getByRole('region', { name: 'Rule test' })
+    fireEvent.click(within(panel).getByRole('button', { name: 'Test rule' }))
+
+    expect(
+      await within(panel).findByText(
+        "'card.decline_reason' has no value on at least one transaction",
+      ),
+    ).toBeInTheDocument()
+    expect(within(panel).getByText("unknown field 'card.mystery'")).toBeInTheDocument()
+  })
+})
+
+describe('field catalog contract', () => {
+  it('keeps the operator that is still valid after a field change', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+
+    const row = screen.getByRole('group', { name: 'Condition 1' })
+    fireEvent.change(within(row).getByLabelText('Operator'), { target: { value: 'GT' } })
+    fireEvent.change(within(row).getByLabelText('Value'), { target: { value: '10000' } })
+
+    // Both fields are NUMBER, so `GT 10000` must survive the swap intact —
+    // silently rewriting it to `EQ "10000"` persists a rule that never fires.
+    fireEvent.change(within(row).getByLabelText('Field'), {
+      target: { value: 'agg.tx_count_24h' },
+    })
+
+    expect(within(row).getByLabelText('Operator')).toHaveValue('GT')
+    expect(jsonPreview()).toEqual({
+      op: 'AND',
+      conditions: [{ field: 'agg.tx_count_24h', operator: 'GT', value: 10000 }],
+    })
+  })
+
+  it('offers only the operators the catalog declares for the field', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+
+    const row = screen.getByRole('group', { name: 'Condition 1' })
+    fireEvent.change(within(row).getByLabelText('Field'), { target: { value: 'status' } })
+
+    const operator = within(row).getByLabelText('Operator')
+    const offered = within(operator)
+      .getAllByRole('option')
+      .map((option) => (option as HTMLOptionElement).value)
+    // ENUM_OPERATORS from the catalog entry — CONTAINS and MATCHES are not in it.
+    expect(offered).toEqual(['EQ', 'NEQ', 'IN', 'NOT_IN', 'IS_NULL', 'NOT_NULL'])
+  })
+
+  it('keeps an open option set typeable instead of forcing a dropdown', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+
+    fireEvent.change(screen.getByLabelText(/Rule name/), {
+      target: { value: 'Privacy chain exposure' },
+    })
+    const row = screen.getByRole('group', { name: 'Condition 1' })
+    fireEvent.change(within(row).getByLabelText('Field'), {
+      target: { value: 'crypto.blockchain' },
+    })
+
+    // `optionsClosed: false` — the backend accepts anything, so a chain that
+    // is not in the suggestion list must still be authorable.
+    const value = within(row).getByLabelText('Value')
+    expect(value.tagName).toBe('INPUT')
+    fireEvent.change(value, { target: { value: 'AVAX' } })
+
+    expect(jsonPreview()).toEqual({
+      op: 'AND',
+      conditions: [{ field: 'crypto.blockchain', operator: 'EQ', value: 'AVAX' }],
+    })
+    expect(screen.getByRole('button', { name: 'Create rule' })).toBeEnabled()
   })
 })

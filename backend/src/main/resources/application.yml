@@ -46,8 +46,26 @@ spring:
 caa:
   security:
     jwt:
+      # SIGNING SECRET. Set the JWT_SECRET environment variable to a private value:
+      #   export JWT_SECRET="$(openssl rand -base64 48)"     (at least 32 bytes, HS256)
+      # The fallback below exists so the demo starts with zero configuration, but it is
+      # committed to this repository: with it in place anyone who has read the source can
+      # forge a token for any account, admin included, without calling /api/auth/login.
+      # JwtService logs a prominent WARNING at startup whenever this fallback is in use -
+      # if you see that banner outside a local demo, the deployment is unprotected.
       secret: ${JWT_SECRET:change-me-in-production-this-is-a-demo-secret-key-of-sufficient-length-256bits}
       ttl-minutes: 480
+    login-throttle:
+      # Brute-force brake on POST /api/auth/login, counted per username + client address.
+      # Documented limit: 5 failed attempts within 15 minutes lock that pair out for 5
+      # minutes; a locked-out attempt is refused with 429 + Retry-After before the password
+      # is checked. A successful sign-in clears the counter immediately, so a user who
+      # mistypes and then gets it right is never delayed. In-memory and single-instance by
+      # design - this is a demo brake, not edge infrastructure.
+      max-attempts: 5
+      window: 15m
+      lock-duration: 5m
+      max-tracked-pairs: 10000
   agent:
     max-steps: 40
     max-coverage-reprompts: 3

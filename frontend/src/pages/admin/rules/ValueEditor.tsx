@@ -10,7 +10,7 @@
  *   IS_NULL / NOT_NULL -> no value input at all
  */
 import { Plus, X } from 'lucide-react'
-import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
+import { useEffect, useId, useRef, useState, type KeyboardEvent } from 'react'
 import type { FieldType, RuleOperator, RuleScalar, RuleValue } from '../../../api/types'
 import { Button } from '../../../components/ui/Button'
 import { Checkbox } from '../../../components/ui/Checkbox'
@@ -85,6 +85,8 @@ interface ScalarFieldProps {
   label: string
   type: FieldType | null
   enumValues: readonly string[]
+  /** `optionsClosed` from the catalog: false means the list is a suggestion. */
+  enumClosed: boolean
   operator: RuleOperator
   value: RuleScalar | null | undefined
   onChange: (value: RuleScalar) => void
@@ -96,12 +98,14 @@ function ScalarField({
   label,
   type,
   enumValues,
+  enumClosed,
   operator,
   value,
   onChange,
   invalid,
   disabled,
 }: ScalarFieldProps) {
+  const listId = useId()
   if (type === 'number') {
     return (
       <NumberField
@@ -128,18 +132,44 @@ function ScalarField({
   }
 
   if (type === 'enum' && enumValues.length > 0) {
+    /* A closed option set is authoritative, so only those values may be
+       chosen. An open one (`crypto.blockchain`) is only a suggestion — the
+       backend accepts anything, so it must stay typeable. */
+    if (enumClosed) {
+      return (
+        <Select
+          label={label}
+          hideLabel
+          placeholder="Select a value"
+          value={typeof value === 'string' ? value : ''}
+          disabled={disabled}
+          aria-invalid={invalid || undefined}
+          className={cn(invalid && 'border-danger')}
+          options={enumValues.map((option) => ({ value: option, label: option }))}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      )
+    }
     return (
-      <Select
-        label={label}
-        hideLabel
-        placeholder="Select a value"
-        value={typeof value === 'string' ? value : ''}
-        disabled={disabled}
-        aria-invalid={invalid || undefined}
-        className={cn(invalid && 'border-danger')}
-        options={enumValues.map((option) => ({ value: option, label: option }))}
-        onChange={(event) => onChange(event.target.value)}
-      />
+      <>
+        <Input
+          label={label}
+          hideLabel
+          type="text"
+          list={listId}
+          placeholder="Value or a suggestion"
+          value={value === null || value === undefined ? '' : String(value)}
+          disabled={disabled}
+          aria-invalid={invalid || undefined}
+          className={cn(invalid && 'border-danger')}
+          onChange={(event) => onChange(event.target.value)}
+        />
+        <datalist id={listId}>
+          {enumValues.map((option) => (
+            <option key={option} value={option} />
+          ))}
+        </datalist>
+      </>
     )
   }
 
@@ -196,6 +226,7 @@ interface ChipValuesProps {
   label: string
   type: FieldType | null
   enumValues: readonly string[]
+  enumClosed: boolean
   values: readonly RuleScalar[]
   onChange: (values: RuleScalar[]) => void
   invalid?: boolean
@@ -206,6 +237,7 @@ function ChipValues({
   label,
   type,
   enumValues,
+  enumClosed,
   values,
   onChange,
   invalid,
@@ -213,7 +245,10 @@ function ChipValues({
 }: ChipValuesProps) {
   const [draft, setDraft] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const useEnumPicker = type === 'enum' && enumValues.length > 0
+  const listId = useId()
+  const useEnumPicker = type === 'enum' && enumValues.length > 0 && enumClosed
+  /* Only a closed option set may reject a typed value. */
+  const allowed = enumClosed ? enumValues : []
   const remaining = enumValues.filter((option) => !values.some((value) => String(value) === option))
 
   const addRaw = (raw: string): void => {
@@ -224,7 +259,7 @@ function ChipValues({
     if (parts.length === 0) return
     const next: RuleScalar[] = [...values]
     for (const part of parts) {
-      const coerced = coerceScalar(part, type, enumValues)
+      const coerced = coerceScalar(part, type, allowed)
       if (coerced === null) {
         setError(type === 'number' ? 'Enter a number' : `"${part}" is not an allowed value`)
         return
@@ -289,6 +324,7 @@ function ChipValues({
             label={label}
             hideLabel
             containerClassName="flex-1 min-w-0"
+            list={enumValues.length > 0 ? listId : undefined}
             placeholder={type === 'number' ? 'Add a number…' : 'Add a value…'}
             value={draft}
             disabled={disabled}
@@ -315,6 +351,14 @@ function ChipValues({
         </div>
       )}
 
+      {!useEnumPicker && enumValues.length > 0 ? (
+        <datalist id={listId}>
+          {remaining.map((option) => (
+            <option key={option} value={option} />
+          ))}
+        </datalist>
+      ) : null}
+
       {error ? (
         <p role="alert" className="text-2xs font-medium text-danger-fg">
           {error}
@@ -338,6 +382,8 @@ export interface ValueEditorProps {
   operator: RuleOperator
   type: FieldType | null
   enumValues: readonly string[]
+  /** Catalog `optionsClosed`; false keeps the value typeable. Defaults to true. */
+  enumClosed?: boolean
   value: RuleValue | undefined
   onChange: (value: RuleValue) => void
   invalid?: boolean
@@ -348,6 +394,7 @@ export function ValueEditor({
   operator,
   type,
   enumValues,
+  enumClosed = true,
   value,
   onChange,
   invalid,
@@ -369,6 +416,7 @@ export function ValueEditor({
         label="Values"
         type={type}
         enumValues={enumValues}
+        enumClosed={enumClosed}
         values={Array.isArray(value) ? value : []}
         onChange={onChange}
         invalid={invalid}
@@ -392,6 +440,7 @@ export function ValueEditor({
             label={isTemporal ? 'From' : 'Minimum'}
             type={type}
             enumValues={enumValues}
+            enumClosed={enumClosed}
             operator={operator}
             value={pair[0]}
             onChange={(next) => setAt(0, next)}
@@ -407,6 +456,7 @@ export function ValueEditor({
             label={isTemporal ? 'To' : 'Maximum'}
             type={type}
             enumValues={enumValues}
+            enumClosed={enumClosed}
             operator={operator}
             value={pair[1]}
             onChange={(next) => setAt(1, next)}
@@ -423,6 +473,7 @@ export function ValueEditor({
       label="Value"
       type={type}
       enumValues={enumValues}
+      enumClosed={enumClosed}
       operator={operator}
       value={Array.isArray(value) ? value[0] : value}
       onChange={onChange}
