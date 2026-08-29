@@ -34,7 +34,6 @@ import com.sq.caa.rules.RuleFormatter;
 import com.sq.caa.rules.RuleMatch;
 import com.sq.caa.rules.RuleParser;
 import com.sq.caa.service.ActivitySummaryService;
-import com.sq.caa.service.TransactionService;
 import com.sq.caa.web.dto.CustomerDtos.ActivityTypeBreakdown;
 import com.sq.caa.web.dto.CustomerDtos.CountryBreakdown;
 import com.sq.caa.web.dto.CustomerDtos.CurrencyBreakdown;
@@ -43,7 +42,6 @@ import com.sq.caa.web.dto.CustomerDtos.StatusBreakdown;
 import com.sq.caa.web.dto.TransactionDtos.CardDetail;
 import com.sq.caa.web.dto.TransactionDtos.CryptoDetail;
 import com.sq.caa.web.dto.TransactionDtos.PaymentDetail;
-import com.sq.caa.web.dto.TransactionDtos.TransactionView;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
@@ -72,9 +70,15 @@ import tools.jackson.databind.node.NullNode;
  * it was not asked to review, because no tool accepts a customer id at all.
  *
  * <p>Every read goes through the services and the rule engine the rest of the application uses; no
- * query logic is duplicated here. All transaction reads are served from the run's single
+ * query logic is duplicated here. Every transaction read - the rows of {@code list_transactions},
+ * the full record and the rolling aggregates of {@code get_transaction_details}, and every
+ * deterministic rule evaluation - is served from the run's single
  * {@link com.sq.caa.rules.EvaluationBatch}, so what the agent sees and what the rule engine scores
- * are by construction the same snapshot.
+ * are by construction the same snapshot. This class holds no repository and no transaction service:
+ * there is no path by which a tool could re-read a row the engine did not score. The one figure
+ * that is not per-transaction is the rollup block of {@code get_customer_activity_summary}, which
+ * {@link ActivitySummaryService} computes with grouped queries over the same customer; its velocity
+ * peaks are folded from the batch's own snapshots.
  *
  * <p>Tools return {@code Object} because a failed call must answer with a {@link ToolError} document
  * the model can act on rather than an exception that costs a turn and teaches it nothing.
@@ -132,20 +136,17 @@ public class RiskAgentTools {
 
     private final AgentRunContext context;
     private final ActivitySummaryService activitySummaryService;
-    private final TransactionService transactionService;
     private final RagService ragService;
     private final JsonMapper jsonMapper;
     private final int defaultTransactionPageSize;
 
     public RiskAgentTools(AgentRunContext context,
             ActivitySummaryService activitySummaryService,
-            TransactionService transactionService,
             RagService ragService,
             JsonMapper jsonMapper,
             int defaultTransactionPageSize) {
         this.context = context;
         this.activitySummaryService = activitySummaryService;
-        this.transactionService = transactionService;
         this.ragService = ragService;
         this.jsonMapper = jsonMapper;
         this.defaultTransactionPageSize = defaultTransactionPageSize;
@@ -311,24 +312,30 @@ public class RiskAgentTools {
                 return new ToolError("'" + transaction_id + "' is not a valid transaction id.",
                         "Copy a transaction_id from list_transactions verbatim.");
             }
+            // Ownership check, and the reason no tool needs a customer id: the batch holds this
+            // customer's activity and nothing else, so an id it does not know is an id the agent
+            // may not read.
             if (context.batch().factsFor(id) == null) {
                 return new ToolError("Transaction " + id + " does not belong to the customer under analysis.",
                         "Only transactions returned by list_transactions for this customer can be read.");
             }
-            TransactionView view = transactionService.getTransaction(id);
+            // The payload comes from the same snapshot, not from a fresh read: the record the model
+            // quotes has to be the record the rule engine scored.
+            Transaction transaction = context.batch().transactionFor(id);
+            Customer owner = context.customer();
             AggregateSnapshot aggregates = context.batch().aggregatesFor(id);
             return new TransactionDetail(
-                    text(view.transactionId()),
-                    text(view.customerId()),
-                    view.customerName(),
-                    view.activityType() == null ? null : view.activityType().name(),
-                    view.amount(),
-                    view.currency(),
-                    view.status(),
-                    text(view.createdAt()),
-                    safe(view.card()),
-                    safe(view.payment()),
-                    safe(view.crypto()),
+                    text(transaction.getTransactionId()),
+                    owner == null ? null : text(owner.getCustomerId()),
+                    owner == null ? null : owner.getFullName(),
+                    transaction.getActivityType() == null ? null : transaction.getActivityType().name(),
+                    transaction.getAmount(),
+                    transaction.getCurrency(),
+                    transaction.getStatus(),
+                    text(transaction.getCreatedAt()),
+                    safe(CardDetail.from(transaction.getCardActivity())),
+                    safe(PaymentDetail.from(transaction.getPaymentActivity())),
+                    safe(CryptoDetail.from(transaction.getCryptoActivity())),
                     new TransactionAggregates(
                             aggregates.txCount24h(),
                             aggregates.amountSum24h(),

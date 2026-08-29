@@ -77,7 +77,12 @@ import tools.jackson.databind.node.ObjectNode;
  * requirements are reconciled by distributing the rule's weight across the transactions that
  * actually matched it, largest-remainder style, and writing {@code 0.00} for the in-scope
  * transactions that did not match and for every rule that did not trigger. The sum of the column is
- * then exactly the run's total score, and the table alone proves which rules were evaluated.
+ * then exactly the run's total score, and the table alone proves which rules were evaluated - for
+ * every rule that had at least one transaction in scope. A rule whose scope is empty (an
+ * {@code ALL}-scoped rule for a customer with no activity) is evaluated like any other but has no
+ * transaction to key a row on; for that rule the run header's {@code rules_evaluated} /
+ * {@code rules_total} / {@code coverage_complete}, written below on every path, are the
+ * authoritative record.
  */
 @Service
 public class RiskAnalysisService {

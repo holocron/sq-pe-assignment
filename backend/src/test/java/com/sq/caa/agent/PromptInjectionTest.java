@@ -73,7 +73,7 @@ class PromptInjectionTest {
         AnalysisTrace trace = AgentTestFixtures.trace(UUID.randomUUID());
         RiskAgentTools tools = new RiskAgentTools(
                 AgentTestFixtures.context(UUID.randomUUID(), trace, AgentTestFixtures.rules()),
-                null, null, rag, jsonMapper, 25);
+                null, rag, jsonMapper, 25);
 
         KnowledgeSearchResult result = assertInstanceOf(KnowledgeSearchResult.class,
                 tools.searchPolicyKnowledge("reporting threshold", 1));
@@ -157,7 +157,7 @@ class PromptInjectionTest {
         RiskAgentTools tools = new RiskAgentTools(
                 AgentTestFixtures.contextOver(UUID.randomUUID(), trace, AgentTestFixtures.rules(),
                         List.of(hostile)),
-                null, null, null, jsonMapper, 25);
+                null, null, jsonMapper, 25);
 
         TransactionPage page = assertInstanceOf(TransactionPage.class,
                 tools.listTransactions(null, null, null, null, null));
@@ -179,7 +179,7 @@ class PromptInjectionTest {
         AnalysisTrace trace = AgentTestFixtures.trace(UUID.randomUUID());
         RiskAgentTools tools = new RiskAgentTools(
                 AgentTestFixtures.context(UUID.randomUUID(), trace, List.of(hostile)),
-                null, null, null, jsonMapper, 25);
+                null, null, jsonMapper, 25);
 
         RuleList listing = assertInstanceOf(RuleList.class, tools.listRiskRules());
         String name = listing.rules().getFirst().ruleName();

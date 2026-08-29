@@ -16,7 +16,11 @@ import java.util.UUID;
  *
  * @param inScopeTransactionIds every transaction the rule was evaluated against; one
  *                              {@code risk_assessments} row is written per entry, so that "no rule
- *                              was skipped" is provable from the table alone
+ *                              was skipped" is provable from the table alone for every rule with at
+ *                              least one transaction in scope. Empty when the rule had nothing to
+ *                              evaluate - an {@code ALL}-scoped rule for a customer with no activity
+ *                              - in which case the rule writes no rows and the run's coverage
+ *                              counters are the record that it was evaluated
  * @param disagreement          true when the agent's triggered flag contradicted the engine
  */
 public record RuleOutcome(

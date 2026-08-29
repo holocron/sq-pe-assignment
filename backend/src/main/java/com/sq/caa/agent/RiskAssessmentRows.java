@@ -18,7 +18,8 @@ import java.util.UUID;
  * <p>Two requirements meet here and have to be reconciled:
  * <ul>
  *   <li>a row must exist for <b>every (transaction, rule) pair evaluated</b>, including the rules
- *       that did not trigger, so that "no rule was skipped" is provable from the table alone;</li>
+ *       that did not trigger, so that "no rule was skipped" is provable from the table alone for
+ *       every rule that had at least one transaction in scope;</li>
  *   <li>a rule's contribution to the score is <b>capped at its weight</b>, however many transactions
  *       it matched.</li>
  * </ul>
@@ -29,6 +30,16 @@ import java.util.UUID;
  * run is exactly the run's total score, and every matching transaction still carries a non-zero
  * contribution that marks it as evidence. Transactions in scope that did not match, and every
  * transaction of a rule that did not trigger, get {@code 0.00}.
+ *
+ * <p><b>The exact limit of the "provable from the table alone" claim.</b> A row is keyed by a
+ * transaction and {@code risk_assessments.transaction_id} is a NOT NULL foreign key, so a rule whose
+ * scope contains <em>zero</em> transactions has nothing to key a row on and writes none. That
+ * happens for an {@code ALL}-scoped rule when the customer has no activity at all - the rule is
+ * genuinely evaluated, appears in the run's trace and counts towards the coverage counters, but
+ * leaves no trace in this table. For such a rule the authoritative record that it was checked is
+ * {@code analysis_runs.rules_evaluated} / {@code rules_total} / {@code coverage_complete}, which is
+ * written for every run. A sentinel row is not an option without changing the assignment's schema,
+ * and the schema is fixed; stating the boundary precisely is. See {@code EmptyScopeCoverageTest}.
  */
 public final class RiskAssessmentRows {
 

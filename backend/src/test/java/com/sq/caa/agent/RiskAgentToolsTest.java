@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.sq.caa.agent.ToolPayloads.CustomerProfile;
@@ -13,9 +14,12 @@ import com.sq.caa.agent.ToolPayloads.FinalAck;
 import com.sq.caa.agent.ToolPayloads.RuleEngineVerdict;
 import com.sq.caa.agent.ToolPayloads.RuleList;
 import com.sq.caa.agent.ToolPayloads.ToolError;
+import com.sq.caa.agent.ToolPayloads.TransactionDetail;
 import com.sq.caa.agent.ToolPayloads.TransactionPage;
 import com.sq.caa.agent.ToolPayloads.VerdictAck;
+import com.sq.caa.domain.ActivityType;
 import com.sq.caa.domain.RiskRule;
+import com.sq.caa.domain.Transaction;
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.UUID;
@@ -39,7 +43,7 @@ class RiskAgentToolsTest {
     private final AgentRunContext context =
             AgentTestFixtures.context(UUID.randomUUID(), trace, rules);
     private final RiskAgentTools tools =
-            new RiskAgentTools(context, null, null, null, JsonMapper.builder().build(), 25);
+            new RiskAgentTools(context, null, null, JsonMapper.builder().build(), 25);
 
     @Test
     @DisplayName("every tool is exposed with a description and a typed schema")
@@ -179,6 +183,59 @@ class RiskAgentToolsTest {
 
         assertInstanceOf(ToolError.class, tools.listTransactions("WIRE", null, null, null, null));
         assertInstanceOf(ToolError.class, tools.getTransactionDetails(UUID.randomUUID().toString()));
+    }
+
+    @Test
+    @DisplayName("get_transaction_details answers from the run's snapshot, type-specific detail included")
+    void transactionDetailsAreServedFromTheSnapshot() {
+        // These tools hold no transaction service and no repository: the only place any of the
+        // fields below can come from is the run's EvaluationBatch.
+        Transaction card = snapshot(ActivityType.CARD);
+        TransactionDetail detail = assertInstanceOf(TransactionDetail.class,
+                tools.getTransactionDetails(card.getTransactionId().toString()));
+
+        assertEquals(card.getTransactionId().toString(), detail.transactionId());
+        assertEquals("11111111-1111-4111-8111-111111111111", detail.customerId());
+        assertEquals("Dana Kovac", detail.customerName());
+        assertEquals("CARD", detail.activityType());
+        assertEquals("Completed", detail.status());
+        assertEquals(0, new BigDecimal("120.00").compareTo(detail.amount()));
+        assertNull(detail.payment());
+        assertNull(detail.crypto());
+        assertNotNull(detail.card());
+        assertEquals("Coop Supermarket", detail.card().merchantName());
+        assertEquals("5411", detail.card().mccCode());
+        assertTrue(detail.card().cardPresent());
+        // Neither the PAN nor the authorisation code is a rule-DSL field, so they can only have
+        // been carried by the batch's own record of the transaction.
+        assertEquals("****4242", detail.card().cardPan());
+        assertEquals("Debit", detail.card().cardType());
+        assertEquals("AUTH-1", detail.card().authorizationCode());
+        assertNull(detail.card().declineReason());
+
+        // The aggregates alongside it are the engine's own snapshots for this transaction, not a
+        // recomputation: this is the oldest transaction on file, so its backward-looking windows
+        // contain only itself.
+        assertEquals(1, detail.customerAggregatesAtThisTransaction().transactionsInPrior24h());
+        assertEquals(0, new BigDecimal("120.00")
+                .compareTo(detail.customerAggregatesAtThisTransaction().largestAmountInPrior30d()));
+
+        Transaction crypto = snapshot(ActivityType.CRYPTO);
+        TransactionDetail cryptoDetail = assertInstanceOf(TransactionDetail.class,
+                tools.getTransactionDetails(crypto.getTransactionId().toString()));
+        assertNotNull(cryptoDetail.crypto());
+        assertEquals("XMR", cryptoDetail.crypto().blockchain());
+        assertEquals("wallet-from", cryptoDetail.crypto().walletAddressFrom());
+        assertEquals("wallet-to", cryptoDetail.crypto().walletAddressTo());
+        assertEquals("0xfeed", cryptoDetail.crypto().txHash());
+        assertNull(cryptoDetail.crypto().exchangeName(), "an unattributed transfer has no exchange");
+    }
+
+    private Transaction snapshot(ActivityType type) {
+        return context.batch().transactions().stream()
+                .filter(transaction -> transaction.getActivityType() == type)
+                .findFirst()
+                .orElseThrow();
     }
 
     private String id(String ruleName) {

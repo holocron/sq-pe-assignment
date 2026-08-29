@@ -151,7 +151,40 @@ And a rule about tests, since the suites had failed to catch two crashes:
 > *"When you fix a bug a test should have caught, fix the TEST too so it would now fail without your
 > change. A green suite that cannot detect the bug is part of the defect."*
 
-### Phase 6 — Documentation
+### Phase 6 — Independent cross-model audit
+
+A full audit was run by a **different model** (Claude Fable 5) with no involvement in the build and
+no access to the reasoning behind it, instructed to read the code, run the builds, and report — see
+[`fable-audit.md`](fable-audit.md).
+
+Using a different model matters: the agents that wrote this code share priors with the agent that
+reviewed it. An auditor drawn from a different model does not inherit the same blind spots. It
+independently confirmed the coverage gate, the prompt-injection defences and the failure-path
+handling, and it produced findings the in-family review had not — notably that one agent tool
+(`get_transaction_details`) served its payload from a live database read while the class
+documentation claimed everything came from the run's frozen snapshot, and that the
+"auditable from `risk_assessments` alone" claim has an edge for a rule with no in-scope transactions.
+
+**It also produced the sharpest process lesson of the build.** The audit ran against the working
+tree *while the fix workflow was still executing*, and reported four blockers — the app not booting,
+both test suites red, the frontend build failing. All four were real **at 18:10** and all four were
+resolved by the integration agent by 18:59. The audit was accurate and stale at the same time.
+
+The lesson is not that the audit was wrong; it is that **an audit is a measurement of a moment**, and
+a repository mid-fix is not a state worth measuring. Two changes follow:
+
+- Audit a **committed** state, never a working tree — the audit's own M4 finding ("the entire fix
+  wave exists only as uncommitted changes") was the same problem seen from the other side.
+- Record the commit hash *and* the wall-clock time in the audit header, so a reader can tell staleness
+  from disagreement. This one did record both, which is why the discrepancy was diagnosable in
+  minutes rather than argued about.
+
+Every blocker it raised was verified individually against the current tree before being dismissed —
+`@Autowired` present on the bootstrap constructor, the test signature updated, the fixture keys
+refreshed, and a clean-slate boot seeding 3 documents into 32 chunks — rather than being waved away
+as "already fixed".
+
+### Phase 7 — Documentation
 
 Written by the architect rather than delegated, because the assumptions and design rationale live in
 the decisions, not in the code.
@@ -206,7 +239,7 @@ the flag would otherwise hide the bug it reports on.
 
 | | |
 |---|---|
-| Workflows | 5 (backend, frontend, design, review, fixes) |
+| Workflows | 5 (backend, frontend, design, review, fixes) + an independent cross-model audit |
 | Agents | 81 |
 | Agent tokens | ~8.0M |
 | Agent tool calls | ~3,200 |
@@ -230,6 +263,8 @@ the flag would otherwise hide the bug it reports on.
   original reviewer had missed while checking.
 - **Architect-level verification.** Three real defects, including the one that breaks the reviewer's
   very first command.
+- **A cross-model auditor.** A different model found what an in-family review had not, because it did
+  not share the reviewers' priors.
 
 ---
 
@@ -257,6 +292,10 @@ brief, and the app shell was left unbranded. It was caught only because a later 
 the work rather than trusting the report.
 *Change:* assert on a stage's output before feeding it downstream — a `null` from a required stage
 should halt the pipeline, not flow into the next prompt.
+
+**An audit was run against a moving tree.** The cross-model audit measured the repository while the
+fix workflow was still writing to it, so four of its findings were obsolete before they were read.
+*Change:* audits run against a commit, never a working tree.
 
 **Reviewers were told the code worked.** Review prompts included "current verified state: all tests
 green", which risks anchoring. The refutation step counteracted it, but the framing was a mistake.

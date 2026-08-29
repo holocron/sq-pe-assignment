@@ -445,7 +445,7 @@ class RuleCoverageGuaranteeTest {
     private AgentRunResult run(ScriptedChatModel model, AgentRunContext context, int maxSteps) {
         AgentProperties properties = new AgentProperties(maxSteps, MAX_COVERAGE_REPROMPTS, 4096, 0.1,
                 32768, 1536, 10, "test-model", 2, 16, Duration.ofMinutes(5), 25);
-        RiskAgentTools tools = new RiskAgentTools(context, null, null, null, jsonMapper, 25);
+        RiskAgentTools tools = new RiskAgentTools(context, null, null, jsonMapper, 25);
         RiskAgentLoop loop = new RiskAgentLoop(model, ToolCallingManager.builder().build(), jsonMapper,
                 properties);
         return loop.execute(context, tools);

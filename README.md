@@ -268,8 +268,8 @@ structurally, not merely requested in the prompt:
    **deterministic result wins** for scoring, and the disagreement is recorded in the trace.
 6. `analysis_runs.coverage_complete` records whether the agent covered everything itself.
 
-The result is auditable from the database alone — one `risk_assessments` row per
-`(transaction, rule)` sharing the run's `assessment_id`, **including non-triggered rules at `0.00`**:
+The result is auditable from the database — one `risk_assessments` row per `(transaction, rule)`
+sharing the run's `assessment_id`, **including non-triggered rules at `0.00`**:
 
 ```sql
 SELECT count(*) rows, count(DISTINCT rule_id) rules, sum(score_contribution) score
@@ -277,6 +277,13 @@ FROM risk_assessments WHERE assessment_id = '…';
 --  rows | rules | score
 --   220 |    12 | 100.00      <- 12 of 12 rules, summing to the run's total
 ```
+
+> **One precise caveat.** A rule is provable from `risk_assessments` when it has at least one
+> in-scope transaction. A rule whose scope is empty — an `ALL`-scoped rule for a customer with no
+> activity at all — is still evaluated and still counted, but writes no rows, because
+> `transaction_id` is a `NOT NULL` foreign key and the given schema may not be altered to admit a
+> sentinel. For that case `analysis_runs.rules_evaluated` / `rules_total` / `coverage_complete` are
+> the authoritative record. Found by an independent audit; see `docs/fable-audit.md`.
 
 ### Minimising false negatives
 
@@ -457,6 +464,14 @@ The brief requires login, RAG and persisted AI results but does not schema them,
   the app logs a prominent **warning at startup** when that built-in secret is in use. Override with
   `JWT_SECRET`.
 
+**Accepted for a demo, and deliberately so** (flagged by the independent audit in
+`docs/fable-audit.md`): the JWT lives in `localStorage` and — because `EventSource` cannot set
+headers — reaches the SSE endpoint as `?token=…`, so it can appear in access and proxy logs. The
+backend accepts a query-param token on that **one** GET path only. Beyond a demo this wants
+short-lived one-time stream tickets (or cookie auth for the stream) and a shorter TTL. There is also
+no token revocation: logout is client-side and a stolen token lives its full 8 hours, though the JWT
+filter reloads the user per request so *disabling* an account takes effect immediately.
+
 ---
 
 ## Main design decisions
@@ -556,6 +571,10 @@ Verification went beyond the suites, because green tests turned out not to imply
   them, because the fixtures asserted the frontend's own assumed payload shape rather than the
   backend's actual output.
 - **An adversarial code review** — see [`docs/CODE_REVIEW.md`](docs/CODE_REVIEW.md).
+- **An independent audit by a different model** — see [`docs/fable-audit.md`](docs/fable-audit.md).
+  Reviewers drawn from the same model share the blind spots of the agents that wrote the code; a
+  different one does not. It found two defects the in-family review had missed, including an agent
+  tool that read the live database while its documentation claimed a frozen snapshot.
 
 ---
 
@@ -596,6 +615,9 @@ Verification went beyond the suites, because green tests turned out not to imply
 │   ├── BUILD_SPEC.md            the authoritative build contract
 │   ├── DESIGN_SYSTEM.md         Swissquote brand tokens and the brand-vs-risk colour rule
 │   ├── CODE_REVIEW.md           adversarial review findings
+│   ├── METHODOLOGY.md           how the project was built, and what the process got wrong
+│   ├── AI_DESIGN.md             model choices and the agent instruction design
+│   ├── fable-audit.md           independent audit by a different model
 │   └── sample-knowledge/        seeded policy documents (.docx, .pdf)
 └── scripts/                     db-setup · db-reset · tunnel · knowledge doc generator
 ```
@@ -620,7 +642,8 @@ the effort went into writing code and two thirds into proving it correct.
 | **3 · Architect verification** | — | Re-run everything personally; trust no agent report |
 | **4 · Adversarial review** | 53 | 6 dimension reviewers, then a verifier per finding tasked with *refuting* it |
 | **5 · Fixes** | 7 | Parallel fixes under one arbitration rule, then re-verification |
-| **6 · Documentation** | — | Written by the architect, where the rationale lives |
+| **6 · Cross-model audit** | 1 | An independent audit by a *different* model ([`docs/fable-audit.md`](docs/fable-audit.md)) |
+| **7 · Documentation** | — | Written by the architect, where the rationale lives |
 
 Three decisions did most of the work:
 

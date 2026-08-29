@@ -22,7 +22,10 @@ import org.hibernate.type.SqlTypes;
  *
  * <p>A row is written for <em>every</em> rule in the coverage set, not only the triggered ones:
  * rules that did not fire are persisted with {@code scoreContribution = 0.00}. That makes "no rule
- * was skipped" provable from this table alone.
+ * was skipped" provable from this table alone for every rule that had at least one transaction in
+ * scope. A rule with an empty scope - an {@code ALL}-scoped rule for a customer with no activity -
+ * has no transaction to key a row on, and {@code analysis_runs.rules_evaluated} /
+ * {@code rules_total} / {@code coverage_complete} are the record that it was evaluated.
  *
  * <p>{@link #transaction} and {@link #rule} are read-only navigations over the key columns; write
  * the identifiers through {@link #getId()}.

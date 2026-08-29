@@ -158,8 +158,16 @@ CREATE INDEX idx_risk_rules_applies_to      ON risk_rules (applies_to);
 --   * assessment_id is the shared identifier of one analysis run,
 --   * the PRIMARY KEY is the composite (assessment_id, transaction_id, rule_id).
 -- One row is written per (transaction, rule) pair evaluated - including rules that
--- did NOT trigger, which get score_contribution = 0.00. Full rule coverage is
--- therefore auditable from this table alone.
+-- did NOT trigger, which get score_contribution = 0.00. Coverage of every rule that
+-- had at least one transaction in scope is therefore auditable from this table
+-- alone.
+--
+-- The one exception is structural, not an omission: transaction_id is NOT NULL, so
+-- a rule whose scope contains ZERO transactions (an ALL-scoped rule for a customer
+-- with no activity at all) has nothing to key a row on and writes none. That rule
+-- is still evaluated, and analysis_runs.rules_evaluated / rules_total /
+-- coverage_complete, together with the run's trace, are the authoritative record
+-- that it was checked.
 -- -----------------------------------------------------------------------------
 CREATE TABLE risk_assessments (
     assessment_id      UUID         NOT NULL,

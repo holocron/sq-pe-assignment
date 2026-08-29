@@ -8,7 +8,6 @@ import com.sq.caa.rules.RuleEvaluator;
 import com.sq.caa.service.ActivitySummaryService;
 import com.sq.caa.service.CustomerService;
 import com.sq.caa.service.RiskRuleService;
-import com.sq.caa.service.TransactionService;
 import java.util.List;
 import java.util.UUID;
 import org.springframework.beans.factory.ObjectProvider;
@@ -20,10 +19,11 @@ import tools.jackson.databind.json.JsonMapper;
  * it and hands the conversation to {@link RiskAgentLoop}.
  *
  * <p>The customer's activity is loaded exactly once, into a single
- * {@link EvaluationBatch}. Every tool read and every deterministic rule evaluation of the run is
- * served from that one snapshot, so the evidence the agent reasons about and the evidence the engine
- * scores can never be two different things - which is what makes the post-loop cross-check
- * meaningful rather than a race.
+ * {@link EvaluationBatch}. Every transaction the tools read and every deterministic rule evaluation
+ * of the run is served from that one snapshot - the tool surface is handed no repository and no
+ * transaction service, so it has nothing else to read from - and the evidence the agent reasons
+ * about and the evidence the engine scores can never be two different things, which is what makes
+ * the post-loop cross-check meaningful rather than a race.
  */
 @Component
 public class ReActRiskAgent {
@@ -33,7 +33,6 @@ public class ReActRiskAgent {
     private final RiskRuleService riskRuleService;
     private final RuleEvaluator ruleEvaluator;
     private final ActivitySummaryService activitySummaryService;
-    private final TransactionService transactionService;
     private final ObjectProvider<RagService> ragServiceProvider;
     private final JsonMapper jsonMapper;
     private final AgentProperties properties;
@@ -43,7 +42,6 @@ public class ReActRiskAgent {
             RiskRuleService riskRuleService,
             RuleEvaluator ruleEvaluator,
             ActivitySummaryService activitySummaryService,
-            TransactionService transactionService,
             ObjectProvider<RagService> ragServiceProvider,
             JsonMapper jsonMapper,
             AgentProperties properties) {
@@ -52,7 +50,6 @@ public class ReActRiskAgent {
         this.riskRuleService = riskRuleService;
         this.ruleEvaluator = ruleEvaluator;
         this.activitySummaryService = activitySummaryService;
-        this.transactionService = transactionService;
         this.ragServiceProvider = ragServiceProvider;
         this.jsonMapper = jsonMapper;
         this.properties = properties;
@@ -75,7 +72,7 @@ public class ReActRiskAgent {
     public AgentRunResult run(UUID assessmentId, UUID customerId, AnalysisTrace trace,
             AnalysisProgressListener progress) {
         AgentRunContext context = context(assessmentId, customerId, trace, progress);
-        RiskAgentTools tools = new RiskAgentTools(context, activitySummaryService, transactionService,
+        RiskAgentTools tools = new RiskAgentTools(context, activitySummaryService,
                 ragServiceProvider.getIfAvailable(), jsonMapper, properties.transactionPageSize());
         return loop.execute(context, tools);
     }
