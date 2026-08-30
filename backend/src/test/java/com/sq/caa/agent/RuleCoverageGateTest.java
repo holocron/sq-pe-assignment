@@ -31,11 +31,12 @@ import tools.jackson.databind.json.JsonMapper;
  * The rule-coverage gate: the loop must not be able to finish while a rule is unjudged, and a run
  * that cannot judge them all must end as a failure rather than as a tidy report.
  *
- * <p>This is the guarantee re-armed for an agent that is the sole judge. There is no engine to close
- * a rule the model skipped, so "coverage is always 100%" would now be a lie; what holds instead is
- * stricter and is what these tests pin: a run is either complete - every applicable rule judged by
- * the agent, {@code coverage_complete} true - or it is failed, with the rules it never judged named
- * in the exception and in the trace, and with every verdict it did produce kept.
+ * <p>This is the guarantee re-armed for an agent that answers every rule with a query. There is no
+ * engine to close a rule the model skipped, so "coverage is always 100%" would now be a lie; what
+ * holds instead is stricter and is what these tests pin: a run is either complete - every applicable
+ * rule answered by a query that ran, {@code coverage_complete} true - or it is failed, with the
+ * rules it never judged named in the exception and in the trace, and with every verdict it did
+ * produce kept.
  *
  * <p>Everything here runs against a scripted {@link ScriptedChatModel} that deliberately misbehaves,
  * so the gate is exercised as control flow rather than hoped for. No Spring context, no database and
@@ -64,8 +65,8 @@ class RuleCoverageGateTest {
                 // 1. look at the checklist
                 calls(RiskAgentTools.LIST_RISK_RULES, "{}"),
                 // 2. judge one rule out of four
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                        sanctioned, true, 30, "Wire of 25,000 to a bank in RU.")),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(sanctioned,
+                        "Payments over 10,000 to a sanctioned jurisdiction.")),
                 // 3. try to conclude with three rules still open - the gate must reject this
                 calls(RiskAgentTools.SUBMIT_FINAL_ASSESSMENT,
                         """
@@ -74,8 +75,8 @@ class RuleCoverageGateTest {
                 // 4. give up and answer in prose instead - the gate must reject this too
                 says("My analysis is complete; the customer is high risk."),
                 // 5. grudgingly judge one more
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                        structuring, true, 20, "Three payments just under 10,000 within a day.")),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(structuring,
+                        "Three payments of 9,000-9,999 inside a rolling day.")),
                 // 6. and 7. stop answering, burning the reprompt budget
                 says("Nothing else to add."),
                 says("Truly done.")));
@@ -103,9 +104,12 @@ class RuleCoverageGateTest {
         assertTrue(result.unjudgedRuleNames().contains(declines.getRuleId().toString()));
 
         Map<String, RuleOutcome> byName = outcomes(result);
-        assertEquals(RuleVerdictSource.AGENT_JUDGED, byName.get(SANCTIONED_WIRE).source());
-        assertEquals("Wire of 25,000 to a bank in RU.", byName.get(SANCTIONED_WIRE).rationale());
-        assertEquals(RuleVerdictSource.AGENT_JUDGED, byName.get(STRUCTURING).source());
+        assertEquals(RuleVerdictSource.SQL_DERIVED, byName.get(SANCTIONED_WIRE).source());
+        assertEquals("Payments over 10,000 to a sanctioned jurisdiction.",
+                byName.get(SANCTIONED_WIRE).rationale());
+        assertTrue(byName.get(SANCTIONED_WIRE).sql().contains("receiver_bank_country"),
+                "a kept verdict keeps the query that produced it");
+        assertEquals(RuleVerdictSource.SQL_DERIVED, byName.get(STRUCTURING).source());
         assertFalse(byName.containsKey(UNATTRIBUTED_CRYPTO),
                 "a rule nobody judged must not appear as an outcome - that would write a 0.00 row "
                         + "indistinguishable from a rule that was checked and cleared");
@@ -128,7 +132,7 @@ class RuleCoverageGateTest {
                 "the reprompt must give the missing rule's id so the model can act on it");
         assertTrue(reprompts.contains(DECLINE_BURST));
 
-        // --- what was judged is still scored, from the agent's own estimates -
+        // --- what was judged is still scored, at the weights of the rules whose queries matched -
         assertEquals(0, new BigDecimal("50.00").compareTo(result.totalScore()));
         assertEquals(RiskLevel.HIGH, result.riskLevel());
         assertEquals(1, countSteps(trace, TraceStep.Type.FINAL));
@@ -148,19 +152,20 @@ class RuleCoverageGateTest {
 
         ScriptedChatModel model = new ScriptedChatModel(List.of(
                 calls(RiskAgentTools.LIST_RISK_RULES, "{}"),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                        AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE), true, 30, "RU wire.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                        AgentTestFixtures.ruleNamed(rules, STRUCTURING), true, 20,
-                        "Three near-threshold payments.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                        AgentTestFixtures.ruleNamed(rules, UNATTRIBUTED_CRYPTO), true, 15,
-                        "XMR, no exchange.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                        AgentTestFixtures.ruleNamed(rules, DECLINE_BURST), false, 0,
-                        "No declines on file.")),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
+                        AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE),
+                        "Payments over 10,000 to a sanctioned jurisdiction.")),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
+                        AgentTestFixtures.ruleNamed(rules, STRUCTURING),
+                        "Three payments of 9,000-9,999 inside a rolling day.")),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
+                        AgentTestFixtures.ruleNamed(rules, UNATTRIBUTED_CRYPTO),
+                        "Crypto over 1,000 with no exchange attribution.")),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
+                        AgentTestFixtures.ruleNamed(rules, DECLINE_BURST),
+                        "Five declined authorisations inside a rolling day.")),
                 calls(RiskAgentTools.SUBMIT_FINAL_ASSESSMENT, """
-                        {"risk_level":"CRITICAL","summary":"Sanctioned wire, structuring and an \
+                        {"risk_level":"HIGH","summary":"Sanctioned wire, structuring and an \
                         unattributed privacy-coin transfer.","recommendations":"Escalate to the MLRO."}""")));
 
         AgentRunResult result = run(model, context);
@@ -172,15 +177,20 @@ class RuleCoverageGateTest {
         assertEquals(0, countSteps(trace, TraceStep.Type.COVERAGE_FAILED));
         assertEquals(6, model.turns(), "the loop must stop as soon as the assessment is accepted");
 
-        assertEquals(RiskLevel.CRITICAL, result.agentRiskLevel());
-        // The band is re-derived by banding the agent's own rule scores, so it can differ from the
-        // band the agent proposed.
+        assertEquals(RiskLevel.HIGH, result.agentRiskLevel());
+        // Three queries returned rows and one did not, so the total is the sum of three weights and
+        // the band is that total banded - no part of it is an estimate.
         assertEquals(0, new BigDecimal("65.00").compareTo(result.totalScore()));
+        assertEquals(RiskLevel.HIGH, result.mechanicalRiskLevel());
         assertEquals(RiskLevel.HIGH, result.riskLevel());
+        assertFalse(result.escalated());
+        assertNull(result.escalationJustification());
         assertTrue(result.summary().contains("Sanctioned wire"));
         assertTrue(result.recommendations().contains("MLRO"));
         assertTrue(result.ruleOutcomes().stream()
-                .allMatch(outcome -> outcome.source() == RuleVerdictSource.AGENT_JUDGED));
+                .allMatch(outcome -> outcome.source() == RuleVerdictSource.SQL_DERIVED));
+        assertTrue(result.ruleOutcomes().stream().allMatch(outcome -> outcome.sql() != null),
+                "every recorded verdict names the query that produced it");
     }
 
     @Test
@@ -257,9 +267,10 @@ class RuleCoverageGateTest {
     // ------------------------------------------------------------------
 
     private AgentRunResult run(ScriptedChatModel model, AgentRunContext context) {
-        AgentProperties properties = new AgentProperties(40, MAX_COVERAGE_REPROMPTS, 4096, 0.1,
+        AgentProperties properties = new AgentProperties(40, MAX_COVERAGE_REPROMPTS, 3, 4096, 0.1,
                 32768, 1536, 10, "test-model", 2, 16, Duration.ofMinutes(5), Duration.ofMinutes(10), 25);
-        RiskAgentTools tools = new RiskAgentTools(context, null, null, jsonMapper, 25);
+        RiskAgentTools tools = new RiskAgentTools(context, null, null,
+                AgentTestFixtures.evaluator(context), jsonMapper, 25, 3);
         RiskAgentLoop loop = new RiskAgentLoop(model, ToolCallingManager.builder().build(), jsonMapper,
                 properties);
         return loop.execute(context, tools);

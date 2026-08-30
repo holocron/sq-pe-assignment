@@ -195,7 +195,7 @@ export function RuleEditor({ mode, rule, onClose }: RuleEditorProps) {
         mode === 'edit' && rule ? (
           <span className="font-mono text-2xs">{rule.ruleId}</span>
         ) : (
-          'Describe the condition in plain English — the agent reads it, fetches the data and judges the verdict.'
+          'Describe the condition in plain English — the agent turns it into a SQL query, Postgres runs it, and the rule fires when the query returns rows.'
         )
       }
       footer={

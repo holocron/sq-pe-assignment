@@ -12,6 +12,7 @@ import {
   ChartColumn,
   CircleAlert,
   ClipboardCheck,
+  Database,
   Flag,
   Gavel,
   ListOrdered,
@@ -23,8 +24,9 @@ import {
   Wrench,
   type LucideIcon,
 } from 'lucide-react'
-import type { JsonValue, ToolCallTraceStep, TraceStep } from '../../api/types'
+import type { JsonValue, SqlEvaluation, ToolCallTraceStep, TraceStep } from '../../api/types'
 import { formatAmount, humanizeToken, shortId } from '../../lib/format'
+import { sqlFailure } from './sql'
 
 /** What a tool call is for; drives the chip on the trace step. */
 export type ToolKind = 'evidence' | 'policy' | 'submit' | 'custom'
@@ -47,8 +49,9 @@ export const TOOL_KIND_LABELS: Record<ToolKind, string> = {
 }
 
 /**
- * The eight agent tools. There is no tool that evaluates a rule: conditions are
- * prose, so the agent gathers evidence and judges them itself.
+ * The agent's tools. `evaluate_rule` is the one that settles a rule: the agent
+ * writes SQL expressing the condition, Postgres runs it, and the verdict follows
+ * from the row count rather than from anything the model concluded.
  */
 export const TOOL_META: Record<string, ToolMeta> = {
   get_customer_profile: {
@@ -84,7 +87,7 @@ export const TOOL_META: Record<string, ToolMeta> = {
     name: 'list_risk_rules',
     label: 'Risk rules',
     description:
-      'Loaded every rule that applies to this customer — the coverage set, each condition in plain English for the agent to judge.',
+      'Loaded every rule that applies to this customer — the coverage set, each condition in plain English for the agent to express as SQL.',
     icon: SlidersHorizontal,
     kind: 'evidence',
   },
@@ -95,11 +98,19 @@ export const TOOL_META: Record<string, ToolMeta> = {
     icon: BookOpen,
     kind: 'policy',
   },
+  evaluate_rule: {
+    name: 'evaluate_rule',
+    label: 'Evaluate rule',
+    description:
+      'Ran the agent’s SQL for one rule condition against this customer. Postgres decided it: rows returned means triggered, and the score is the rule’s weight.',
+    icon: Database,
+    kind: 'submit',
+  },
   submit_rule_evaluation: {
     name: 'submit_rule_evaluation',
     label: 'Submit rule verdict',
     description:
-      'Recorded the agent’s verdict, estimated score and rationale for one rule. The score is capped at the rule’s weight.',
+      'Recorded the agent’s own verdict and estimated score for one rule. This is the older tool, used before rule conditions were answered by a query.',
     icon: ClipboardCheck,
     kind: 'submit',
   },
@@ -151,6 +162,19 @@ export function traceStepMeta(step: TraceStep): TraceStepMeta {
   switch (step.type) {
     case 'tool_call': {
       const meta = toolMeta(step.tool)
+      /* A query that was refused or errored decided nothing. It must not wear
+         the same marker as one Postgres answered, or a retry after a failure
+         reads as two successful evaluations of the same rule. */
+      const failure = sqlFailure(step.sql)
+      if (failure) {
+        return {
+          label: meta.label,
+          description:
+            'The query for this rule did not run, so nothing was measured and the rule was left undecided.',
+          icon: TriangleAlert,
+          tone: 'danger',
+        }
+      }
       return {
         label: meta.label,
         description: meta.description,
@@ -337,9 +361,10 @@ export function hasJsonContent(value: JsonValue | null | undefined): boolean {
  * The collapsed row's identity.
  *
  * A run with twelve rules produces two dozen steps whose tool name is the same,
- * and the rule each one judged used to be visible only after expanding the
- * arguments. Since a rule condition is prose and the agent's judgement *is* the
- * verdict — nothing re-checks it — the row has to name the rule on its face.
+ * and the rule each one settled used to be visible only after expanding the
+ * arguments. The rule now has to be on the face of the row, together with how
+ * the query came out — including when it did not run at all, which is the one
+ * outcome that must never be mistaken for a cleared rule.
  */
 export interface TraceStepIdentity {
   /** What the step acted on: a rule name, a transaction, a policy query. */
@@ -490,6 +515,65 @@ function verdictIdentity(
   return { subject, outcome, outcomeTone: triggered ? 'accent' : 'neutral', progress }
 }
 
+/**
+ * The collapsed row of an `evaluate_rule` step.
+ *
+ * Which rule, and how the database answered. A failed or rejected attempt says
+ * so in place of an outcome, because "not triggered" and "the query never ran"
+ * are opposite facts and a row that blurs them would be the most misleading
+ * thing on the page.
+ */
+function sqlVerdictIdentity(
+  step: ToolCallTraceStep,
+  context: TraceStepIdentityContext,
+): TraceStepIdentity {
+  const preview = step.resultPreview
+  const args = argsObject(step.args)
+  const ruleId = previewString(preview, 'ruleId') ?? argString(args, 'rule_id')
+  const subject =
+    previewString(preview, 'ruleName') ??
+    (ruleId ? (context.ruleNames?.get(ruleId) ?? `Rule ${shortId(ruleId)}`) : null)
+
+  const failure = sqlFailure(step.sql)
+  if (failure) {
+    return {
+      subject,
+      outcome: failure.kind === 'rejected' ? 'query rejected' : 'query failed',
+      outcomeTone: 'neutral',
+      progress: null,
+    }
+  }
+  // The tool refuses a call it cannot act on at all — an unknown rule, no SQL —
+  // and answers a query it would not run with accepted:false. Either way the
+  // rule was left where it was, so neither may render as an evaluation.
+  if (previewHas(preview, 'error') || previewBoolean(preview, 'accepted') === false) {
+    return { subject, outcome: 'call rejected', outcomeTone: 'neutral', progress: null }
+  }
+
+  const submitted = previewNumber(preview, 'verdictsSubmitted') ?? context.ruleOrdinal ?? null
+  const total = previewNumber(preview, 'rulesTotal') ?? context.ruleCount ?? null
+  const progress = submitted && total ? `rule ${submitted}/${total}` : null
+
+  const triggered = previewBoolean(preview, 'triggered') ?? argBoolean(args, 'triggered')
+  if (triggered === null) {
+    return { subject, outcome: null, outcomeTone: 'neutral', progress }
+  }
+  /* `matchedTransactions` is the field name on the tool acknowledgement; the
+     persisted evaluation calls the same number `matchedCount`. */
+  const matched =
+    previewNumber(preview, 'matchedTransactions') ??
+    previewNumber(preview, 'matchedCount') ??
+    step.sql?.matchedCount ??
+    null
+  const rows = matched === null ? '' : ` · ${countLabel(matched, 'row')}`
+  return {
+    subject,
+    outcome: triggered ? `triggered${rows}` : `not triggered${rows}`,
+    outcomeTone: triggered ? 'accent' : 'neutral',
+    progress,
+  }
+}
+
 /** `PAYMENT 9,800.00 CHF on 2026-08-20` — enough to recognise the transaction. */
 function transactionSubject(step: ToolCallTraceStep): string | null {
   const preview = step.resultPreview
@@ -512,6 +596,8 @@ function toolCallIdentity(
 ): TraceStepIdentity {
   const preview = step.resultPreview
   switch (step.tool) {
+    case 'evaluate_rule':
+      return sqlVerdictIdentity(step, context)
     case 'submit_rule_evaluation':
       return verdictIdentity(step, context)
     case 'list_risk_rules': {
@@ -628,9 +714,22 @@ export type TraceBlock =
   | { kind: 'step'; step: TraceStep }
   | { kind: 'verdicts'; steps: TraceStep[] }
 
-/** True when the step is the agent recording its judgement of one rule. */
+/** Tool calls that settle one rule, in either the SQL or the older form. */
+const VERDICT_TOOLS = new Set(['evaluate_rule', 'submit_rule_evaluation'])
+
+/** True when the step settles one rule of the coverage set. */
 export function isVerdictStep(step: TraceStep): boolean {
-  return step.type === 'tool_call' && step.tool === 'submit_rule_evaluation'
+  return step.type === 'tool_call' && VERDICT_TOOLS.has(step.tool)
+}
+
+/**
+ * The query one step ran, if it ran one.
+ *
+ * Narrowing lives here rather than at each call site so the viewer can ask any
+ * step for its SQL without first proving it is a tool call.
+ */
+export function traceStepSql(step: TraceStep): SqlEvaluation | null {
+  return step.type === 'tool_call' ? (step.sql ?? null) : null
 }
 
 /**

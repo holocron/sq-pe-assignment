@@ -10,7 +10,13 @@ PSQL="${PSQL:-/opt/homebrew/opt/postgresql@17/bin/psql}"
 DB="${DB_NAME:-caa}"
 ROLE="${DB_ROLE:-caa}"
 
+# caa_ro goes too: it holds the single-customer views the agent's SQL role reads through, and
+# they are rebuilt by V5__readonly_role.sql on the next start. Dropping public alone would cascade
+# the views away and leave the schema and its scope function behind, which is a partial slate.
+# The caa_readonly LOGIN role itself is deliberately kept - dropping a role needs superuser and
+# V5 is idempotent about a role that already exists.
 "$PSQL" -d "$DB" -v ON_ERROR_STOP=1 <<SQL
+DROP SCHEMA IF EXISTS caa_ro CASCADE;
 DROP SCHEMA public CASCADE;
 CREATE SCHEMA public;
 ALTER SCHEMA public OWNER TO ${ROLE};

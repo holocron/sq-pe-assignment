@@ -594,12 +594,14 @@ describe('rule tester', () => {
       within(panel).getByText('Third of four near-threshold payments.'),
     ).toBeInTheDocument()
 
-    /* The verdict is a judgement, not a calculation. Saying so is the whole
-       honesty requirement of dropping the deterministic engine. */
-    expect(within(panel).getByText(/Running it again .* can produce a different/)).toBeInTheDocument()
+    /* The preview is a judgement, not a calculation, and it is not how the run
+       decides either. Saying both is the honesty requirement of a tester that no
+       longer shares a mechanism with the thing it previews. */
+    expect(within(panel).getByText(/running it again .* can produce a different/)).toBeInTheDocument()
+    expect(within(panel).getByText(/the agent writes SQL for this condition/)).toBeInTheDocument()
   })
 
-  it('warns when the agent estimated more than the rule’s weight', async () => {
+  it('says the preview score is not the score a run would record', async () => {
     renderRulesPage()
     await openNewRuleEditor()
     typeCondition(VALID_CONDITION)
@@ -617,7 +619,7 @@ describe('rule tester', () => {
     fireEvent.click(within(panel).getByRole('button', { name: /Run the agent/ }))
 
     expect(
-      await within(panel).findByText(/The agent estimated more than the rule’s weight/),
+      await within(panel).findByText(/this rule would be recorded as/),
     ).toBeInTheDocument()
     /* The backend caps the evidence it returns, so a count of six over one row
        is not a contradiction — but it has to be named, not silently shown. */

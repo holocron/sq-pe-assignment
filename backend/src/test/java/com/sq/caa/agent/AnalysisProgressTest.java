@@ -47,14 +47,18 @@ class AnalysisProgressTest {
 
         ScriptedChatModel model = new ScriptedChatModel(List.of(
                 calls(RiskAgentTools.LIST_RISK_RULES, "{}"),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                        AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE), true, 30, "RU wire.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                        AgentTestFixtures.ruleNamed(rules, STRUCTURING), true, 20, "Structuring.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                        AgentTestFixtures.ruleNamed(rules, UNATTRIBUTED_CRYPTO), true, 15, "XMR.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                        AgentTestFixtures.ruleNamed(rules, DECLINE_BURST), false, 0, "None.")),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
+                        AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE),
+                        "Payments over 10,000 to a sanctioned jurisdiction.")),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
+                        AgentTestFixtures.ruleNamed(rules, STRUCTURING),
+                        "Three payments of 9,000-9,999 inside a rolling day.")),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
+                        AgentTestFixtures.ruleNamed(rules, UNATTRIBUTED_CRYPTO),
+                        "Crypto over 1,000 with no exchange attribution.")),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
+                        AgentTestFixtures.ruleNamed(rules, DECLINE_BURST),
+                        "Five declines inside a rolling day.")),
                 calls(RiskAgentTools.SUBMIT_FINAL_ASSESSMENT, """
                         {"risk_level":"HIGH","summary":"Sanctioned wire and structuring.",\
                         "recommendations":"Escalate."}""")));
@@ -91,9 +95,10 @@ class AnalysisProgressTest {
     }
 
     private AgentRunResult run(ScriptedChatModel model, AgentRunContext context) {
-        AgentProperties properties = new AgentProperties(40, 3, 4096, 0.1, 32768, 1536, 10, "test-model",
-                2, 16, Duration.ofMinutes(5), Duration.ofMinutes(10), 25);
-        RiskAgentTools tools = new RiskAgentTools(context, null, null, jsonMapper, 25);
+        AgentProperties properties = new AgentProperties(40, 3, 3, 4096, 0.1, 32768, 1536, 10,
+                "test-model", 2, 16, Duration.ofMinutes(5), Duration.ofMinutes(10), 25);
+        RiskAgentTools tools = new RiskAgentTools(context, null, null,
+                AgentTestFixtures.evaluator(context), jsonMapper, 25, 3);
         RiskAgentLoop loop = new RiskAgentLoop(model, ToolCallingManager.builder().build(), jsonMapper,
                 properties);
         return loop.execute(context, tools);

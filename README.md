@@ -40,7 +40,7 @@ that checks every configured risk rule, cites retrieved policy, and persists an 
 | Maven | 3.9+ | |
 | Node.js | 20+ | verified on 26 |
 | PostgreSQL | 17 | **must have the `pgvector` extension available** |
-| An LLM endpoint | — | any OpenAI-compatible server (see [Model access](#model-access)) |
+| An LLM endpoint | — | any OpenAI-compatible server (see [Model access](#2-model-access)) |
 
 On macOS with Homebrew:
 
@@ -59,10 +59,13 @@ export JAVA_HOME=/opt/homebrew/opt/openjdk@21
 ./scripts/db-setup.sh
 ```
 
-Creates the `caa` role and database, installs `vector` and `uuid-ossp`, and — importantly — makes
-the `caa` role **own** the `public` schema. Without that ownership Flyway fails with
-`ERROR: no schema has been selected to create in`. The script must be run by a Postgres superuser
-(on a Homebrew install that is simply your own macOS user).
+Creates the `caa` role and database, installs `vector` and `uuid-ossp`, makes the `caa` role **own**
+the `public` schema, and delegates the two superuser-only rights `V5__readonly_role.sql` needs:
+`CREATEROLE` (to create the least-privilege role the agent's SQL runs as) and `SET ON PARAMETER
+temp_file_limit`. Without the schema ownership Flyway fails with `ERROR: no schema has been selected
+to create in`; without `CREATEROLE` the V5 migration stops and prints the exact statement a DBA has
+to run; without the parameter grant it raises a warning and carries on. The script must be run by a
+Postgres superuser (on a Homebrew install that is simply your own macOS user).
 
 ### 2. Model access
 
@@ -143,15 +146,21 @@ These are seeded with real BCrypt hashes and are also shown on the login screen 
 3. **Click "Run AI risk analysis".** The run takes several minutes — the trace streams live over
    SSE as the agent works. Watch it call tools, evaluate rules and retrieve policy.
 4. **Read the result.** A risk level, the agent's summary and recommendations, and — the important
-   part — a **rule coverage table** listing *every* applicable rule, triggered or not, with each
-   verdict's source and rationale, plus a `12 / 12 rules evaluated` indicator.
-5. **Sign in as `admin`** → **Risk Rules**. Open a rule and edit its conditions in the visual
-   builder; the JSON preview updates live. Hit "Test rule" to evaluate it against real seeded data.
+   part — a **rule coverage table** listing *every* applicable rule, triggered or not, with a
+   `12 / 12 rules answered` indicator. **Expand any row** to see the SQL the agent wrote for that
+   rule, what Postgres answered (*"returned 1 row, so the rule is triggered"*), and the transactions
+   the query returned. If the agent raised the risk band above the score, a banner above the verdict
+   shows both bands and its written justification.
+5. **Sign in as `admin`** → **Risk Rules**. Open a rule and edit its condition in plain English; the
+   editor's checklist explains how the wording becomes a query. "Test rule" runs one model judgement
+   of the draft against real seeded data — a preview of the wording, not of the run (see
+   [Rule conditions](#rule-conditions-and-the-rule-editor)).
 6. **Knowledge Base** → upload another `.docx`/`.pdf`, then use **Knowledge Search** to query it.
    That is the same retrieval path the agent uses as a tool.
 
 Customers with deliberately planted patterns: **Semenov** (sanctioned-jurisdiction wires, privacy
-chain), **Holloway** (structuring — repeated payments just under 10,000), **Tanaka** (crypto
+chain), **Holloway** (structuring — repeated payments just under 10,000, plus a 24-hour velocity
+and value spike), **Tanaka** (crypto
 concentration), **Okafor** (card decline burst then a large card-not-present success). Several other
 customers are deliberately clean so LOW/MEDIUM outcomes are reachable.
 
@@ -198,7 +207,8 @@ POST /api/customers/{id}/analyses
   → bounded executor runs the ReAct loop
        ├─ tools read customers / transactions / rules / aggregates
        ├─ search_policy_knowledge → pgvector similarity search
-       ├─ submit_rule_evaluation → the agent's verdict on ONE rule
+       ├─ evaluate_rule → the agent's SQL for ONE rule, run in the read-only sandbox;
+       │                  the row count is the verdict, the weight is the score
        └─ each step appended to the trace and pushed over SSE
   → coverage gate: cannot finish while any applicable rule is unjudged
   → still unjudged when the steps run out? the run is persisted FAILED, naming them
@@ -249,8 +259,49 @@ of the deliverable — the model relies on them):
 | `get_transaction_details` | one transaction with its CARD/PAYMENT/CRYPTO specifics |
 | `list_risk_rules` | every applicable rule — this defines the coverage set |
 | `search_policy_knowledge` | **RAG** — vector search over the policy knowledge base |
-| `submit_rule_evaluation` | records the agent's verdict on ONE rule: triggered, score, evidence ids, rationale |
-| `submit_final_assessment` | terminal: risk level, summary, recommendations |
+| `evaluate_rule` | takes the agent's **SQL** for ONE rule, runs it in the sandbox, and derives the verdict from the row count |
+| `submit_final_assessment` | terminal: risk level, summary, recommendations, escalation justification |
+
+### How a rule is decided
+
+**The agent writes the query. PostgreSQL answers it. The verdict is read off the answer.**
+
+`evaluate_rule(rule_id, sql, explanation)` takes a single `SELECT` the model wrote for that rule's
+condition, executes it against five customer-scoped, read-only CTEs, and derives everything
+mechanically:
+
+| | decided by |
+|---|---|
+| triggered / not triggered | the query returned at least one row |
+| score | the rule's `weight` when triggered, `0.00` when not — the model proposes no number |
+| evidence | the `transaction_id`s the query returned, intersected with the customer's own |
+| the summary, the recommendations, the overall band | still the agent |
+
+This replaced a design in which the model stated the verdict and estimated the score, and it exists
+because of a measured failure: asked to judge *"eight or more transactions in 24 hours"*, a run read
+the tool output, made the peak 8, compared it against a threshold it had misremembered as 10, and
+cleared a rule the data breached — a 20-point false negative caused purely by a language model doing
+arithmetic. The database does not misremember a threshold.
+
+Three checks sit between the model and a recorded verdict, and each records **nothing** when it
+fires — the rule stays outstanding and the model is told what to fix:
+
+1. **The sandbox** (`com.sq.caa.sql`) refuses a query that is not a single read-only SELECT over the
+   five relations, and the database refuses it again on privilege. See [Security](#security).
+2. **Scope.** Every id returned must be a transaction of this customer inside the rule's
+   `applies_to` scope. Half-verified evidence is not evidence.
+3. **Threshold fidelity** (`ThresholdFidelity`). The numbers in the query are compared with the
+   numbers in the condition, and a query that uses none of one of them is refused before it runs.
+   This is the check on the *question* rather than on the answer; see
+   [Known limitations](#known-limitations) for exactly what it does and does not guarantee.
+
+A query that is refused or that PostgreSQL cannot run leaves the rule **UNJUDGED**. It is never
+recorded as "not triggered" — the coverage guarantee below fails the run instead.
+
+**Escalation.** The band is mechanical: `RiskLevel.forScore(sum of rule scores)`. The agent may
+record a band **above** it with a written justification (`analysis_runs.trace` keeps both bands and
+the reason, and the UI shows them side by side). It may never record one below it, and it may never
+clear or downgrade a rule whose query fired.
 
 ### The rule-coverage guarantee
 
@@ -258,7 +309,8 @@ of the deliverable — the model relies on them):
 enforced structurally, not merely requested in the prompt:
 
 1. The **coverage set** is computed up front from `risk_rules` and fixed before turn one.
-2. `submit_rule_evaluation` is the only way a rule becomes covered.
+2. `evaluate_rule` is the only way a rule becomes covered, and only a query that actually ran
+   covers it.
 3. If the model tries to conclude with rules outstanding — by calling `submit_final_assessment` or
    by simply writing prose — the loop **does not exit**. It appends a message naming the exact
    missing rules, by name and id, and continues, recording a `coverage_reprompt` trace step.
@@ -296,14 +348,27 @@ The brief asks to minimise missed risk while keeping false positives reasonable.
 - **Mandatory total coverage.** No rule can be skipped — not by the model losing interest, and not
   by the run finishing early — so no risk goes unexamined. A rule the agent will not judge fails the
   whole run rather than passing quietly at `0.00`.
-- **Evidence before a verdict.** `submit_rule_evaluation` refuses a `triggered` verdict with no
-  cited transaction, refuses ids that are not this customer's or not in the rule's scope, and
-  refuses an empty rationale. The agent cannot record a finding it cannot evidence.
+- **Evidence before a verdict.** `evaluate_rule` records only what the query returned: it refuses
+  ids that are not this customer's or not in the rule's scope, and refuses an empty explanation. A
+  triggered rule always has the rows that triggered it, because the rows *are* the trigger.
+- **The comparison is not the model's.** The count, the sum and the `>=` are PostgreSQL's, so the
+  arithmetic failure mode is gone outright rather than mitigated.
 - **Asymmetric-cost prompting.** The system prompt states explicitly that a missed real risk costs
   far more than an extra review, and instructs the agent to escalate when evidence is ambiguous and
   never to assert a number that did not come from a tool.
 
 ### Context management
+
+> **The SQL change made this tighter, and that had to be measured rather than assumed.** Each rule
+> verdict now involves a query the model writes (a few hundred characters) and a statement that
+> executes (about 1,900, of which ~1,300 are the wrapper's identical boilerplate). Echoing the
+> executed statement back in the tool acknowledgement — twelve times a run — cost several thousand
+> tokens of a 32k window for text the model had written itself, and two live runs died with
+> *"500: Context size has been exceeded"*, one of them after ten of twelve rules. The acknowledgement
+> now carries only the model's own fragment; the executed statement is kept where it is needed, in
+> the verdict record, the trace and the analysis screen, and `RiskAgentToolsTest` asserts both halves
+> so the two readers cannot be conflated again.
+
 
 `gpt-oss-120b` advertises a 131k context window, but the serving backend was actually started with
 `ctx_size: 32768` — the real limit. A 30-turn ReAct transcript replays every tool result each turn
@@ -363,9 +428,10 @@ something the runtime will refuse.
   in `[BEGIN UNTRUSTED …]` fences, and an injection attempt is treated as a finding to report rather
   than merely something to ignore.
 - **Tool descriptions state the enforcement** — `submit_final_assessment` announces that it is
-  *rejected* while any rule is missing, and `submit_rule_evaluation` announces that verdicts are
-  cross-checked and *the engine wins*. The gate is therefore cooperative: the model usually satisfies
-  it without being re-prompted.
+  *rejected* while any rule is missing and that a band below the scored one is refused, and
+  `evaluate_rule` opens with *"YOU DO NOT DECIDE WHETHER THE RULE TRIGGERED"* and says plainly that
+  the row count is the verdict. The gate is therefore cooperative: the model usually satisfies it
+  without being re-prompted.
 - **Re-prompts are specific** — the coverage gate names the exact outstanding rules, because "you
   missed some rules" is not actionable.
 
@@ -384,8 +450,9 @@ which every review finding had to survive an agent trying to refute it (47 raise
 ## Rule conditions and the rule editor
 
 `risk_rules.threshold_logic` holds the rule condition **in natural language**. It is a prompt, not a
-program: nothing parses this column. The agent is shown the sentence verbatim, fetches the
-customer's data with its tools, and judges whether the rule is triggered and what it should score.
+program: nothing parses this column. The agent is shown the sentence verbatim, investigates the
+customer's data with its tools, and then **translates the sentence into one SQL query**. PostgreSQL
+runs it, and the verdict and the score follow from the result — the agent decides neither.
 
 ```text
 Three or more payments, each between 8,000 and 9,999.99, inside any rolling 24-hour window,
@@ -397,8 +464,15 @@ the 10,000 reporting threshold so that none of them is reported. The tell is the
 below the threshold within hours, not the total. Cite every payment in the cluster.
 ```
 
-- A condition states **a concrete threshold, a time window, and why the pattern matters**, because
-  the last part is what tells the agent how heavily to score a marginal case.
+- A condition states **a concrete threshold, a time window, and why the pattern matters**. The first
+  two become the query; the last is context for the summary, and is no longer used to weigh a
+  marginal case, because a triggered rule now scores exactly its weight.
+- **Write the numbers only where they are thresholds.** Every number in the condition is compared
+  against the numbers in the query the agent writes, and a query that uses none of a stated number
+  is refused before it runs. That check works for you when it flags a substituted threshold, and
+  against you when a "why it matters" paragraph contains an illustrative figure — the seeded
+  structuring rule's *"nine payments of 9,500"* was read as a band bound in two live runs. Keep
+  example figures out of the condition.
 - It may name **fields the agent can actually fetch** — the transaction, its type-specific detail,
   the customer, and customer-level aggregates (`agg.tx_count_24h`, `agg.crypto_ratio_30d`, …).
 - It reaches the model **fenced as data** (`PromptSafety.fence("rule_condition", …)`): a condition
@@ -415,11 +489,16 @@ example values and nullability, and clicking a field inserts its path into the p
 catalog fetch therefore no longer blocks saving.
 
 The admin editor is an authoring surface: an auto-growing condition textarea with a live character
-counter, six worked example conditions, a weight control that shows what the weight is worth against
-the whole catalogue, and a **Test rule** action that sends the draft to the model for one customer
-and shows the verdict, the score, the rationale and the cited transactions. The result panel states
-plainly that it is a judgement rather than a calculation and that a second run can differ — and it
-tells you when the model's estimate was capped at the rule's weight.
+counter, six worked example conditions, a *Writing for the SQL translation* checklist (one threshold
+per sentence, name the fields, write the numbers and windows out), a weight control that states the
+score is now mechanical — *"a rule whose query returns rows contributes exactly this weight; one
+whose query returns none contributes 0.00"* — and a **Test rule** action that sends the draft to the
+model for one customer.
+
+> **Read `Test rule` for what it is.** It is a *preview*: one direct model judgement of the draft
+> condition, and it does **not** go through `evaluate_rule`, the sandbox or PostgreSQL. Its verdict
+> and its score are the model's own, so they can differ from what a run would record. The panel says
+> so in as many words. It is a sense check on the wording, not a rehearsal of the run.
 
 ---
 
@@ -468,6 +547,15 @@ The brief requires login, RAG and persisted AI results but does not schema them,
 | `knowledge_documents` | uploaded policy documents and their ingestion status |
 | `document_chunks` | pgvector chunk store, `embedding vector(2560)` |
 
+### The read-only view schema, `caa_ro`
+
+`V5__readonly_role.sql` adds a schema of five `security_barrier` views — one per activity table —
+each filtered to a single customer by a transaction-local GUC, plus the `caa_readonly` login role
+that is granted `SELECT` on them and on nothing else. **No assignment table is altered**: no columns,
+constraints, indexes or row-level security. The views exist so that the agent's SQL reads through a
+principal with no privilege on any base table, and so that an unset scope yields zero rows rather
+than every row. See [Security](#security).
+
 `risk_assessments` stays exactly as specified and holds only the per-rule scoring rows.
 
 ---
@@ -484,6 +572,28 @@ The brief requires login, RAG and persisted AI results but does not schema them,
 - **Prompt-injection hardening**: retrieved document text and admin-authored rule names reach the
   model wrapped in explicit delimiters, and the system prompt states that tool output is *data*,
   never instructions.
+- **A sandbox for model-authored SQL** (`com.sq.caa.sql`, `V5__readonly_role.sql`). Because the
+  agent now writes SQL that runs against the customer database, four independent rings stand between
+  it and the data, and **the customer scope does not depend on any of the software ones**:
+
+  1. `RuleSqlValidator` — allow-list first. Five relations, their columns, ~90 functions, a closed
+     set of operators, printable ASCII only. A name it does not know is refused, not inspected.
+     Declared names are tracked by kind, so a column alias can never qualify a name, and a
+     schema-qualified name has no legal form where a table belongs.
+  2. `RuleSqlWrapper` — the fragment runs nested inside CTEs filtered by a **JDBC-bound** customer
+     id, and whatever it returns is inner-joined back to that customer's transactions. An id from
+     anywhere else is dropped before it can be returned or counted.
+  3. **The role.** `caa_readonly` holds `CONNECT`, `USAGE` on one schema, and `SELECT` on five
+     single-customer views. Nothing on `app_users`, nothing on any base table, no `USAGE` on
+     `public`, no `TEMPORARY`, no writes anywhere. `SELECT … FROM public.app_users` answers
+     *permission denied for schema public*.
+  4. **The transaction.** Read-only, rolled back always, scoped by a transaction-local GUC that is
+     itself a bound parameter — unset, every view returns zero rows — under `statement_timeout=5s`,
+     `work_mem=4MB` and `temp_file_limit=64MB` set on the role and again per transaction.
+
+  Verified by 173 tests in `com/sq/caa/sql`, of which 71 are an independent penetration test that
+  asserts every payload **twice** — once through the evaluator and once with the validator removed —
+  and digests `app_users` and the six activity tables before and after each attempt.
 - The development JWT secret ships in `application.yml` so the demo runs with zero configuration;
   the app logs a prominent **warning at startup** when that built-in secret is in use. Override with
   `JWT_SECRET`.
@@ -506,14 +616,25 @@ needed to record every step for the audit trail *and* to refuse termination whil
 outstanding. Owning the loop made both trivial. Spring AI still provides transport, tool schema
 generation and the vector store.
 
-**2. The agent is the scoring authority, and the cost of that is stated rather than hidden.**
-`threshold_logic` is a rule *condition* written by a compliance officer in their own words, and the
-agent reads it, gathers the evidence and judges it. There is no engine behind the agent to check the
-answer. Two consequences follow and neither is papered over: **risk scores are not reproducible
-run-to-run**, and a rule the agent misjudges is misjudged for good. What is guaranteed instead is
-that every applicable rule is *judged*, on evidence the tools verified, or the run does not complete
-at all. Each score is the agent's estimate, capped at the rule's weight, and every screen that shows
-one says so.
+**2. The agent chooses the question; PostgreSQL gives the answer. This is the central decision.**
+`threshold_logic` is a rule *condition* written by a compliance officer in their own words, and there
+is no engine behind it to defer to — but there is a database. The agent reads the condition,
+investigates with its tools, and writes **one SQL query**; that query executes in a locked-down
+sandbox and the verdict is derived mechanically from the result (rows → triggered, weight → score,
+returned ids → evidence). The model performs no count, no comparison and no scoring.
+
+The previous design had the agent state the verdict and estimate the score, and it produced a
+measured 20-point false negative on *"eight or more transactions in 24 hours"* — the model made the
+peak 8, compared it against a threshold it had misremembered as 10, and cleared the rule. That class
+of error is now impossible: the count and the `>=` are the database's.
+
+This is **semi-deterministic**, and the honest description matters. Evaluation is exact and
+reproducible. *Query authorship is not* — the query is written fresh each run, there are no stored or
+approved queries, and so the score can still move between runs. What is guaranteed is that every
+applicable rule is answered by a query that actually executed, or the run does not complete at all;
+and the query is recorded, so a reviewer can see the question that was asked, not just the answer.
+The remaining risk is that the query does not faithfully express the condition — see
+[Known limitations](#known-limitations), where it is described rather than minimised.
 
 **3. Rule coverage enforced structurally, not by prompting.**
 "Please check every rule" is not a guarantee. A gate that refuses to let the loop end — and a run
@@ -525,7 +646,16 @@ A local 120B model takes minutes per run. A synchronous endpoint would time out 
 feel broken, so `POST` returns `202` immediately and the trace streams over SSE, with polling as a
 fallback. The wait becomes legible instead of a spinner.
 
-**5. `threshold_logic` is prose, and the field catalog is reference material.**
+**5. A sandbox, not a trusted query.** Letting a language model's SQL touch a bank's customer
+database is only acceptable if the blast radius is provably nil. So the customer scope is guaranteed
+*by construction* rather than by inspection: the fragment is nested inside CTEs filtered by a
+JDBC-bound customer id and its output is inner-joined back to that customer's transactions, and it
+executes as a role whose entire privilege set is `SELECT` on five GUC-scoped views. Both of those
+hold **with the validator deleted**, which an independent penetration test proved by running every
+payload twice. The allow-list validator is the outermost ring and the one that produces a message
+the model can act on; it is deliberately not the ring the guarantee rests on.
+
+**6. `threshold_logic` is prose, and the field catalog is reference material.**
 The schema calls the column a "Rule condition" and types it `TEXT`. Read as a machine grammar it
 buys reproducibility; read as natural language it buys rules a compliance officer can actually write,
 including the judgement ("score near the full weight only when …") that no operator table can
@@ -533,16 +663,16 @@ express. The second reading is the one implemented. The column is stored verbati
 untrusted data on its way to the model, and validated only for length, uniqueness and *not* being a
 pasted JSON document. The API-served field catalog keeps the author honest about which data exists.
 
-**6. One vector table, owned by our migrations.**
+**7. One vector table, owned by our migrations.**
 Spring AI's `PgVectorStore` can create its own table, but then the schema is invisible to Flyway. We
 create `document_chunks` ourselves in a migration matching what the store expects, and disable its
 auto-initialisation, so the whole schema lives in one place and is reviewable.
 
-**7. Provider-agnostic model access through one OpenAI-compatible base URL.**
+**8. Provider-agnostic model access through one OpenAI-compatible base URL.**
 Chat and embeddings resolve through a single `base-url` and are selected by model id, so switching
 models — or pointing at OpenAI proper — is configuration, not code.
 
-**8. The backend wire shape is the contract's source of truth.**
+**9. The backend wire shape is the contract's source of truth.**
 Building both halves in parallel produced field-name drift (see below). The resolution rule adopted
 during the fix pass: the backend's shape wins on naming; the backend is extended only where the UI
 genuinely needs data that does not exist.
@@ -605,6 +735,23 @@ Verification went beyond the suites, because green tests turned out not to imply
   Reviewers drawn from the same model share the blind spots of the agents that wrote the code; a
   different one does not. It found two defects the in-family review had missed, including an agent
   tool that read the live database while its documentation claimed a frozen snapshot.
+- **A penetration test of the SQL sandbox**, written against the source rather than against the
+  author's threat model (`SqlSandboxAttackTest`, 71 attacks). It found four issues, all now closed:
+  alias laundering that made `FROM public.app_users` legal to the validator (stopped by the grants
+  alone — right outcome, wrong ring); `WITH RECURSIVE` reachable the same way, and demonstrably able
+  to allocate ~0.7 GB inside a 5-second `statement_timeout` that cannot interrupt a single
+  allocation; `current_role` usable as a one-bit oracle; and a lexer that treated U+2003 as
+  whitespace where PostgreSQL treats it as an identifier character. It also found the fidelity gap
+  that `ThresholdFidelity` now addresses — see [Known limitations](#known-limitations).
+
+> **Two notes on running the suites.** `caa_readonly` has `CONNECTION LIMIT 8`, which is a control
+> worth keeping, so the two sandbox test contexts run with `caa.sql.datasource.pool-size=1` and
+> `mvn test` passes whether or not the application is running. Separately: the tests share the `caa`
+> database with the running application, and booting an application context runs the start-up
+> reconciler that marks analyses left `RUNNING` by a previous process as `FAILED`. That is right on a
+> real restart and a nuisance in development — **do not run `mvn test` while an analysis is in
+> flight**, or it will be failed out from under you with
+> *"The application restarted while this analysis was running."*
 
 ---
 
@@ -614,15 +761,64 @@ Verification went beyond the suites, because green tests turned out not to imply
   bottleneck — roughly 20-30 generated tokens a second, and the agent reasons before every turn. A
   complete twelve-rule analysis runs seven to fifteen minutes; one "Test rule" judgement is about a
   minute. A hosted frontier model would cut this to seconds; the code is provider-agnostic.
-- **Risk scores are not reproducible.** The agent judges each rule, so the same customer analysed
-  twice can score differently. That is the accepted cost of reading `threshold_logic` as natural
-  language, and it is stated on the analysis screen rather than hidden. What *is* guaranteed is
-  coverage: every applicable rule is judged, or the run is `FAILED`.
-- **Judgement quality varies with the rule.** In verification the agent read one seeded condition
-  ("eight or more transactions … above 40,000") as requiring ten, and cleared a customer whose
-  activity did meet it. A deterministic engine would not have made that mistake. Conditions should
-  therefore state one threshold per sentence, and a rule that matters should be spot-checked with
-  **Test rule** after it is written.
+- **Risk scores are not reproducible, and the reason moved.** The comparison is now exact — the
+  count, the sum and the `>=` are PostgreSQL's — but the *query* is written fresh by the model for
+  every rule on every run, and there are no stored or approved queries. So the same customer
+  analysed twice can still score differently, not because a number was computed differently but
+  because a different question was asked. Measured on Marcus Holloway — six consecutive runs that
+  reached a full set of twelve verdicts:
+
+  | run | total | score band | band recorded | rules fired | evidence cited |
+  |---|---|---|---|---|---|
+  | 1 | 50.00 | HIGH | CRITICAL *(escalated)* | 2 | 2 + 1 |
+  | 2 | 50.00 | HIGH | CRITICAL *(escalated)* | 2 | 8 + 1 |
+  | 3 | 50.00 | HIGH | HIGH | 2 | 8 + 1 |
+  | 4 | 50.00 | HIGH | HIGH | 2 | 8 + 1 |
+  | 5 | 50.00 | HIGH | HIGH | 2 | 8 + 1 |
+  | 6 | 50.00 | HIGH | CRITICAL *(escalated)* | 2 | 8 + 1 |
+
+  **The total score did not move at all across six runs**, all twelve verdicts agreed every time,
+  and the ten rules that do not fire returned zero rows in every one — where the design this replaced
+  had scored the same customer 30.00 by clearing a rule the data breached. Two things still move:
+
+  - **the evidence**, on one rule and only in the earliest runs — a query that used a narrower band
+    than its condition states cited 2 of the 8 payments that qualify. The verdict was right either
+    way, but a short evidence list is a real defect in an audit record, and it is the visible symptom
+    of the fidelity gap below;
+  - **the recorded band**, because escalation is the agent's judgement and nothing else: three runs
+    raised HIGH to CRITICAL with a written justification and three did not. That is variance in an
+    explicitly human-style override, recorded with both bands and the reason, not variance in a
+    measurement.
+
+  Run-to-run drift now lives in the recorded SQL, where it can be read, rather than in a rationale
+  nobody can check. What is *guaranteed* is coverage: every applicable rule is judged, or the run is
+  `FAILED`.
+- **The remaining failure mode is fidelity, not arithmetic — and it is real.** Nothing can prove
+  that the SQL the model wrote *is* the condition. The first live run after the SQL change missed
+  the same velocity rule again, this time by writing `count(*) >= 5 AND sum(amount) >= 100000` for a
+  condition reading *"eight or more … above 40,000"*: perfect arithmetic, wrong question, same
+  20-point false negative. `ThresholdFidelity` was added for exactly this — it refuses a query that
+  uses none of a number the condition states, before the query runs — and after it the rule fires
+  correctly on every run. But it is a numeric-overlap check, not a proof of meaning:
+  - it cannot see an operator (`>= 8` and `> 8` look identical to it), a window that names the right
+    number in the wrong place, or a missing join;
+  - it is deliberately **advisory** — a rule is asked at most twice, may then resend the same query
+    unchanged, and the prompts spend none of the query-retry budget, so it can cost model turns and
+    can never leave a rule unjudged. That last property had to be *fixed*, not just designed: the
+    first version shared the retry budget, and a live run spent two of a rule's three attempts being
+    asked about thresholds, wrote an invalid query with what was left, and failed the whole analysis
+    on an unjudged rule. The check had refused no verdict — it had eaten the budget meant to repair
+    one;
+  - it produces false positives by design (a condition writing `00:00 to 05:59` answered by
+    `extract(hour …) < 6`), which cost one extra model turn each.
+
+  A rule that matters should still be spot-checked against the database after it is written.
+- **A rule's own prose can mislead the query.** The seeded structuring rule explains itself with the
+  sentence *"nine payments of 9,500 …"*, and in two runs the model used **9,500** as the band's
+  lower bound instead of the **8,000** the condition states. The verdict was right (the rule fires
+  either way) but the evidence list was short — 2 transactions cited of the 8 that qualify.
+  Illustrative numbers in a condition are read as thresholds. Keep the condition and the rationale
+  in separate sentences, and keep example figures out of the condition entirely.
 - **Vector search is an exact scan.** pgvector refuses an HNSW index above 2000 dimensions, and the
   embedding model produces 2560. At a few dozen policy chunks this is irrelevant; at scale it needs
   either a smaller embedding model or dimensionality reduction. The trade-off is documented in the
@@ -643,13 +839,17 @@ Verification went beyond the suites, because green tests turned out not to imply
 .
 ├── backend/                     Spring Boot 4.1.1 · Java 21 · Maven
 │   └── src/main/java/com/sq/caa/
-│       ├── agent/               ReAct loop, tools, coverage gate, trace, compaction
+│       ├── agent/               ReAct loop, tools, coverage gate, trace, compaction,
+│       │                         threshold fidelity, escalation
+│       ├── sql/                  the rule-SQL sandbox: validator, wrapper, read-only pool,
+│       │                         evaluator — the ring the model's SQL runs inside
 │       ├── rules/               validation, aggregates, field catalog, rule judge
 │       ├── rag/                 DOCX/PDF extraction, section chunking, vector store
 │       ├── domain/ repository/  JPA entities and Spring Data repositories
 │       ├── service/ web/        business services, controllers, DTO records
 │       ├── security/ config/    JWT, roles, CORS, error handling
-│       └── resources/db/migration/   V1 schema · V2 app tables · V3 seed · V4 fixes
+│       └── resources/db/migration/   V1 schema · V2 app tables · V3 seed · V4 fixes ·
+│                                     V5 read-only role + customer-scoped views
 ├── frontend/                    React 19 · TypeScript · Vite · Tailwind 4
 │   └── src/{api,auth,components,lib,pages}/
 ├── docs/

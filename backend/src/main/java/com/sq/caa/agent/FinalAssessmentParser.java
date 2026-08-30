@@ -25,7 +25,10 @@ import tools.jackson.databind.json.JsonMapper;
  * assessment and the loop re-prompts exactly as before.
  *
  * <p>It is <b>never</b> a way around the coverage gate: {@link RiskAgentLoop} only consults it once
- * every rule of the coverage set already has a verdict.
+ * every rule of the coverage set already has a verdict. It is not a way around the banding either:
+ * a band written in prose is subject to the same rule as one submitted through the tool - it may
+ * only raise the mechanical band, and only when the message also carries a justification, which is
+ * why {@code escalation_justification} is one of the keys read here.
  */
 public final class FinalAssessmentParser {
 
@@ -40,6 +43,8 @@ public final class FinalAssessmentParser {
     private static final List<String> SUMMARY_KEYS = List.of("summary", "assessment_summary");
     private static final List<String> RECOMMENDATION_KEYS =
             List.of("recommendations", "recommendation", "recommended_actions", "next_steps");
+    private static final List<String> ESCALATION_KEYS = List.of("escalation_justification",
+            "escalation_reason", "escalation", "justification");
 
     private FinalAssessmentParser() {
     }
@@ -101,7 +106,8 @@ public final class FinalAssessmentParser {
         if (summary == null) {
             return null;
         }
-        return new FinalAssessment(level, summary, flatten(find(node, RECOMMENDATION_KEYS)));
+        return new FinalAssessment(level, flatten(find(node, ESCALATION_KEYS)), summary,
+                flatten(find(node, RECOMMENDATION_KEYS)));
     }
 
     /** Case- and separator-insensitive field lookup: {@code riskLevel} and {@code risk_level} agree. */

@@ -117,6 +117,11 @@ public final class AnalysisTrace {
      * steps whose tool name is the same, so the rule being judged - or the transaction opened, or
      * the query searched - is recorded on the step itself rather than being left inside the
      * arguments. It may be null for a tool whose call is not scoped to anything nameable.
+     *
+     * <p>When the note carries SQL it is written into {@code detail.sql}. That is the whole audit
+     * trail of a verdict: the rule's condition was answered by a query, so a reviewer has to be able
+     * to read the query - on the attempt that was accepted and on every attempt that was rejected
+     * along the way.
      */
     public TraceStep toolCall(String tool, JsonNode args, String resultPreview, long ms,
             TraceStep.Note note) {
@@ -125,6 +130,8 @@ public final class AnalysisTrace {
                 .args(args)
                 .resultPreview(TraceStep.truncate(resultPreview, TraceStep.PREVIEW_LIMIT))
                 .ms(ms)
+                .detail(note == null || note.sql() == null ? null : nodes.objectNode()
+                        .put("sql", note.sql()))
                 .note(note));
     }
 
@@ -189,16 +196,36 @@ public final class AnalysisTrace {
                         + TraceStep.truncate(summary, TraceStep.TEXT_LIMIT / 4)));
     }
 
-    public TraceStep finalStep(String riskLevel, String summary, BigDecimal totalScore,
-            int rulesTotal, boolean coverageComplete) {
+    /**
+     * Terminal step: the recorded band, the band the rule scores band to, and the total.
+     *
+     * <p>Both bands are on the step because they can legitimately differ. The mechanical band is
+     * arithmetic over SQL-derived scores; the recorded band is that one unless the agent escalated
+     * above it, which it may only do with a justification, which is written here beside it.
+     */
+    public TraceStep finalStep(String riskLevel, String mechanicalRiskLevel,
+            String escalationJustification, String summary, BigDecimal totalScore, int rulesTotal,
+            boolean coverageComplete) {
         ObjectNode detail = nodes.objectNode();
         detail.put("total_score", totalScore == null ? null : totalScore.toPlainString());
         detail.put("rules_total", rulesTotal);
         detail.put("coverage_complete", coverageComplete);
+        detail.put("mechanical_risk_level", mechanicalRiskLevel);
+        detail.put("escalated", escalationJustification != null);
+        if (escalationJustification != null) {
+            detail.put("escalation_justification", escalationJustification);
+        }
+        String narrative = TraceStep.truncate(summary, TraceStep.TEXT_LIMIT);
+        String escalation = escalationJustification == null ? "" : "Escalated from "
+                + mechanicalRiskLevel + " to " + riskLevel + ": " + escalationJustification;
         return add(builder(TraceStep.Type.FINAL)
                 .riskLevel(riskLevel)
                 .detail(detail)
-                .text(TraceStep.truncate(summary, TraceStep.TEXT_LIMIT)));
+                .outcome(escalationJustification == null
+                        ? riskLevel + " (" + mechanicalRiskLevel + " from the rule scores)"
+                        : "escalated " + mechanicalRiskLevel + " to " + riskLevel)
+                .text(narrative == null ? escalation
+                        : escalation.isEmpty() ? narrative : narrative + " " + escalation));
     }
 
     public TraceStep error(String message) {

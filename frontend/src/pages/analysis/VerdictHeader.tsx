@@ -5,8 +5,14 @@
  * RiskBadge, the total score in large tabular figures on the banded 0–100
  * scale, and then a quiet hairline strip of audit facts (model, steps,
  * duration, coverage, requester, timestamp).
+ *
+ * When the agent raised the band above the one the totals produce, that override
+ * is the first thing on the card. The score is arithmetic — the weights of the
+ * rules whose query returned rows — so a band above it is a judgement laid on
+ * top of a number, and a reviewer has to meet both bands and the reason for the
+ * gap before anything else on the page.
  */
-import { Clock, Cpu, Layers, ShieldCheck, UserRound } from 'lucide-react'
+import { ArrowUpRight, Clock, Cpu, Layers, ShieldCheck, UserRound } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { RISK_LEVELS, type AnalysisResult, type AnalysisStatus } from '../../api/types'
 import { Badge } from '../../components/ui/Badge'
@@ -17,6 +23,7 @@ import { cn } from '../../lib/cn'
 import { EM_DASH, formatDateTime, formatDuration, formatNumber } from '../../lib/format'
 import { RISK_BAND_BOUNDS, RISK_LEVEL_STYLES, riskLevelFromScore } from '../../lib/risk'
 import { coverageCountLabel, type CoverageStats } from './coverage'
+import { escalationExtentLabel, escalationOf, type Escalation } from './escalation'
 
 const STATUS_LABEL: Record<AnalysisStatus, string> = {
   RUNNING: 'Running',
@@ -89,6 +96,56 @@ function ScoreScale({ score }: { score: number | null }) {
   )
 }
 
+/**
+ * The agent raised the band above the arithmetic — shown before the verdict.
+ *
+ * Both bands render as the canonical filled `RiskBadge`, because both of them
+ * really are risk levels; the strip around them stays on the warning tokens, so
+ * the risk ramp keeps meaning exactly one thing. A missing justification is
+ * stated rather than glossed: an unexplained override is worse than an explained
+ * one, and the reviewer is the person who has to notice.
+ */
+function EscalationBanner({ escalation }: { escalation: Escalation }) {
+  return (
+    <div className="border-b border-warning/40 bg-warning-soft/60 px-4 py-3 sm:px-5">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <span
+          aria-hidden="true"
+          className="flex size-7 shrink-0 items-center justify-center rounded-full border border-warning/45 bg-warning-soft text-warning-fg"
+        >
+          <ArrowUpRight className="size-4" />
+        </span>
+        <p className={cn(CAPTION, 'text-warning-fg')}>
+          Escalated by the agent — {escalationExtentLabel(escalation)}
+        </p>
+        <span className="flex flex-wrap items-center gap-2">
+          <span className="text-xs text-muted">Score band</span>
+          <RiskBadge level={escalation.mechanical} size="sm" />
+          <span aria-hidden="true" className="text-subtle">
+            &rarr;
+          </span>
+          <span className="text-xs text-muted">Recorded verdict</span>
+          <RiskBadge level={escalation.final} size="sm" />
+        </span>
+      </div>
+      <p className="mt-2 text-xs leading-relaxed text-fg">
+        <span className="font-medium">Why:</span>{' '}
+        {escalation.justification ?? (
+          <span className="text-warning-fg">
+            No justification was recorded for this escalation. The band on this run is therefore
+            higher than the rule scores support, with nothing on file explaining it.
+          </span>
+        )}
+      </p>
+      <p className="mt-1.5 text-2xs leading-relaxed text-muted">
+        The band the score alone produces is {escalation.mechanical}. The agent may raise the overall
+        band when the context warrants it, never lower it, and it can never clear a rule whose query
+        fired.
+      </p>
+    </div>
+  )
+}
+
 function Fact({
   label,
   value,
@@ -125,7 +182,12 @@ export function VerdictHeader({ analysis, stats, elapsedMs, className }: Verdict
   const score =
     analysis.totalScore === null || analysis.totalScore === undefined ? null : analysis.totalScore
   const level = analysis.riskLevel ?? null
-  const band = level ? RISK_BAND_BOUNDS[level] : null
+  const escalation = escalationOf(analysis)
+  /* The bounds sit beside the score, so they must be the band the score itself
+     falls in. On an escalated run that is not the recorded level, and printing
+     the recorded level's bounds next to a score outside them would be a lie. */
+  const scoreBandLevel = escalation?.mechanical ?? level
+  const band = scoreBandLevel ? RISK_BAND_BOUNDS[scoreBandLevel] : null
 
   return (
     <Card
@@ -137,19 +199,33 @@ export function VerdictHeader({ analysis, stats, elapsedMs, className }: Verdict
         className,
       )}
     >
+      {escalation ? <EscalationBanner escalation={escalation} /> : null}
+
       <div className="grid gap-5 p-4 sm:p-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,22rem)] lg:gap-8">
         <div className="min-w-0">
           <p className={CAPTION}>Risk determination</p>
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <RiskBadge level={analysis.riskLevel} size="lg" />
             <StatusChip status={analysis.status} />
+            {escalation ? (
+              <Badge
+                tone="warning"
+                size="md"
+                icon={<ArrowUpRight aria-hidden="true" className="size-3" />}
+                title={`The score alone bands as ${escalation.mechanical}; the agent recorded ${escalation.final}.`}
+              >
+                Escalated from {escalation.mechanical}
+              </Badge>
+            ) : null}
           </div>
           <p className="mt-2 max-w-md text-xs leading-relaxed text-muted">
             {running
               ? 'The agent is still working through the coverage set — the level is only final once every rule has a verdict.'
-              : level
-                ? `Determined from ${coverageCountLabel(stats)} and the weighted score below.`
-                : 'This run never reached a determination.'}
+              : escalation
+                ? `The ${coverageCountLabel(stats)} and the score below band as ${escalation.mechanical}. The agent raised the determination to ${escalation.final}; its reason is at the top of this card.`
+                : level
+                  ? `Determined from ${coverageCountLabel(stats)} and the weighted score below.`
+                  : 'This run never reached a determination.'}
           </p>
         </div>
 

@@ -15,6 +15,12 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  *                             unjudged at that point the run is recorded as FAILED rather than
  *                             completed, so this bounds how long a stubborn model may argue, never
  *                             what may be reported as a finished analysis.
+ * @param maxRuleSqlAttempts   how many times one rule's condition may be re-expressed as SQL after
+ *                             a rejection or a database error. A rejected query records nothing, so
+ *                             the model must be able to fix it; past this cap the rule is left
+ *                             UNJUDGED, which by the coverage policy fails the run. Deliberately
+ *                             small: a model that cannot express a condition in three attempts is
+ *                             not going to express it in ten, and a failed run says so honestly.
  * @param maxTokens            completion budget per turn. The chat model emits reasoning content,
  *                             so anything below ~2048 comes back with an empty message.
  * @param temperature          sampling temperature; low, because this is an audit task.
@@ -46,6 +52,7 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 public record AgentProperties(
         @DefaultValue("40") int maxSteps,
         @DefaultValue("3") int maxCoverageReprompts,
+        @DefaultValue("3") int maxRuleSqlAttempts,
         @DefaultValue("4096") int maxTokens,
         @DefaultValue("0.1") double temperature,
         @DefaultValue("32768") int contextTokens,
@@ -61,6 +68,7 @@ public record AgentProperties(
     public AgentProperties {
         maxSteps = clamp(maxSteps, 1, 400);
         maxCoverageReprompts = clamp(maxCoverageReprompts, 0, 50);
+        maxRuleSqlAttempts = clamp(maxRuleSqlAttempts, 1, 20);
         maxTokens = clamp(maxTokens, 512, 131072);
         temperature = temperature < 0 ? 0 : Math.min(temperature, 2);
         contextTokens = clamp(contextTokens, 4096, 1_000_000);

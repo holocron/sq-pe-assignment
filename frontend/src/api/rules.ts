@@ -1,9 +1,10 @@
 /**
  * Risk-rule administration API.
  *
- * `threshold_logic` is natural language: the agent reads the condition, pulls
- * the customer's data with its tools and judges the verdict itself. Nothing in
- * this module parses the condition — it only ever moves text.
+ * `threshold_logic` is natural language: the agent reads the condition and
+ * translates it into a SQL query, Postgres runs the query, and the rule fires
+ * when rows come back. Nothing in this module parses the condition — it only
+ * ever moves text.
  */
 import {
   useMutation,

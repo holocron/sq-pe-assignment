@@ -209,11 +209,11 @@ export function ActivitySummaryCards({
           <CardHeader>
             <CardTitle>Velocity and exposure</CardTitle>
             <p className="mt-0.5 text-xs text-muted">
-              The same aggregates the agent reads when it judges a rule, exposed as{' '}
-              <code className="font-mono">agg.*</code> fields. Each figure is the highest the
-              rolling window ever reached across this customer's history — the value a rule
-              condition naming a threshold is judged against — not a reading for the last 24 hours
-              or 30 days.
+              The same aggregates the agent reads while working out what a rule condition is
+              asking, exposed as <code className="font-mono">agg.*</code> fields. Each figure is
+              the highest the rolling window ever reached across this customer's history, not a
+              reading for the last 24 hours or 30 days. They inform the query the agent writes;
+              the verdict itself comes from running that query.
             </p>
           </CardHeader>
           <CardContent>

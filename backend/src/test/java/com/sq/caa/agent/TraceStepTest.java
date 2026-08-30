@@ -31,14 +31,15 @@ import tools.jackson.databind.node.ObjectNode;
  * <p>This is a regression test for a defect a reviewer hit on a real run: with twelve rules the
  * transcript rendered two dozen consecutive steps whose visible label was identical - "Submit rule
  * verdict", over and over - because the rule's identity existed only inside the collapsed arguments.
- * It matters more than a cosmetic complaint now that a rule condition is prose: the agent's
- * judgement <em>is</em> the verdict, with no deterministic engine behind it to check the result, so
- * the transcript is the only evidence of how each rule was decided.
+ * It matters more than a cosmetic complaint now that a rule condition is prose answered by a query:
+ * the transcript is where a reviewer sees which rule a step decided, how it came out, and - since
+ * the verdict is a row count - <em>what was actually run</em> to decide it.
  *
- * <p>The old tests passed on a trace where every row was the same, which is exactly why this
- * shipped. These assert on the two fields a reader actually reads - {@code subject} and
- * {@code outcome} - and on the property the defect violated: no two verdict steps of one run may
- * look alike.
+ * <p>So three things are asserted here. The two fields a reader reads while the step is collapsed,
+ * {@code subject} and {@code outcome}; the property the original defect violated, that no two
+ * verdict steps of one run may look alike; and the SQL on the expanded step, for the attempt that
+ * produced the verdict <b>and</b> for the attempts that were refused on the way - a retry loop that
+ * left no trace would hide exactly the behaviour this design exists to make visible.
  */
 class TraceStepTest {
 
@@ -69,16 +70,16 @@ class TraceStepTest {
 
         ScriptedChatModel model = new ScriptedChatModel(List.of(
                 calls(RiskAgentTools.LIST_RISK_RULES, "{}"),
-                // Two verdicts in one turn: the labels must follow their own calls, not the turn.
+                // Two rules in one turn: the labels must follow their own calls, not the turn.
                 callsAll(
-                        call(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                                sanctioned, true, 30, "A 25,000 wire to a bank in RU.")),
-                        call(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                                structuring, true, 20, "Three payments just under 10,000 in a day."))),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context, crypto,
-                        true, 15, "A 4,000 XMR transfer with no exchange attribution.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context, declines,
-                        false, 0, "No declined authorisations at all.")),
+                        call(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(sanctioned,
+                                "Payments over 10,000 to a sanctioned jurisdiction.")),
+                        call(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(structuring,
+                                "Three payments of 9,000-9,999 inside a rolling day."))),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(crypto,
+                        "Crypto over 1,000 with no exchange attribution.")),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(declines,
+                        "Five declined authorisations inside a rolling day.")),
                 calls(RiskAgentTools.SUBMIT_FINAL_ASSESSMENT, """
                         {"risk_level":"HIGH","summary":"Sanctioned wire and structuring.",\
                         "recommendations":"File a report."}""")));
@@ -86,7 +87,7 @@ class TraceStepTest {
         AgentRunResult result = run(model);
         assertTrue(result.coverageComplete());
 
-        List<TraceStep> verdicts = toolSteps(RiskAgentTools.SUBMIT_RULE_EVALUATION);
+        List<TraceStep> verdicts = toolSteps(RiskAgentTools.EVALUATE_RULE);
         assertEquals(4, verdicts.size());
 
         // The subject is the rule, in the words the compliance officer sees everywhere else.
@@ -111,16 +112,61 @@ class TraceStepTest {
         assertNull(checklist.subject(), "the checklist is not scoped to one rule");
         assertEquals("4 rules in scope", checklist.outcome());
 
+        // The query is on the step too, so the verdict can be checked rather than believed - and
+        // it is the statement that ran, not the fragment the model typed.
+        assertEquals(4, verdicts.stream().filter(step -> step.detail() != null).count());
+        String executed = verdicts.getFirst().detail().get("sql").stringValue();
+        assertTrue(executed.startsWith(StubRuleSqlEvaluator.WRAPPER_PREFIX),
+                "the trace must keep the statement that was executed: " + executed);
+        assertTrue(executed.contains("receiver_bank_country"),
+                "and the agent's own condition inside it: " + executed);
+
         // And all of it survives into analysis_runs.trace, not just into the live objects.
-        JsonNode persisted = firstPersistedStep(RiskAgentTools.SUBMIT_RULE_EVALUATION);
+        JsonNode persisted = firstPersistedStep(RiskAgentTools.EVALUATE_RULE);
         assertEquals(SANCTIONED_WIRE, persisted.get("subject").stringValue());
         assertEquals("triggered +30.00 (rule 1 of 4)", persisted.get("outcome").stringValue());
+        assertTrue(persisted.get("detail").get("sql").stringValue().contains("receiver_bank_country"));
+    }
+
+    @Test
+    @DisplayName("a refused query and the retry that fixed it are both on the transcript, each with "
+            + "the query it ran and why it was refused")
+    void arefusedAttemptAndItsRetryAreBothVisible() {
+        RiskRule crypto = AgentTestFixtures.ruleNamed(rules, UNATTRIBUTED_CRYPTO);
+        AgentRunContext oneRule = AgentTestFixtures.context(UUID.randomUUID(), trace, List.of(crypto));
+        StubRuleSqlEvaluator sql = new StubRuleSqlEvaluator()
+                .rejecting("DROP", "the query must be a single SELECT; DROP is not allowed")
+                .matching("exchange_name IS NULL", AgentTestFixtures.cryptoEvidence(oneRule));
+
+        ScriptedChatModel model = new ScriptedChatModel(List.of(
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(crypto,
+                        "SELECT t.transaction_id FROM tx t WHERE t.amount > 1000; "
+                                + "DROP TABLE transactions",
+                        "Crypto transfers with no exchange attribution.")),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(crypto,
+                        "Crypto over 1,000 with no exchange attribution."))));
+
+        run(model, sql, oneRule);
+
+        List<TraceStep> steps = toolSteps(RiskAgentTools.EVALUATE_RULE);
+        assertEquals(2, steps.size(), "the refused attempt must not vanish from the transcript");
+
+        TraceStep refused = steps.getFirst();
+        assertEquals(UNATTRIBUTED_CRYPTO, refused.subject());
+        assertTrue(refused.outcome().startsWith("query rejected (attempt 1)"), refused.outcome());
+        assertTrue(refused.detail().get("sql").stringValue().contains("DROP"),
+                "the query that was refused is kept, or the retry loop is unreviewable");
+
+        TraceStep accepted = steps.getLast();
+        assertEquals(UNATTRIBUTED_CRYPTO, accepted.subject());
+        assertEquals("triggered +15.00 (rule 1 of 1)", accepted.outcome());
+        assertTrue(accepted.detail().get("sql").stringValue().contains("exchange_name IS NULL"));
     }
 
     @Test
     @DisplayName("an evidence step names what it opened: the transaction, or the policy query")
     void evidenceStepsNameWhatTheyOpened() {
-        RiskAgentTools tools = new RiskAgentTools(context, null, null, jsonMapper, 25);
+        RiskAgentTools tools = tools();
         RiskRule sanctioned = AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE);
         UUID paymentId = context.inScopeTransactionIds(sanctioned.getRuleId()).getFirst();
 
@@ -148,36 +194,36 @@ class TraceStepTest {
     @Test
     @DisplayName("a label is dropped rather than attached to the wrong call")
     void aNoteIsNeverAttachedToTheWrongCall() {
-        RiskAgentTools tools = new RiskAgentTools(context, null, null, jsonMapper, 25);
+        RiskAgentTools tools = tools();
         RiskRule sanctioned = AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE);
-        List<UUID> evidence = context.inScopeTransactionIds(sanctioned.getRuleId());
 
         tools.listRiskRules();
-        tools.submitRuleEvaluation(sanctioned.getRuleId().toString(), true, 30.0,
-                List.of(evidence.getFirst().toString()), "A 25,000 wire to a bank in RU.");
+        tools.evaluateRule(sanctioned.getRuleId().toString(), AgentTestFixtures.sqlFor(sanctioned),
+                "Payments over 10,000 to a sanctioned jurisdiction.");
 
         // Asked for the wrong tool's label first: the queue resynchronises and this call goes
         // unlabelled. A verdict row that named someone else's rule would be worse than a bare one.
-        assertNull(tools.takeNote(RiskAgentTools.SUBMIT_RULE_EVALUATION));
-        assertEquals(SANCTIONED_WIRE, tools.takeNote(RiskAgentTools.SUBMIT_RULE_EVALUATION).subject());
-        assertNull(tools.takeNote(RiskAgentTools.SUBMIT_RULE_EVALUATION), "the queue is empty now");
+        assertNull(tools.takeNote(RiskAgentTools.EVALUATE_RULE));
+        assertEquals(SANCTIONED_WIRE, tools.takeNote(RiskAgentTools.EVALUATE_RULE).subject());
+        assertNull(tools.takeNote(RiskAgentTools.EVALUATE_RULE), "the queue is empty now");
     }
 
     @Test
-    @DisplayName("a refused call says so on its own row")
+    @DisplayName("a call refused before any query ran says so on its own row")
     void aRefusedCallIsLabelledAsRefused() {
-        RiskAgentTools tools = new RiskAgentTools(context, null, null, jsonMapper, 25);
+        RiskAgentTools tools = tools();
         RiskRule sanctioned = AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE);
 
-        // Triggered with no evidence: the tool refuses it and the verdict is NOT recorded, which the
-        // trace must show instead of a row that looks like a submitted verdict.
-        tools.submitRuleEvaluation(sanctioned.getRuleId().toString(), true, 30.0, List.of(),
-                "Trust me.");
+        // No explanation: the call is refused before the query is even run, nothing is recorded, and
+        // the trace must show that instead of a row that looks like a verdict.
+        tools.evaluateRule(sanctioned.getRuleId().toString(), AgentTestFixtures.sqlFor(sanctioned),
+                "   ");
 
-        TraceStep.Note note = tools.takeNote(RiskAgentTools.SUBMIT_RULE_EVALUATION);
+        TraceStep.Note note = tools.takeNote(RiskAgentTools.EVALUATE_RULE);
         assertNotNull(note);
         assertNull(note.subject());
         assertEquals("call rejected", note.outcome());
+        assertNull(note.sql(), "no query ran, so there is no query to show");
     }
 
     @Test
@@ -222,13 +268,24 @@ class TraceStepTest {
 
     // ------------------------------------------------------------------
 
+    private RiskAgentTools tools() {
+        return new RiskAgentTools(context, null, null, AgentTestFixtures.evaluator(context),
+                jsonMapper, 25, 3);
+    }
+
     private AgentRunResult run(ScriptedChatModel model) {
-        AgentProperties properties = new AgentProperties(40, 3, 4096, 0.1, 32768, 1536, 10,
+        return run(model, AgentTestFixtures.evaluator(context), context);
+    }
+
+    /** A run over a caller-built context, so a one-rule transcript can be read on its own. */
+    private AgentRunResult run(ScriptedChatModel model, StubRuleSqlEvaluator sql,
+            AgentRunContext runContext) {
+        AgentProperties properties = new AgentProperties(40, 3, 3, 4096, 0.1, 32768, 1536, 10,
                 "test-model", 2, 16, Duration.ofMinutes(5), Duration.ofMinutes(10), 25);
-        RiskAgentTools tools = new RiskAgentTools(context, null, null, jsonMapper, 25);
+        RiskAgentTools tools = new RiskAgentTools(runContext, null, null, sql, jsonMapper, 25, 3);
         RiskAgentLoop loop = new RiskAgentLoop(model, ToolCallingManager.builder().build(), jsonMapper,
                 properties);
-        return loop.execute(context, tools);
+        return loop.execute(runContext, tools);
     }
 
     private List<TraceStep> toolSteps(String tool) {

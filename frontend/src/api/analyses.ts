@@ -29,6 +29,8 @@ import {
   type RiskLevel,
   type RuleEvaluation,
   type RuleEvaluationWire,
+  type SqlEvaluation,
+  type ToolCallTraceStep,
   type TraceStep,
   type UUID,
 } from './types'
@@ -61,6 +63,77 @@ function asRiskLevel(value: JsonValue | undefined): RiskLevel | null {
     : null
 }
 
+function bool(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null
+}
+
+/**
+ * A string with something in it. Returned verbatim, never trimmed: this reads
+ * SQL, and an audit trail shows the statement exactly as it was recorded.
+ */
+function text(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value : null
+}
+
+function count(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+/** First non-null reading of `read` across `blocks`, in the order given. */
+function pick<T>(blocks: readonly JsonObject[], read: (block: JsonObject) => T | null): T | null {
+  for (const block of blocks) {
+    const value = read(block)
+    if (value !== null) return value
+  }
+  return null
+}
+
+/**
+ * Collapses `SqlRuleResult` into {@link SqlEvaluation}.
+ *
+ * The pieces of one query are spread over more than one place — the statement
+ * the agent wrote is a tool *argument*, while whether Postgres accepted it comes
+ * back in the *result* — so this reads an ordered list of candidate blocks and
+ * takes the first that defines each field. The trace JSONB uses snake_case where
+ * the REST DTOs use camelCase; both are accepted here rather than at every call
+ * site.
+ *
+ * Returns null when no block carries a statement at all, which is how a record
+ * stored before the change, or a step that ran no query, keeps exactly the shape
+ * it always had.
+ *
+ * `ok` is only inferred when nothing reported it: a block naming a rejection or
+ * an error is never read as an answered query.
+ */
+export function normalizeSqlEvaluation(...sources: unknown[]): SqlEvaluation | null {
+  const blocks = sources
+    .map(asObject)
+    .filter((block): block is JsonObject => block !== null)
+  if (blocks.length === 0) return null
+
+  const sql = pick(blocks, (block) => text(block.sql) ?? text(block.agent_sql))
+  const effectiveSql = pick(blocks, (block) => text(block.effectiveSql) ?? text(block.effective_sql))
+  if (sql === null && effectiveSql === null) return null
+
+  const rejectionReason = pick(
+    blocks,
+    (block) => text(block.rejectionReason) ?? text(block.rejection_reason),
+  )
+  const errorMessage = pick(blocks, (block) => text(block.errorMessage) ?? text(block.error_message))
+  const reportedOk = pick(blocks, (block) => bool(block.ok) ?? bool(block.sqlOk) ?? bool(block.sql_ok))
+
+  return {
+    sql,
+    effectiveSql,
+    ok: reportedOk ?? (rejectionReason === null && errorMessage === null),
+    matchedCount: pick(blocks, (block) => count(block.matchedCount) ?? count(block.matched_count)),
+    capped: pick(blocks, (block) => bool(block.capped) ?? bool(block.sql_capped)) ?? false,
+    rejectionReason,
+    errorMessage,
+    ms: pick(blocks, (block) => count(block.sqlMs) ?? count(block.sql_ms) ?? count(block.ms)),
+  }
+}
+
 /**
  * The trace JSONB (BUILD_SPEC section 4) uses snake_case keys inside the step
  * objects; the rest of the API is camelCase. Accept both and emit the
@@ -76,8 +149,8 @@ export function normalizeTraceStep(raw: unknown, fallbackIndex = 0): TraceStep {
   const ms = num(step.ms)
   const type = str(step.type) ?? 'unknown'
   switch (type) {
-    case 'tool_call':
-      return {
+    case 'tool_call': {
+      const toolCall: ToolCallTraceStep = {
         type: 'tool_call',
         n,
         ms,
@@ -90,6 +163,12 @@ export function normalizeTraceStep(raw: unknown, fallbackIndex = 0): TraceStep {
         subject: str(step.subject),
         outcome: str(step.outcome),
       }
+      /* Set only when the step actually ran a query, so a trace stored before
+         rules were answered in SQL normalises to the shape it always had. */
+      const sql = normalizeSqlEvaluation(step.sql, step.detail, step.args)
+      if (sql) toolCall.sql = sql
+      return toolCall
+    }
     case 'assistant':
       return { type: 'assistant', n, ms, text: str(step.text) ?? '' }
     case 'coverage_reprompt': {
@@ -150,10 +229,14 @@ function normalizeTrace(trace: AnalysisResultWire['trace']): TraceStep[] {
 }
 
 /**
- * A rule verdict always carries the transactions the agent cited, but a run
+ * A rule verdict always carries the transactions its query returned, but a run
  * rebuilt from `risk_assessments` alone has no evidence ids to give. The
  * coverage table expands into that array, so it is defaulted here rather than
  * guarded at every call site.
+ *
+ * The query itself is folded into one `sql` object whether it arrived nested or
+ * flattened, and is left null for a run judged before rules were answered in
+ * SQL — the coverage table renders those honestly as agent judgements.
  */
 export function normalizeRuleEvaluation(wire: RuleEvaluationWire): RuleEvaluation {
   return {
@@ -162,14 +245,23 @@ export function normalizeRuleEvaluation(wire: RuleEvaluationWire): RuleEvaluatio
     matchedTransactionIds: Array.isArray(wire.matchedTransactionIds)
       ? wire.matchedTransactionIds
       : [],
+    sql: normalizeSqlEvaluation(wire.sql, wire),
   }
 }
 
 export function normalizeAnalysisResult(wire: AnalysisResultWire): AnalysisResult {
+  /* The escalation pair decides whether the header shows an override, so both
+     spellings are accepted rather than silently rendering a raised band as if
+     the totals had produced it. */
+  const raw = asObject(wire) ?? {}
   return {
     ...wire,
     summary: wire.summary ?? null,
     recommendations: wire.recommendations ?? null,
+    mechanicalRiskLevel:
+      asRiskLevel(raw.mechanicalRiskLevel) ?? asRiskLevel(raw.mechanical_risk_level),
+    escalationJustification:
+      str(raw.escalationJustification) ?? str(raw.escalation_justification),
     ruleEvaluations: (wire.ruleEvaluations ?? []).map(normalizeRuleEvaluation),
     trace: normalizeTrace(wire.trace),
   }

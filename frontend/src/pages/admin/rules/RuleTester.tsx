@@ -297,10 +297,10 @@ export function RuleTester({
                 </p>
               ) : null}
 
-              {result.score !== null && result.score > (result.weight ?? weight) ? (
+              {result.score !== null && result.score !== (result.weight ?? weight) ? (
                 <p className="text-2xs leading-relaxed text-warning-fg">
-                  The agent estimated more than the rule’s weight. The backend caps a rule’s
-                  contribution at its weight, so this would be recorded as{' '}
+                  The score above is this preview’s own estimate. In an analysis run a triggered
+                  rule contributes exactly its weight, so this rule would be recorded as{' '}
                   {formatNumber(result.weight ?? weight, { maximumFractionDigits: 2 })}.
                 </p>
               ) : null}
@@ -308,8 +308,11 @@ export function RuleTester({
               <p className="flex items-start gap-1.5 text-2xs leading-relaxed text-subtle">
                 <Bot aria-hidden="true" className="mt-0.5 size-3 shrink-0" />
                 <span>
-                  This is a model judgement, not a calculation. Running it again on the same data can
-                  produce a different verdict or score.
+                  This preview is a model judgement, not a calculation — running it again on the
+                  same data can produce a different verdict or score. An analysis run does not work
+                  this way: there the agent writes SQL for this condition, Postgres executes it, and
+                  the rule triggers exactly when the query returns rows. Read this as a sense check
+                  on the wording, not as the verdict the run will reach.
                   {result.model ? ` Model: ${result.model}.` : ''}
                   {result.durationMs !== null ? ` Took ${formatDuration(result.durationMs)}.` : ''}
                 </span>

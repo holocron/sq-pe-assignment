@@ -2,8 +2,8 @@
  * The transactions behind a triggered rule.
  *
  * `risk_assessments` stores one row per (transaction, rule) pair, so a rule
- * verdict carries the exact transaction ids that matched. Expanding a rule
- * resolves them through `GET /api/transactions/{id}` — no id is ever shown
+ * verdict carries the exact transaction ids the rule's query returned. Expanding
+ * a rule resolves them through `GET /api/transactions/{id}` — no id is ever shown
  * without giving the operator a way to see what it actually was.
  */
 import { useQueries } from '@tanstack/react-query'
@@ -23,10 +23,16 @@ const DEFAULT_LIMIT = 8
 export interface MatchedTransactionsProps {
   /** `RuleEvaluationView.matchedTransactionIds`; tolerates a missing array. */
   transactionIds: UUID[] | null | undefined
+  /** Shown when the list is empty; say who produced the empty list. */
+  emptyLabel?: string
   className?: string
 }
 
-export function MatchedTransactions({ transactionIds, className }: MatchedTransactionsProps) {
+export function MatchedTransactions({
+  transactionIds,
+  emptyLabel = 'The agent cited no transaction for this rule.',
+  className,
+}: MatchedTransactionsProps) {
   const [showAll, setShowAll] = useState(false)
   const ids = Array.isArray(transactionIds) ? transactionIds : []
   const visibleIds = showAll ? ids : ids.slice(0, DEFAULT_LIMIT)
@@ -41,9 +47,7 @@ export function MatchedTransactions({ transactionIds, className }: MatchedTransa
 
   if (ids.length === 0) {
     return (
-      <p className={cn('text-xs text-muted', className)}>
-        The agent cited no transaction for this rule.
-      </p>
+      <p className={cn('text-xs text-muted', className)}>{emptyLabel}</p>
     )
   }
 
@@ -58,7 +62,7 @@ export function MatchedTransactions({ transactionIds, className }: MatchedTransa
     <div className={cn('space-y-2', className)}>
       <div className="overflow-x-auto rounded-xs border border-border">
         <table className="w-full border-collapse text-xs">
-          <caption className="sr-only">Transactions the agent cited as evidence</caption>
+          <caption className="sr-only">Transactions cited as evidence for this rule</caption>
           <thead className="bg-surface-2">
             <tr>
               <th scope="col" className="px-2.5 py-1.5 text-left font-semibold text-2xs tracking-caption text-muted uppercase">

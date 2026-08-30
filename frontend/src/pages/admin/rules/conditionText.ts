@@ -1,10 +1,11 @@
 /**
  * Helpers for the prose in `risk_rules.threshold_logic`.
  *
- * The condition is a prompt: the agent reads it, decides which of its tools to
- * call and judges the verdict. Nothing here parses it — these functions only
- * measure, excerpt and coach, so a rule that reads badly is caught by the author
- * rather than by a run that quietly scores it wrong.
+ * The condition is a prompt: the agent reads it, investigates with its tools and
+ * writes one SQL query from it; Postgres answers the query and the answer is the
+ * verdict. Nothing here parses it — these functions only measure, excerpt and
+ * coach, so a rule that reads badly is caught by the author rather than by a run
+ * that quietly translates it into the wrong question.
  */
 import {
   RULE_CONDITION_MAX_LENGTH,

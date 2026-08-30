@@ -13,8 +13,10 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.util.List;
-import java.util.StringJoiner;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.function.Predicate;
 import tools.jackson.databind.node.JsonNodeFactory;
 
 /**
@@ -24,9 +26,11 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * domain objects, which is what lets the coverage gate be tested as the piece of control flow it is.
  *
  * <p>Each rule's {@code threshold_logic} is what it is in production now - the condition in prose,
- * written by an administrator. Nothing evaluates it here: the scripted model plays the part of the
- * agent that reads it and judges. The verdicts the tests script are therefore the fixture's
- * expectations, and they are consistent throughout: SANCTIONED_WIRE 30, STRUCTURING 20,
+ * written by an administrator. Nothing here evaluates that prose. The scripted model plays the part
+ * of the agent that reads it and writes a query for it ({@link #sqlFor}), and
+ * {@link StubRuleSqlEvaluator} plays the part of PostgreSQL answering that query
+ * ({@link #evaluator}). The verdicts are therefore the stub's, exactly as they are the database's in
+ * production, and they are consistent throughout: SANCTIONED_WIRE 30, STRUCTURING 20,
  * UNATTRIBUTED_CRYPTO 15 and DECLINE_BURST not triggered. Total 65, which bands as HIGH.
  */
 final class AgentTestFixtures {
@@ -117,28 +121,122 @@ final class AgentTestFixtures {
     }
 
     /**
-     * The arguments of one {@code submit_rule_evaluation} call.
+     * The arguments of one {@code evaluate_rule} call: the rule, the SQL the model wrote for it and
+     * what the model says that SQL looks for.
      *
-     * <p>A triggered verdict has to cite transactions that are really in the rule's scope - the tool
-     * refuses anything else - so the evidence is taken from the run's own batch rather than invented
-     * by the test. That is deliberate: a fixture that could not produce valid evidence would be
-     * proving something about the fixture rather than about the loop.
+     * <p>Notice what is <em>not</em> here. There is no verdict and no score to script, because the
+     * model no longer supplies either - the query result does. A test that wants a rule triggered
+     * says so to {@link StubRuleSqlEvaluator}, which is the database's seat in these tests.
      */
-    static String verdict(AgentRunContext context, RiskRule rule, boolean triggered, int score,
-            String rationale) {
-        List<UUID> inScope = context.inScopeTransactionIds(rule.getRuleId());
-        List<UUID> cited = triggered && !inScope.isEmpty() ? List.of(inScope.getFirst()) : List.of();
-        return verdict(rule, triggered, score, cited, rationale);
+    static String evaluateRule(RiskRule rule, String explanation) {
+        return evaluateRule(rule, sqlFor(rule), explanation);
     }
 
-    /** The same, with the evidence chosen by the caller. */
-    static String verdict(RiskRule rule, boolean triggered, int score, List<UUID> transactionIds,
-            String rationale) {
-        StringJoiner ids = new StringJoiner(",", "[", "]");
-        transactionIds.forEach(id -> ids.add("\"" + id + "\""));
+    /** The same, with the query written by the caller - a broken one, or a deliberately lazy one. */
+    static String evaluateRule(RiskRule rule, String sql, String explanation) {
         return """
-                {"rule_id":"%s","triggered":%s,"score":%d,"transaction_ids":%s,"rationale":"%s"}"""
-                .formatted(rule.getRuleId(), triggered, score, ids, rationale);
+                {"rule_id":"%s","sql":"%s","explanation":"%s"}"""
+                .formatted(rule.getRuleId(), json(sql), json(explanation));
+    }
+
+    /**
+     * The query an agent would plausibly write for one of these rules.
+     *
+     * <p>Each is recognisable by a fragment of its own text - {@code receiver_bank_country},
+     * {@code BETWEEN 9000 AND 9999} - which is how {@link StubRuleSqlEvaluator} tells them apart,
+     * because the real evaluator is handed a SELECT and a customer id and never learns which rule it
+     * belongs to.
+     */
+    static String sqlFor(RiskRule rule) {
+        return switch (rule.getRuleName()) {
+            case SANCTIONED_WIRE -> "SELECT t.transaction_id FROM tx t JOIN payment p ON "
+                    + "p.transaction_id = t.transaction_id WHERE t.activity_type = 'PAYMENT' AND "
+                    + "t.amount > 10000 AND p.receiver_bank_country IN ('IR','KP','SY','RU','AF')";
+            // The "< 10000" is redundant against the BETWEEN and is written anyway, because the
+            // condition names the 10,000 reporting threshold and ThresholdFidelity expects a first
+            // query to use the numbers its condition states.
+            case STRUCTURING -> "SELECT t.transaction_id FROM tx t WHERE t.activity_type = 'PAYMENT' "
+                    + "AND t.amount BETWEEN 9000 AND 9999 AND t.amount < 10000 AND (SELECT count(*) "
+                    + "FROM tx w WHERE w.activity_type = 'PAYMENT' AND w.amount BETWEEN 9000 AND "
+                    + "9999 AND w.created_at > t.created_at - INTERVAL '24 hours' AND w.created_at "
+                    + "<= t.created_at) >= 3";
+            case UNATTRIBUTED_CRYPTO -> "SELECT t.transaction_id FROM tx t JOIN crypto c ON "
+                    + "c.transaction_id = t.transaction_id WHERE t.activity_type = 'CRYPTO' AND "
+                    + "t.amount > 1000 AND c.exchange_name IS NULL";
+            case DECLINE_BURST -> "SELECT t.transaction_id FROM tx t JOIN card c ON "
+                    + "c.transaction_id = t.transaction_id WHERE t.activity_type = 'CARD' AND "
+                    + "c.decline_reason IS NOT NULL AND (SELECT count(*) FROM tx w JOIN card k ON "
+                    + "k.transaction_id = w.transaction_id WHERE k.decline_reason IS NOT NULL AND "
+                    + "w.created_at > t.created_at - INTERVAL '24 hours' AND w.created_at <= "
+                    + "t.created_at) >= 5";
+            default -> "SELECT t.transaction_id FROM tx t WHERE t.amount > 1000000";
+        };
+    }
+
+    /**
+     * A query that names every threshold its rule's condition states and still matches nothing.
+     *
+     * <p>Both halves are needed. {@link ThresholdFidelity} refuses a first query that ignores the
+     * condition's numbers, so a test that wants "the query ran and found nothing" cannot just write
+     * {@code WHERE amount > 1000000} any more; and {@link StubRuleSqlEvaluator} answers an
+     * unscripted query with no rows, so naming the numbers in a predicate nothing satisfies is
+     * exactly the shape needed.
+     */
+    static String faithfulSqlThatMatchesNothing(RiskRule rule) {
+        StringBuilder sql = new StringBuilder("SELECT t.transaction_id FROM tx t WHERE false");
+        Matcher numbers = Pattern.compile("(?<![A-Za-z0-9_.])\\d+(?:,\\d{3})*(?:\\.\\d+)?(?![A-Za-z0-9_])")
+                .matcher(rule.getThresholdLogic());
+        while (numbers.find()) {
+            sql.append(" AND t.amount = ").append(numbers.group().replace(",", ""));
+        }
+        return sql.toString();
+    }
+
+    /**
+     * PostgreSQL's part, scripted: the answers that make this fixture's planted risk real.
+     *
+     * <p>The RU wire, the three payments just under the threshold and the unattributed XMR transfer
+     * come back as rows; the decline rule's query finds nothing, because the customer's one card
+     * transaction was authorised. Every id is taken from the run's own snapshot, so the ids a
+     * verdict records are transactions that exist and are in the rule's scope - which is what the
+     * tools check before accepting a result.
+     */
+    static StubRuleSqlEvaluator evaluator(AgentRunContext context) {
+        return new StubRuleSqlEvaluator()
+                .matching("receiver_bank_country", sanctionedWireEvidence(context))
+                .matching("BETWEEN 9000 AND 9999", structuringEvidence(context))
+                .matching("exchange_name IS NULL", cryptoEvidence(context));
+    }
+
+    /** The single payment above 10,000 to a sanctioned jurisdiction. */
+    static List<UUID> sanctionedWireEvidence(AgentRunContext context) {
+        return matching(context, transaction -> transaction.getActivityType() == ActivityType.PAYMENT
+                && transaction.getAmount().compareTo(new BigDecimal("10000")) > 0);
+    }
+
+    /** The three payments between 9,000 and 9,999 inside one day. */
+    static List<UUID> structuringEvidence(AgentRunContext context) {
+        return matching(context, transaction -> transaction.getActivityType() == ActivityType.PAYMENT
+                && transaction.getAmount().compareTo(new BigDecimal("9000")) >= 0
+                && transaction.getAmount().compareTo(new BigDecimal("9999")) <= 0);
+    }
+
+    /** The crypto transfer with no exchange attribution. */
+    static List<UUID> cryptoEvidence(AgentRunContext context) {
+        return matching(context, transaction -> transaction.getActivityType() == ActivityType.CRYPTO);
+    }
+
+    private static List<UUID> matching(AgentRunContext context, Predicate<Transaction> predicate) {
+        return context.batch().transactions().stream()
+                .filter(predicate)
+                .map(Transaction::getTransactionId)
+                .toList();
+    }
+
+    /** A string as it has to appear inside the tool-call arguments the scripted model emits. */
+    private static String json(String value) {
+        return value == null ? "" : value.replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("\n", "\\n");
     }
 
     /** One card transaction with caller-chosen free text, for the prompt-injection tests. */

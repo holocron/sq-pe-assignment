@@ -41,7 +41,8 @@ import tools.jackson.databind.node.ObjectNode;
  * @param text          assistant text, or the human-readable note of a non-tool step
  * @param missing       rule names still awaiting a verdict, for {@code coverage_reprompt} steps
  * @param riskLevel     final risk band, for {@code final} steps
- * @param detail        extra machine-readable payload, e.g. the rules left unjudged
+ * @param detail        extra machine-readable payload, e.g. the SQL a rule evaluation ran or the
+ *                      rules left unjudged
  * @param subject       what this step acted on, in human terms - the rule name of a verdict, the
  *                      transaction a lookup opened, the query a search ran; null when the step is
  *                      not scoped to one thing
@@ -75,6 +76,12 @@ public record TraceStep(
     /** Longest outcome; one short phrase that fits on the collapsed row. */
     public static final int OUTCOME_LIMIT = 80;
 
+    /**
+     * Longest SQL kept on a step. A rule query is a few lines; the cap only exists so a runaway
+     * generation cannot bloat {@code analysis_runs.trace}.
+     */
+    public static final int SQL_LIMIT = 2000;
+
     public TraceStep {
         missing = missing == null ? null : List.copyOf(missing);
         subject = clip(subject, SUBJECT_LIMIT);
@@ -82,27 +89,40 @@ public record TraceStep(
     }
 
     /**
-     * The human-readable identity of one step: what it acted on and how it came out.
+     * The human-readable identity of one step: what it acted on, how it came out, and - for a rule
+     * evaluation - the query that decided it.
      *
      * <p>Produced where the meaning is known - the tool that ran, holding the typed payload - and
      * carried to {@link AnalysisTrace} rather than re-derived by parsing the result string back out
      * of the transcript.
+     *
+     * <p>{@code sql} is what makes a verdict reviewable rather than merely reported. The rule's
+     * condition is answered by PostgreSQL, so "triggered +30.00" is only as trustworthy as the
+     * SELECT behind it; the step carries that SELECT verbatim, for the attempts that were rejected
+     * as well as for the one that stuck. It is kept out of {@code outcome} because it belongs in the
+     * expanded detail of the step, not on the collapsed row.
      */
-    public record Note(String subject, String outcome) {
+    public record Note(String subject, String outcome, String sql) {
 
         public Note {
             subject = clip(subject, SUBJECT_LIMIT);
             outcome = clip(outcome, OUTCOME_LIMIT);
+            sql = sql == null || sql.isBlank() ? null : truncate(sql, SQL_LIMIT);
         }
 
         /** True when the note would add nothing to the step. */
         public boolean isEmpty() {
-            return subject == null && outcome == null;
+            return subject == null && outcome == null && sql == null;
         }
 
         /** Null rather than an empty note, so callers can pass the result straight through. */
         public static Note of(String subject, String outcome) {
-            Note note = new Note(subject, outcome);
+            return of(subject, outcome, null);
+        }
+
+        /** The same, carrying the SQL a rule evaluation ran. */
+        public static Note of(String subject, String outcome, String sql) {
+            Note note = new Note(subject, outcome, sql);
             return note.isEmpty() ? null : note;
         }
     }

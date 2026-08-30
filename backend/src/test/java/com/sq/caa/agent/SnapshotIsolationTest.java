@@ -111,7 +111,8 @@ class SnapshotIsolationTest {
         UUID assessmentId = UUID.randomUUID();
         AgentRunContext context = new AgentRunContext(assessmentId, customer, batch, List.of(),
                 AgentTestFixtures.trace(assessmentId));
-        return new RiskAgentTools(context, null, null, JsonMapper.builder().build(), 25);
+        return new RiskAgentTools(context, null, null, new StubRuleSqlEvaluator(),
+                JsonMapper.builder().build(), 25, 3);
     }
 
     /**

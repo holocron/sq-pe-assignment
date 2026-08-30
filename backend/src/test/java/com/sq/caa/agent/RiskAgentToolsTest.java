@@ -13,6 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.sq.caa.agent.ToolPayloads.CustomerProfile;
 import com.sq.caa.agent.ToolPayloads.FinalAck;
+import com.sq.caa.agent.ToolPayloads.QueryRejected;
 import com.sq.caa.agent.ToolPayloads.RuleList;
 import com.sq.caa.agent.ToolPayloads.RuleListing;
 import com.sq.caa.agent.ToolPayloads.ToolError;
@@ -20,6 +21,7 @@ import com.sq.caa.agent.ToolPayloads.TransactionDetail;
 import com.sq.caa.agent.ToolPayloads.TransactionPage;
 import com.sq.caa.agent.ToolPayloads.VerdictAck;
 import com.sq.caa.domain.ActivityType;
+import com.sq.caa.domain.RiskLevel;
 import com.sq.caa.domain.RiskRule;
 import com.sq.caa.domain.Transaction;
 import java.math.BigDecimal;
@@ -29,6 +31,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.support.ToolCallbacks;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.ai.tool.definition.ToolDefinition;
 import tools.jackson.databind.json.JsonMapper;
 
 /**
@@ -36,10 +39,14 @@ import tools.jackson.databind.json.JsonMapper;
  *
  * <p>Two halves of the guarantee live here, so these are not incidental unit tests.
  * {@code submit_final_assessment} is what refuses to end an incomplete analysis, and
- * {@code submit_rule_evaluation} is the last thing standing between a model's claim and the
- * database. The second matters far more now than it used to: the verdict it accepts is final, so a
- * rationale that says nothing, a score above the rule's weight or a transaction id the rule does not
- * even apply to would go straight into the audit record if this were merely a setter.
+ * {@code evaluate_rule} is what makes a verdict something other than an assertion by a language
+ * model: it hands the agent's SELECT to PostgreSQL and reads the verdict off the result. The model
+ * supplies neither the verdict nor the score, so the tests below are mostly about what happens when
+ * it tries to - by writing an explanation that contradicts the rows, by returning ids the rule does
+ * not cover, or by never getting a query to run at all.
+ *
+ * <p>PostgreSQL's seat is taken by {@link StubRuleSqlEvaluator}. What is under test is not SQL
+ * execution - that belongs to the evaluator's own tests - but what this class does with a result.
  */
 class RiskAgentToolsTest {
 
@@ -47,8 +54,12 @@ class RiskAgentToolsTest {
     private final AnalysisTrace trace = AgentTestFixtures.trace(UUID.randomUUID());
     private final AgentRunContext context =
             AgentTestFixtures.context(UUID.randomUUID(), trace, rules);
+    private final StubRuleSqlEvaluator sql = AgentTestFixtures.evaluator(context);
     private final RiskAgentTools tools =
-            new RiskAgentTools(context, null, null, JsonMapper.builder().build(), 25);
+            new RiskAgentTools(context, null, null, sql, JsonMapper.builder().build(), 25, MAX_ATTEMPTS);
+
+    /** Query attempts one rule gets before it is abandoned unjudged. */
+    private static final int MAX_ATTEMPTS = 3;
 
     @Test
     @DisplayName("every tool is exposed with a description and a typed schema, and the deterministic "
@@ -66,15 +77,28 @@ class RiskAgentToolsTest {
                 RiskAgentTools.GET_TRANSACTION_DETAILS,
                 RiskAgentTools.LIST_RISK_RULES,
                 RiskAgentTools.SEARCH_POLICY_KNOWLEDGE,
-                RiskAgentTools.SUBMIT_RULE_EVALUATION,
+                RiskAgentTools.EVALUATE_RULE,
                 RiskAgentTools.SUBMIT_FINAL_ASSESSMENT)), names.toString());
         assertFalse(names.stream().anyMatch(name -> name.contains("deterministic")),
-                "there is no engine to defer to any more; the agent judges the rule itself");
+                "there is no engine to defer to; the agent writes the query and the database answers");
+
         for (ToolCallback callback : callbacks) {
             assertTrue(callback.getToolDefinition().description().length() > 80,
                     callback.getToolDefinition().name() + " needs an operator-readable description");
             assertNotNull(callback.getToolDefinition().inputSchema());
         }
+
+        // The one description the whole design rests on has to say, in the model's own working
+        // context, that it is not the one doing the comparing - and has to describe the shape it may
+        // write SQL against, because a model cannot write a correct query against an unknown schema.
+        String evaluate = definition(callbacks, RiskAgentTools.EVALUATE_RULE).description();
+        assertTrue(evaluate.contains("YOU DO NOT DECIDE WHETHER THE RULE TRIGGERED"), evaluate);
+        assertTrue(evaluate.contains("Never count, sum, average, compare or round anything yourself"));
+        assertTrue(evaluate.contains("HAVING count(*) >= 8"), "the worked comparison is the whole point");
+        for (String cte : List.of("customer(", "tx(", "card(", "payment(", "crypto(")) {
+            assertTrue(evaluate.contains(cte), "the CTE " + cte + " must be documented: " + evaluate);
+        }
+        assertTrue(evaluate.contains("transaction_id"), "the required output column must be named");
     }
 
     @Test
@@ -99,9 +123,10 @@ class RiskAgentToolsTest {
         assertEquals(1, listing(before, DECLINE_BURST).transactionsInScope());
         assertTrue(before.instruction().contains("do not comply"),
                 "the tool result must say what to do with a condition that gives orders");
+        assertTrue(before.instruction().contains("the database decides whether the rule fired"),
+                "the checklist must say who decides: " + before.instruction());
 
-        tools.submitRuleEvaluation(id(SANCTIONED_WIRE), true, 30.0, evidenceIds(SANCTIONED_WIRE),
-                "A 25,000 SWIFT payment to a bank in RU.");
+        evaluate(SANCTIONED_WIRE, "Payments over 10,000 to a sanctioned jurisdiction.");
 
         RuleList after = assertInstanceOf(RuleList.class, tools.listRiskRules());
         assertEquals(1, after.verdictsSubmitted());
@@ -112,187 +137,322 @@ class RiskAgentToolsTest {
     @Test
     @DisplayName("a rule id that is not on the checklist is refused with a usable hint")
     void unknownRuleIsRefused() {
-        ToolError error = assertInstanceOf(ToolError.class, tools.submitRuleEvaluation(
-                UUID.randomUUID().toString(), true, 1.0, List.of(), "Something."));
+        ToolError error = assertInstanceOf(ToolError.class, tools.evaluateRule(
+                UUID.randomUUID().toString(), "SELECT t.transaction_id FROM tx t", "Anything."));
         assertTrue(error.hint().contains(SANCTIONED_WIRE));
-        assertInstanceOf(ToolError.class,
-                tools.submitRuleEvaluation("not-a-uuid", false, 0.0, List.of(), "Something."));
+        assertInstanceOf(ToolError.class, tools.evaluateRule("not-a-uuid",
+                "SELECT t.transaction_id FROM tx t", "Anything."));
+        assertEquals(0, sql.callCount(), "an unknown rule must not reach the database at all");
     }
 
     @Test
-    @DisplayName("the agent's verdict is what gets recorded, with its evidence and its rationale")
-    void theAgentsVerdictIsRecordedAsGiven() {
-        UUID cited = evidence(SANCTIONED_WIRE).getFirst();
-        VerdictAck ack = assertInstanceOf(VerdictAck.class, tools.submitRuleEvaluation(
-                id(SANCTIONED_WIRE), true, 22.5, List.of(cited.toString()),
-                "A 25,000 SWIFT payment to a bank in RU, which the condition names directly."));
+    @DisplayName("the query decides: rows come back, so the rule is triggered at its full weight - "
+            + "even when the model's own explanation says it did not trigger")
+    void theQueryDecidesTheVerdictAndTheModelCannotTalkItDown() {
+        // The regression this whole design exists for, in miniature. The model looks at the same
+        // data, gets the arithmetic wrong and says so in its explanation; the query returned rows,
+        // and the rows are the verdict.
+        sql.matching("c.decline_reason", context.inScopeTransactionIds(ruleId(DECLINE_BURST)));
+
+        VerdictAck ack = assertInstanceOf(VerdictAck.class, tools.evaluateRule(
+                id(DECLINE_BURST), AgentTestFixtures.sqlFor(rule(DECLINE_BURST)),
+                "The highest number of declines in any 24-hour window is 4, which is below the "
+                        + "required minimum of 5, so this rule did NOT trigger."));
 
         assertTrue(ack.accepted());
-        assertTrue(ack.recordedAsTriggered());
-        assertEquals(0, new BigDecimal("22.50").compareTo(ack.recordedScore()),
-                "an estimate inside the weight is the agent's to make");
-        assertFalse(ack.scoreClamped());
-        assertEquals(0, new BigDecimal("30.00").compareTo(ack.weightCap()));
-        assertEquals(1, ack.matchedTransactionsRecorded());
-        assertEquals(3, ack.verdictsStillRequired());
-        assertEquals(3, ack.rulesStillMissingAVerdict().size());
-        assertTrue(ack.nextAction().contains("Still missing"));
-        assertTrue(ack.note().contains("final"), "the model must be told the verdict is not re-checked");
+        assertTrue(ack.triggered(), "the query returned a row, so the rule fired - whatever the "
+                + "explanation claims about it");
+        assertEquals(0, new BigDecimal("10.00").compareTo(ack.score()),
+                "a triggered rule scores its weight; there is no estimate to make");
+        assertEquals(0, new BigDecimal("10.00").compareTo(ack.weight()));
+        assertEquals(1, ack.matchedTransactions());
+        assertFalse(ack.matchedIdsCapped());
+        assertEquals(context.inScopeTransactionIds(ruleId(DECLINE_BURST)).stream()
+                .map(UUID::toString).toList(), ack.matchedTransactionIds(),
+                "the evidence is the rows the query returned, so it cannot be invented");
+        assertTrue(ack.note().contains("This verdict is the query result, not your reading of it"),
+                ack.note());
+        assertEquals(AgentTestFixtures.sqlFor(rules.stream()
+                        .filter(rule -> rule.getRuleName().equals(DECLINE_BURST)).findFirst()
+                        .orElseThrow()), ack.sql(),
+                "the acknowledgement echoes the model's own fragment, not the wrapper - the wrapper "
+                        + "is boilerplate and repeating it twelve times a run overflows the context");
+        assertEquals(List.of(context.customer().getCustomerId()), sql.scopes(),
+                "a tool can only ever ask about the customer this run is analysing");
 
-        AgentRuleVerdict stored = context.verdict(ruleId(SANCTIONED_WIRE));
-        assertNotNull(stored);
-        assertEquals(List.of(cited), stored.transactionIds());
-        assertTrue(stored.rationale().contains("SWIFT"));
+        AgentRuleVerdict stored = context.verdict(ruleId(DECLINE_BURST));
+        assertTrue(stored.triggered());
+        assertEquals(0, new BigDecimal("10.00").compareTo(stored.score()));
+        assertEquals(1, stored.matchedCount());
+        assertTrue(stored.sql().startsWith(StubRuleSqlEvaluator.WRAPPER_PREFIX),
+                "what is recorded is the statement that ran, not the fragment the model typed");
     }
 
     @Test
-    @DisplayName("a score above the rule's weight is clamped, and the model is told it was")
-    void anExcessiveScoreIsClampedAndReported() {
-        VerdictAck ack = assertInstanceOf(VerdictAck.class, tools.submitRuleEvaluation(
-                id(STRUCTURING), true, 500.0, evidenceIds(STRUCTURING),
-                "Three payments just under the threshold within a day."));
+    @DisplayName("a query that returns no rows is recorded as not triggered, scoring 0.00")
+    void aQueryThatMatchesNothingIsRecordedNotTriggered() {
+        VerdictAck ack = assertInstanceOf(VerdictAck.class, tools.evaluateRule(
+                id(DECLINE_BURST), AgentTestFixtures.sqlFor(rule(DECLINE_BURST)),
+                "This customer's card activity was clearly a burst of declines."));
 
         assertTrue(ack.accepted());
-        assertTrue(ack.scoreClamped());
-        assertEquals(0, new BigDecimal("20.00").compareTo(ack.recordedScore()));
-        assertTrue(ack.note().contains("500.00"), "the attempt is reported back: " + ack.note());
+        assertFalse(ack.triggered());
+        assertEquals(0, BigDecimal.ZERO.compareTo(ack.score()));
+        assertEquals(0, ack.matchedTransactions());
+        assertTrue(ack.matchedTransactionIds().isEmpty());
 
-        AgentRuleVerdict stored = context.verdict(ruleId(STRUCTURING));
-        assertEquals(0, new BigDecimal("20.00").compareTo(stored.score()));
-        assertEquals(0, new BigDecimal("500.00").compareTo(stored.claimedScore()));
-        assertTrue(stored.scoreClamped());
-
-        // A negative score is nonsense rather than an under-estimate, so it becomes zero.
-        VerdictAck negative = assertInstanceOf(VerdictAck.class, tools.submitRuleEvaluation(
-                id(UNATTRIBUTED_CRYPTO), true, -8.0, evidenceIds(UNATTRIBUTED_CRYPTO),
-                "XMR transfer with no exchange attribution."));
-        assertEquals(0, BigDecimal.ZERO.compareTo(negative.recordedScore()));
-        assertTrue(negative.scoreClamped());
-
-        // Omitting the score on a triggered rule means the full weight.
-        VerdictAck omitted = assertInstanceOf(VerdictAck.class, tools.submitRuleEvaluation(
-                id(SANCTIONED_WIRE), true, null, evidenceIds(SANCTIONED_WIRE), "A 25,000 wire to RU."));
-        assertEquals(0, new BigDecimal("30.00").compareTo(omitted.recordedScore()));
-        assertFalse(omitted.scoreClamped());
+        AgentRuleVerdict stored = context.verdict(ruleId(DECLINE_BURST));
+        assertFalse(stored.triggered());
+        assertEquals(0, BigDecimal.ZERO.compareTo(stored.score()));
+        assertTrue(stored.transactionIds().isEmpty());
     }
 
     @Test
-    @DisplayName("a rule the agent says did not trigger is scored zero whatever it claims")
-    void anUntriggeredRuleScoresZero() {
-        VerdictAck ack = assertInstanceOf(VerdictAck.class, tools.submitRuleEvaluation(
-                id(DECLINE_BURST), false, 10.0, evidenceIds(DECLINE_BURST),
-                "The single card transaction on file was authorised; there are no declines."));
+    @DisplayName("a capped id list still counts every match, and says it was capped")
+    void aCappedIdListStillCountsEveryMatch() {
+        List<UUID> payments = context.inScopeTransactionIds(ruleId(STRUCTURING));
+        sql.matching("BETWEEN 9000 AND 9999", 97, payments.subList(0, 2));
 
-        assertTrue(ack.accepted());
-        assertFalse(ack.recordedAsTriggered());
-        assertEquals(0, BigDecimal.ZERO.compareTo(ack.recordedScore()));
-        assertEquals(0, ack.matchedTransactionsRecorded(),
-                "a rule that did not trigger has no matching transactions");
-        assertTrue(ack.note().contains("not recorded"),
-                "the model must be told its transaction ids were dropped: " + ack.note());
-        assertTrue(context.verdict(ruleId(DECLINE_BURST)).transactionIds().isEmpty());
+        VerdictAck ack = assertInstanceOf(VerdictAck.class,
+                evaluate(STRUCTURING, "Three payments of 9,000-9,999 inside a rolling day."));
+
+        assertTrue(ack.triggered());
+        assertEquals(97, ack.matchedTransactions(), "the true total is what the query counted");
+        assertTrue(ack.matchedIdsCapped());
+        assertEquals(2, ack.matchedTransactionIds().size());
+        assertTrue(ack.note().contains("all 97 matches are counted and recorded"), ack.note());
+        assertEquals(97, context.verdict(ruleId(STRUCTURING)).matchedCount());
     }
 
     @Test
-    @DisplayName("a verdict with no rationale is refused and nothing is recorded")
-    void aVerdictWithoutARationaleIsRefused() {
-        ToolError blank = assertInstanceOf(ToolError.class, tools.submitRuleEvaluation(
-                id(SANCTIONED_WIRE), true, 30.0, evidenceIds(SANCTIONED_WIRE), "   "));
-        assertTrue(blank.error().contains("NOT recorded"));
+    @DisplayName("a rejected query records nothing, comes back with the reason, and may be retried "
+            + "until the cap is spent")
+    void aRejectedQueryRecordsNothingAndIsRetriedUntilTheCapIsSpent() {
+        sql.rejecting("BROKEN", "syntax error at or near \"BROKEN\"");
 
-        assertInstanceOf(ToolError.class, tools.submitRuleEvaluation(
-                id(SANCTIONED_WIRE), true, 30.0, evidenceIds(SANCTIONED_WIRE), null));
-        // Punctuation is not a reason either - Narrative treats it as nothing said.
-        assertInstanceOf(ToolError.class, tools.submitRuleEvaluation(
-                id(SANCTIONED_WIRE), true, 30.0, evidenceIds(SANCTIONED_WIRE), "-- ... --"));
+        QueryRejected first = assertInstanceOf(QueryRejected.class, tools.evaluateRule(
+                id(STRUCTURING), "SELECT BROKEN FROM tx WHERE amount BETWEEN 9000 AND 9999 "
+                        + "AND amount < 10000 AND created_at > now() - INTERVAL '24 hours'",
+                "Payments just under the threshold."));
+        assertFalse(first.accepted());
+        assertTrue(first.reason().contains("syntax error"), "the model gets what it needs to fix it");
+        assertEquals(1, first.attemptsUsed());
+        assertEquals(MAX_ATTEMPTS - 1, first.attemptsRemaining());
+        assertEquals(4, first.verdictsStillRequired());
+        assertFalse(context.isEvaluated(ruleId(STRUCTURING)),
+                "a query that did not run leaves the rule outstanding - it is never 'not triggered'");
+
+        // A repaired query settles it, and the failed attempts cost nothing but attempts.
+        VerdictAck fixed = assertInstanceOf(VerdictAck.class,
+                evaluate(STRUCTURING, "Three payments of 9,000-9,999 inside a rolling day."));
+        assertTrue(fixed.triggered());
+        assertEquals(3, fixed.matchedTransactions());
+        assertEquals(0, context.sqlAttempts(ruleId(STRUCTURING)),
+                "the budget bounds failures, so a query that ran gives the rule its attempts back");
+
+        // On another rule, the model never repairs it. After the cap the tool refuses to run more.
+        // The window is written into the broken query so that every attempt gets past the threshold
+        // check and reaches the database - the count below is about the query budget, not about it.
+        String broken = "SELECT BROKEN FROM tx WHERE created_at > now() - INTERVAL '24 hours'";
+        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            assertInstanceOf(QueryRejected.class,
+                    tools.evaluateRule(id(DECLINE_BURST), broken, "Declines in a day."));
+        }
+        ToolError exhausted = assertInstanceOf(ToolError.class,
+                tools.evaluateRule(id(DECLINE_BURST), broken, "Declines in a day."));
+        assertTrue(exhausted.error().contains("has used all " + MAX_ATTEMPTS), exhausted.error());
+        assertTrue(exhausted.hint().contains("recorded as FAILED"),
+                "the model must be told what an unjudged rule costs the run");
+        assertFalse(context.isEvaluated(ruleId(DECLINE_BURST)),
+                "an exhausted rule stays UNJUDGED; recording it as not triggered is the one thing "
+                        + "that must never happen");
+        assertEquals(MAX_ATTEMPTS + 2, sql.callCount(),
+                "the cap is enforced before the database is asked again");
+    }
+
+    @Test
+    @DisplayName("the model is sent back its own fragment while the record keeps the whole statement")
+    void theAcknowledgementIsShortAndTheAuditRecordIsComplete() {
+        // Two different readers with two different needs. The model wrote the fragment and gains
+        // nothing from 1,300 characters of wrapper read back to it - a live run died on "Context
+        // size has been exceeded" doing exactly that twelve times. A compliance officer needs the
+        // opposite: the statement that actually ran, wrapper and all.
+        VerdictAck ack = assertInstanceOf(VerdictAck.class,
+                evaluate(SANCTIONED_WIRE, "Payments above 10,000 to a sanctioned jurisdiction."));
+
+        assertFalse(ack.sql().startsWith(StubRuleSqlEvaluator.WRAPPER_PREFIX),
+                "the wrapper must not be echoed to the model: " + ack.sql());
+        assertTrue(ack.sql().contains("receiver_bank_country"), ack.sql());
+
+        AgentRuleVerdict recorded = context.verdict(ruleId(SANCTIONED_WIRE));
+        assertTrue(recorded.sql().startsWith(StubRuleSqlEvaluator.WRAPPER_PREFIX),
+                "the record keeps the statement that ran");
+        assertTrue(recorded.sql().contains(ack.sql()),
+                "and the fragment the model was shown is the one inside it");
+    }
+
+    @Test
+    @DisplayName("a query that substitutes its own thresholds is refused before it is even run")
+    void aQueryThatIgnoresTheConditionsNumbersIsRefusedUnrun() {
+        // The regression this check exists for, in miniature. The condition says three payments
+        // between 9,000 and 9,999 under the 10,000 threshold; the query below counts five above
+        // 20,000. Its arithmetic would be perfect and its answer would be to the wrong question.
+        QueryRejected refused = assertInstanceOf(QueryRejected.class, tools.evaluateRule(
+                id(STRUCTURING),
+                "SELECT t.transaction_id FROM tx t WHERE t.activity_type = 'PAYMENT' AND t.amount "
+                        + "> 20000 AND (SELECT count(*) FROM tx w WHERE w.created_at > "
+                        + "t.created_at - INTERVAL '24 hours') >= 5",
+                "Five large payments in a day."));
+
+        assertTrue(refused.reason().contains("9,000"), refused.reason());
+        assertTrue(refused.reason().contains("9,999"), refused.reason());
+        assertTrue(refused.reason().contains("10,000"), refused.reason());
+        assertTrue(refused.reason().contains("Nothing was recorded"), refused.reason());
+        assertEquals(0, sql.callCount(), "the wrong question must not reach the database");
+        assertFalse(context.isEvaluated(ruleId(STRUCTURING)),
+                "and it must leave the rule outstanding rather than 'not triggered'");
+
+        // The repaired query is accepted, and the verdict is the database's as always.
+        VerdictAck fixed = assertInstanceOf(VerdictAck.class,
+                evaluate(STRUCTURING, "Three payments of 9,000-9,999 inside a rolling day."));
+        assertTrue(fixed.triggered());
+        assertEquals(3, fixed.matchedTransactions());
+    }
+
+    @Test
+    @DisplayName("the threshold check is bounded, and spends none of the query budget")
+    void theThresholdCheckCannotStarveARuleOfItsRepairAttempts() {
+        // A correct query can legitimately not contain a number the condition writes - an hour range
+        // as a comparison, a band as one bound. The model is asked to reconsider a bounded number of
+        // times and may then resend the same query, which is run as written.
+        String unchanged = "SELECT t.transaction_id FROM tx t JOIN crypto c ON c.transaction_id = "
+                + "t.transaction_id WHERE t.activity_type = 'CRYPTO' AND t.amount > 999.99 "
+                + "AND c.exchange_name IS NULL";
+
+        QueryRejected first = assertInstanceOf(QueryRejected.class, tools.evaluateRule(
+                id(UNATTRIBUTED_CRYPTO), unchanged, "Unattributed crypto above a thousand."));
+        assertEquals(0, first.attemptsUsed(), "a threshold prompt never reaches the database");
+        assertEquals(MAX_ATTEMPTS, first.attemptsRemaining(),
+                "so it must not spend one of the attempts that exist to repair a real SQL error");
+        assertInstanceOf(QueryRejected.class, tools.evaluateRule(
+                id(UNATTRIBUTED_CRYPTO), unchanged, "Unattributed crypto above a thousand."));
+        assertEquals(0, sql.callCount(), "neither of those reached the database");
+        assertFalse(context.isEvaluated(ruleId(UNATTRIBUTED_CRYPTO)));
+
+        // Asked twice, the check gives way: the query the model stood by is the one that runs.
+        VerdictAck accepted = assertInstanceOf(VerdictAck.class, tools.evaluateRule(
+                id(UNATTRIBUTED_CRYPTO), unchanged, "Unattributed crypto above a thousand."));
+        assertTrue(accepted.accepted());
+        assertTrue(accepted.triggered(), "the query the model stood by is the one that was run");
+        assertTrue(context.isEvaluated(ruleId(UNATTRIBUTED_CRYPTO)));
+    }
+
+    @Test
+    @DisplayName("a rule asked about its thresholds still gets every one of its query attempts")
+    void thresholdPromptsLeaveTheRepairBudgetIntact() {
+        // The live failure this guards against. A rule was asked twice about its numbers, wrote an
+        // invalid query on what was left of its budget, and ended UNJUDGED - failing the whole run.
+        // The threshold check had refused no verdict; it had spent the budget meant for repairs.
+        sql.rejecting("agg.", "'agg' is not a relation the fragment may read.");
+        String wrongNumbers = "SELECT t.transaction_id FROM tx t JOIN crypto c ON "
+                + "c.transaction_id = t.transaction_id WHERE t.amount > 500";
+        String invalid = "SELECT t.transaction_id FROM tx t WHERE agg.crypto_ratio_30d > 1000";
+
+        assertInstanceOf(QueryRejected.class,
+                tools.evaluateRule(id(UNATTRIBUTED_CRYPTO), wrongNumbers, "Crypto over 500."));
+        assertInstanceOf(QueryRejected.class,
+                tools.evaluateRule(id(UNATTRIBUTED_CRYPTO), wrongNumbers, "Crypto over 500."));
+        QueryRejected broken = assertInstanceOf(QueryRejected.class,
+                tools.evaluateRule(id(UNATTRIBUTED_CRYPTO), invalid, "Crypto over 1000."));
+        assertEquals(1, broken.attemptsUsed(), "only the query that ran counts against the budget");
+        assertEquals(MAX_ATTEMPTS - 1, broken.attemptsRemaining());
+
+        VerdictAck fixed = assertInstanceOf(VerdictAck.class,
+                evaluate(UNATTRIBUTED_CRYPTO, "Unattributed crypto transfers above 1,000."));
+        assertTrue(fixed.triggered(), "the rule still had the attempts it needed to be answered");
+        assertTrue(context.isEvaluated(ruleId(UNATTRIBUTED_CRYPTO)));
+    }
+
+    @Test
+    @DisplayName("a database error is reported back like a rejection - nothing recorded, reason kept")
+    void aDatabaseErrorLeavesTheRuleOutstanding() {
+        sql.failing("pg_sleep", "canceling statement due to statement timeout");
+
+        QueryRejected refused = assertInstanceOf(QueryRejected.class, tools.evaluateRule(
+                id(UNATTRIBUTED_CRYPTO),
+                "SELECT t.transaction_id FROM tx t WHERE t.amount > 1000 AND pg_sleep(30) IS NULL",
+                "Crypto with no exchange."));
+        assertTrue(refused.reason().contains("statement timeout"));
+        assertFalse(context.isEvaluated(ruleId(UNATTRIBUTED_CRYPTO)));
+    }
+
+    @Test
+    @DisplayName("an evaluation with no explanation is refused before the query is even run")
+    void anEvaluationWithoutAnExplanationIsRefused() {
+        for (String explanation : new String[] {"   ", null, "-- ... --"}) {
+            ToolError error = assertInstanceOf(ToolError.class, tools.evaluateRule(id(SANCTIONED_WIRE),
+                    AgentTestFixtures.sqlFor(rule(SANCTIONED_WIRE)), explanation));
+            assertTrue(error.error().contains("explanation is required"), error.error());
+        }
+        assertInstanceOf(ToolError.class, tools.evaluateRule(id(SANCTIONED_WIRE), "   ",
+                "A query would go here."));
 
         assertFalse(context.isEvaluated(ruleId(SANCTIONED_WIRE)),
-                "a refused verdict must not count towards coverage");
+                "a refused call must not count towards coverage");
         assertEquals(0, context.evaluatedCount());
+        assertEquals(0, sql.callCount(), "nothing was run, so no attempt was spent");
     }
 
     @Test
-    @DisplayName("a triggered verdict that cites nothing is refused")
-    void aTriggeredVerdictWithoutEvidenceIsRefused() {
-        ToolError error = assertInstanceOf(ToolError.class, tools.submitRuleEvaluation(
-                id(SANCTIONED_WIRE), true, 30.0, List.of(), "It looks like a sanctioned wire."));
-        assertTrue(error.error().contains("transaction_ids is required"));
-        assertFalse(context.isEvaluated(ruleId(SANCTIONED_WIRE)));
-
-        assertInstanceOf(ToolError.class, tools.submitRuleEvaluation(
-                id(SANCTIONED_WIRE), true, 30.0, null, "It looks like a sanctioned wire."));
-    }
-
-    @Test
-    @DisplayName("a transaction id that is invented, or out of the rule's scope, never reaches the record")
+    @DisplayName("a query result naming a transaction outside the rule's scope is thrown away whole")
     void evidenceOutsideTheRulesScopeIsRefused() {
         // A real transaction of this customer - but a card one, and the rule is scoped to PAYMENT.
-        UUID cardTransaction = evidence(DECLINE_BURST).getFirst();
-        ToolError outOfScope = assertInstanceOf(ToolError.class, tools.submitRuleEvaluation(
-                id(SANCTIONED_WIRE), true, 30.0, List.of(cardTransaction.toString()),
-                "This card payment went to RU."));
-        assertTrue(outOfScope.error().contains("PAYMENT scope"), outOfScope.error());
-        assertTrue(outOfScope.error().contains("NOT recorded"));
-        assertTrue(outOfScope.hint().contains("activity_type=PAYMENT"));
+        UUID cardTransaction = context.inScopeTransactionIds(ruleId(DECLINE_BURST)).getFirst();
+        sql.matching("no scope filter", List.of(cardTransaction));
 
-        // A transaction that does not exist at all.
-        assertInstanceOf(ToolError.class, tools.submitRuleEvaluation(
-                id(SANCTIONED_WIRE), true, 30.0, List.of(UUID.randomUUID().toString()),
-                "A wire to RU."));
-        // Something that is not even an id.
-        assertInstanceOf(ToolError.class, tools.submitRuleEvaluation(
-                id(SANCTIONED_WIRE), true, 30.0, List.of("transaction-1"), "A wire to RU."));
-        // One good id and one bad one is still refused: half-verified evidence is not evidence.
-        assertInstanceOf(ToolError.class, tools.submitRuleEvaluation(
-                id(SANCTIONED_WIRE), true, 30.0,
-                List.of(evidence(SANCTIONED_WIRE).getFirst().toString(), UUID.randomUUID().toString()),
-                "A wire to RU."));
+        QueryRejected outOfScope = assertInstanceOf(QueryRejected.class, tools.evaluateRule(
+                id(SANCTIONED_WIRE),
+                "SELECT t.transaction_id FROM tx t WHERE t.amount > 10000 /* no scope filter */",
+                "Everything of this customer."));
+        assertTrue(outOfScope.reason().contains("PAYMENT activity"), outOfScope.reason());
+        assertTrue(outOfScope.hint().contains("activity_type = 'PAYMENT'"), outOfScope.hint());
+
+        // One in-scope id and one out-of-scope id is still refused: half-verified evidence is not
+        // evidence, and a partial record would be worse than none.
+        sql.matching("mixed", List.of(
+                context.inScopeTransactionIds(ruleId(SANCTIONED_WIRE)).getFirst(), cardTransaction));
+        assertInstanceOf(QueryRejected.class, tools.evaluateRule(id(SANCTIONED_WIRE),
+                "SELECT t.transaction_id FROM tx t WHERE t.amount > 10000 /* mixed */",
+                "Payments and cards."));
 
         assertFalse(context.isEvaluated(ruleId(SANCTIONED_WIRE)));
     }
 
     @Test
-    @DisplayName("a rule with nothing in scope cannot be triggered")
-    void aRuleWithAnEmptyScopeCannotBeTriggered() {
-        RiskRule empty = AgentTestFixtures.ruleConditionedByAnAttacker("Any transaction at all.");
-        AnalysisTrace ownTrace = AgentTestFixtures.trace(UUID.randomUUID());
-        AgentRunContext emptyContext = AgentTestFixtures.contextOver(UUID.randomUUID(), ownTrace,
-                List.of(empty), List.of());
-        RiskAgentTools emptyTools =
-                new RiskAgentTools(emptyContext, null, null, JsonMapper.builder().build(), 25);
-
-        ToolError error = assertInstanceOf(ToolError.class, emptyTools.submitRuleEvaluation(
-                empty.getRuleId().toString(), true, 5.0, List.of(), "I believe it triggered."));
-        assertTrue(error.error().contains("no transactions in scope"));
-        assertTrue(error.hint().contains("triggered=false"));
-
-        VerdictAck ack = assertInstanceOf(VerdictAck.class, emptyTools.submitRuleEvaluation(
-                empty.getRuleId().toString(), false, 0.0, List.of(),
-                "The customer has no transactions on file."));
-        assertTrue(ack.accepted());
-        assertEquals(0, ack.verdictsStillRequired());
-    }
-
-    @Test
-    @DisplayName("submitting the same rule twice replaces the verdict without double-counting coverage")
-    void resubmittingARuleReplacesItsVerdict() {
-        tools.submitRuleEvaluation(id(STRUCTURING), false, 0.0, List.of(),
-                "Three payments, but they look routine to me.");
+    @DisplayName("evaluating the same rule twice replaces the verdict without double-counting coverage")
+    void reevaluatingARuleReplacesItsVerdict() {
+        evaluate(STRUCTURING, "Payments of 9,000-9,999, but only two of them.");
         assertEquals(1, context.evaluatedCount());
+        assertTrue(context.verdict(ruleId(STRUCTURING)).triggered());
 
-        VerdictAck second = assertInstanceOf(VerdictAck.class, tools.submitRuleEvaluation(
-                id(STRUCTURING), true, 20.0, evidenceIds(STRUCTURING),
-                "On reflection: three payments of 9,500-9,700 inside 24 hours is structuring."));
+        // The same thresholds, expressed without the fragment the stub keys the first answer on,
+        // so this query is one PostgreSQL answers with no rows.
+        VerdictAck second = assertInstanceOf(VerdictAck.class, tools.evaluateRule(id(STRUCTURING),
+                "SELECT t.transaction_id FROM tx t WHERE t.activity_type = 'PAYMENT' AND t.amount "
+                        + ">= 9000 AND t.amount <= 9999 AND t.amount < 10000 AND (SELECT count(*) "
+                        + "FROM tx w WHERE w.created_at > t.created_at - INTERVAL '24 hours') >= 30",
+                "On reflection, the condition is about the pattern, not the single payment."));
         assertEquals(1, context.evaluatedCount(), "the same rule must not be counted twice");
         assertEquals(3, second.verdictsStillRequired());
-        assertTrue(context.verdict(ruleId(STRUCTURING)).triggered());
+        assertFalse(second.triggered(), "the replacement verdict is the new query's result");
+        assertFalse(context.verdict(ruleId(STRUCTURING)).triggered());
     }
 
     @Test
     @DisplayName("submit_final_assessment refuses to end an incomplete analysis")
     void finalAssessmentIsRejectedWhileRulesAreOpen() {
         FinalAck rejected = assertInstanceOf(FinalAck.class,
-                tools.submitFinalAssessment("HIGH", "All done.", "File a report."));
+                tools.submitFinalAssessment("HIGH", "All done.", "File a report.", null));
 
         assertFalse(rejected.accepted());
         assertEquals(4, rejected.verdictsStillRequired());
@@ -310,16 +470,19 @@ class RiskAgentToolsTest {
     @DisplayName("submit_final_assessment is accepted once every rule has a verdict")
     void finalAssessmentIsAcceptedWhenCoverageIsComplete() {
         for (RiskRule rule : rules) {
-            tools.submitRuleEvaluation(rule.getRuleId().toString(), false, 0.0, List.of(),
-                    "Checked against the condition and not met.");
+            tools.evaluateRule(rule.getRuleId().toString(),
+                    AgentTestFixtures.faithfulSqlThatMatchesNothing(rule),
+                    "Nothing of this customer is anywhere near that size.");
         }
         FinalAck accepted = assertInstanceOf(FinalAck.class,
-                tools.submitFinalAssessment("critical", "Serious findings.", "Escalate."));
+                tools.submitFinalAssessment("low", "Nothing found.", "Periodic review.", null));
 
         assertTrue(accepted.accepted());
         assertEquals(0, accepted.verdictsStillRequired());
+        assertEquals(4, accepted.verdictsSubmitted(), "coverage is complete on an accepted run");
         assertTrue(context.isConcluded());
-        assertEquals(com.sq.caa.domain.RiskLevel.CRITICAL, context.finalAssessment().riskLevel());
+        assertEquals(RiskLevel.LOW, context.finalAssessment().riskLevel());
+        assertEquals(RiskLevel.LOW.name(), accepted.mechanicalRiskLevel());
     }
 
     @Test
@@ -408,22 +571,28 @@ class RiskAgentToolsTest {
                 .orElseThrow(() -> new AssertionError("no rule named " + ruleName + " in the checklist"));
     }
 
+    private static ToolDefinition definition(ToolCallback[] callbacks, String name) {
+        return List.of(callbacks).stream()
+                .map(ToolCallback::getToolDefinition)
+                .filter(definition -> name.equals(definition.name()))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no tool named " + name));
+    }
+
+    private RiskRule rule(String ruleName) {
+        return AgentTestFixtures.ruleNamed(rules, ruleName);
+    }
+
     private UUID ruleId(String ruleName) {
-        return AgentTestFixtures.ruleNamed(rules, ruleName).getRuleId();
+        return rule(ruleName).getRuleId();
     }
 
     private String id(String ruleName) {
         return ruleId(ruleName).toString();
     }
 
-    /** Ids of the transactions a rule really applies to - the only evidence the tool will accept. */
-    private List<UUID> evidence(String ruleName) {
-        List<UUID> inScope = context.inScopeTransactionIds(ruleId(ruleName));
-        assertFalse(inScope.isEmpty(), ruleName + " should have transactions in scope");
-        return inScope;
-    }
-
-    private List<String> evidenceIds(String ruleName) {
-        return evidence(ruleName).stream().map(UUID::toString).toList();
+    /** One evaluate_rule call with the query the fixture writes for that rule. */
+    private Object evaluate(String ruleName, String explanation) {
+        return tools.evaluateRule(id(ruleName), AgentTestFixtures.sqlFor(rule(ruleName)), explanation);
     }
 }

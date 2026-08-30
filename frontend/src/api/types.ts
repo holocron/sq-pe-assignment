@@ -5,10 +5,12 @@
  * are UUID strings and timestamps are ISO-8601 UTC strings unless noted
  * otherwise.
  *
- * `threshold_logic` holds natural language: the agent reads the rule condition,
- * fetches the customer's data with its tools and judges it. Nothing parses that
- * column and nothing recomputes a verdict, so every score on these pages is a
- * model's estimate, capped at the rule's weight.
+ * `threshold_logic` holds natural language, but the agent no longer answers it
+ * from memory: it writes a SQL query that expresses the condition, Postgres runs
+ * it, and the verdict is derived mechanically from the result — triggered means
+ * the query returned rows. The score is then the rule's weight, or 0.00. So the
+ * per-rule payloads carry the query and how it was answered, and the UI can show
+ * a reviewer the exact statement that decided each verdict.
  *
  * Anything that arrives in a shape the backend may serialise differently
  * (Spring `Page`, the trace JSONB, the per-type activity detail) has a `*Wire`
@@ -61,12 +63,17 @@ export type AnalysisStatus = (typeof ANALYSIS_STATUSES)[number]
 /**
  * Where a rule verdict came from — rendered on the coverage table.
  *
- * There is exactly one origin: `threshold_logic` is natural language, the agent
- * reads it, fetches the evidence and judges it. Nothing recomputes or overrules
- * that verdict, so the value is kept (and shown) to tell a reviewer plainly that
- * what they are reading is a model's judgement rather than a calculation.
+ * `SQL_DERIVED` is what a current run produces (`RuleVerdictSource.SQL_DERIVED`):
+ * the agent wrote a query for the rule condition, Postgres executed it, and
+ * "triggered" means the query returned rows. The model chose the query; it never
+ * made the comparison.
+ *
+ * `AGENT_JUDGED` is the older origin, where the model read the condition and
+ * decided the verdict itself. Runs stored that way are still readable from
+ * `analysis_runs.trace` and must keep saying so — a reviewer opening one has to
+ * see that the arithmetic behind it was the model's, not the database's.
  */
-export const EVALUATION_SOURCES = ['AGENT_JUDGED'] as const
+export const EVALUATION_SOURCES = ['SQL_DERIVED', 'AGENT_JUDGED'] as const
 export type EvaluationSource = (typeof EVALUATION_SOURCES)[number]
 
 export const KNOWLEDGE_DOCUMENT_STATUSES = [
@@ -426,12 +433,15 @@ export interface ActivityQueryParams extends PageParams {
 
 /**
  * `risk_rules.threshold_logic` is prose, not a machine-parseable expression.
- * The ReAct agent reads it verbatim, fetches the customer's data with its tools
- * and judges whether the rule is triggered and what score it contributes.
+ * The ReAct agent reads it verbatim and translates it into a SQL query for this
+ * customer; Postgres runs the query and the verdict follows mechanically from
+ * whether it returned rows. The score is then the rule's `weight`, or 0.00.
  *
  * Two consequences the UI must never hide:
- *  - the score for a rule is the agent's *estimate*, capped at `weight`;
- *  - two runs over identical data may reach different verdicts.
+ *  - the comparison is exact, but the *query* is the model's work, so two runs
+ *    over identical data may still phrase the condition differently;
+ *  - how the condition is written therefore affects correctness, which is why
+ *    the rule editor coaches one threshold per sentence.
  */
 export interface RiskRule {
   ruleId: UUID
@@ -644,6 +654,35 @@ export interface AnalysisSummary {
 }
 
 /**
+ * The query that decided one rule, and how Postgres answered it.
+ *
+ * Mirrors `com.sq.caa.sql.SqlRuleResult`. This is the audit trail of a verdict:
+ * the fragment the agent wrote, the full statement that was actually executed
+ * after the backend scoped it to the customer, and the outcome. `ok` is false
+ * when the validator refused the query or the database errored — a rule in that
+ * state has no verdict at all, which is a coverage failure and never a quiet
+ * "not triggered".
+ */
+export interface SqlEvaluation {
+  /** The `SELECT` fragment the agent wrote for the rule condition. */
+  sql: string | null
+  /** The full wrapped statement that ran, kept verbatim for the audit trail. */
+  effectiveSql: string | null
+  /** False when the query was rejected by validation or Postgres errored. */
+  ok: boolean
+  /** True total of matching transactions, even when the id list was capped. */
+  matchedCount: number | null
+  /** The returned id list was truncated; `matchedCount` is still the true total. */
+  capped: boolean
+  /** The validator's reason for refusing to run the query. */
+  rejectionReason: string | null
+  /** The Postgres error message. */
+  errorMessage: string | null
+  /** Wall-clock time of the query, in milliseconds. */
+  ms: number | null
+}
+
+/**
  * One row of `risk_assessments`, joined with its rule for display —
  * `AnalysisDtos.RuleEvaluationView`.
  *
@@ -656,21 +695,24 @@ export interface RuleEvaluation {
   ruleName: string
   appliesTo?: RuleScope | null
   weight?: number | null
+  /** Whether the rule's query returned rows. Not a model opinion. */
   triggered: boolean
-  /** `risk_assessments.score_contribution` — 0.00 when not triggered. */
+  /** `risk_assessments.score_contribution` — the rule's weight, or 0.00. */
   score: number
   source: EvaluationSource
   /** How many of the customer's transactions were in the rule's scope. */
   evaluatedTransactionCount?: number | null
   matchedCount?: number | null
-  /** The transactions the agent cited as evidence. Empty, never absent. */
+  /** The transactions the query returned. Empty, never absent. */
   matchedTransactionIds: UUID[]
-  /** The agent's reasoning — the only account there is of why it decided this. */
+  /**
+   * The agent's account of the verdict. On a SQL-derived one it is what the
+   * query looks for — the model is not allowed to state the outcome there,
+   * because the outcome came from the row count and not from it.
+   */
   rationale?: string | null
-  /** What the model asked for before the backend capped it at the rule's weight. */
-  claimedScore?: number | null
-  /** True when `claimedScore` exceeded the weight and `score` is the capped value. */
-  scoreClamped?: boolean | null
+  /** The query that produced this verdict. Absent on runs stored before the change. */
+  sql?: SqlEvaluation | null
 }
 
 export interface ToolCallTraceStep {
@@ -689,6 +731,12 @@ export interface ToolCallTraceStep {
   subject?: string | null
   /** How the call ended - `triggered +30.00 (rule 3 of 12)`, `2 of 4 transactions`. */
   outcome?: string | null
+  /**
+   * For an `evaluate_rule` step: the query and how Postgres answered it. The key
+   * is omitted rather than nulled when the step carried none, so a trace stored
+   * before the change normalises to exactly the shape it always had.
+   */
+  sql?: SqlEvaluation
 }
 
 export interface AssistantTraceStep {
@@ -762,10 +810,21 @@ interface AnalysisCoverageCounters {
   coveragePercent?: number | null
   triggeredRuleCount?: number | null
   /**
-   * The band the model itself proposed, kept alongside `riskLevel` (which is the
-   * sum of its own per-rule scores, banded) so the two can be compared.
+   * The band the totals alone produce: the summed weights of the rules whose
+   * query returned rows, banded. Nothing about it is a model opinion.
+   */
+  mechanicalRiskLevel?: RiskLevel | null
+  /**
+   * The band the agent proposed. It may sit above {@link #mechanicalRiskLevel},
+   * never below it, and `riskLevel` is the one that stands.
    */
   agentRiskLevel?: RiskLevel | null
+  /**
+   * Why the agent raised the band above the mechanical one. Present exactly when
+   * it escalated — an override with no reason recorded is itself a finding, so
+   * the UI says so rather than hiding the escalation.
+   */
+  escalationJustification?: string | null
 }
 
 /** `GET /api/analyses/{assessmentId}`. */
@@ -784,9 +843,24 @@ export interface AnalysisResultWire extends AnalysisSummary, AnalysisCoverageCou
   trace?: AnalysisTrace | JsonObject | JsonObject[] | string | null
 }
 
-/** `matchedTransactionIds` is defaulted to `[]` by `normalizeRuleEvaluation`. */
-export interface RuleEvaluationWire extends Omit<RuleEvaluation, 'matchedTransactionIds'> {
+/**
+ * `matchedTransactionIds` is defaulted to `[]` by `normalizeRuleEvaluation`.
+ *
+ * The query block is accepted either nested under `sql` or flattened onto the
+ * evaluation, because it is `SqlRuleResult` mapped onto a DTO and Jackson can
+ * legitimately serialise it either way. `normalizeRuleEvaluation` collapses both
+ * into {@link SqlEvaluation}, so nothing downstream has to know which arrived.
+ */
+export interface RuleEvaluationWire
+  extends Omit<RuleEvaluation, 'matchedTransactionIds' | 'sql'> {
   matchedTransactionIds?: UUID[] | null
+  sql?: SqlEvaluation | string | null
+  effectiveSql?: string | null
+  sqlOk?: boolean | null
+  sqlMs?: number | null
+  rejectionReason?: string | null
+  errorMessage?: string | null
+  capped?: boolean | null
 }
 
 /** Payload pushed over `GET /api/analyses/{assessmentId}/stream`. */

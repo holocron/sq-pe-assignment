@@ -1,10 +1,11 @@
 /**
  * Admin screen for the risk-rule catalogue.
  *
- * `risk_rules.threshold_logic` is prose: the agent reads each condition, fetches
- * the customer's data with its tools and judges the verdict itself. The table
- * therefore shows the condition as written rather than a rendering of a parsed
- * expression, and the editor is an authoring tool for that prose.
+ * `risk_rules.threshold_logic` is prose: the agent reads each condition and
+ * writes the SQL that answers it, and the row count Postgres returns is the
+ * verdict. The table therefore shows the condition as written rather than a
+ * rendering of a parsed expression, and the editor is an authoring tool for that
+ * prose — prose that has to survive being translated into a query.
  */
 import { Copy, Database, ListFilter, Pencil, Plus, Scale, Trash2 } from 'lucide-react'
 import { useMemo, useState } from 'react'

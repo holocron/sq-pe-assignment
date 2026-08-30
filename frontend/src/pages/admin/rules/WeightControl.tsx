@@ -48,7 +48,7 @@ export function WeightControl({
         >
           Weight
           <span className="ml-1.5 font-normal normal-case text-subtle">
-            the most this rule can add to the score
+            what this rule adds to the score when it fires
           </span>
         </label>
         {valid ? (
@@ -129,8 +129,8 @@ export function WeightControl({
       </div>
 
       <p className="text-2xs leading-relaxed text-subtle">
-        The agent estimates this rule’s contribution and the backend caps it at the weight, so the
-        score recorded for a triggered rule is between 0 and{' '}
+        A rule whose query returns rows contributes exactly this weight; one whose query returns
+        none contributes 0.00. Nothing in between is estimated, so a triggered rule scores{' '}
         <span className="numeric">{valid ? formatNumber(weight, { maximumFractionDigits: 2 }) : '—'}</span>.
         {weight > SCALE_MAX ? ' A weight above 100 exceeds the whole risk scale on its own.' : ''}
         {otherRulesWeight !== null && valid

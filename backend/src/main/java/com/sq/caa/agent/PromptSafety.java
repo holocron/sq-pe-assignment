@@ -24,14 +24,16 @@ import java.util.regex.Pattern;
  * obeyed.
  *
  * <p>This is defence in depth, and it is worth being exact about what it does and does not buy now
- * that the agent - not an engine - decides every verdict. Injected text cannot remove a rule from
- * the run: the coverage set is fixed before the first turn and a run that ends with a rule unjudged
- * is recorded as failed. It cannot invent evidence either: {@code submit_rule_evaluation} rejects
- * transaction ids outside the rule's scope and caps every score at the rule's weight, and the
- * total is arithmetic over those capped scores. What it could reach, if the fencing failed, is the
- * model's judgement of a rule and the prose a reviewer reads - which is exactly why every untrusted
- * value is labelled as data here and why {@link AgentPrompts#system()} tells the model, up front,
- * that a rule's own text can never change the procedure.
+ * that a rule's condition is prose the agent turns into a query. Injected text cannot remove a rule
+ * from the run: the coverage set is fixed before the first turn and a run that ends with a rule
+ * unjudged is recorded as failed. It cannot decide a verdict either: the verdict is whether the
+ * query returned rows and the score is the rule's weight, neither of which the model supplies, and
+ * {@code evaluate_rule} rejects a result naming transactions outside the rule's scope. Nor can it
+ * lower the band, which is the summed weights of the rules whose queries matched and may only be
+ * raised. What it could reach, if the fencing failed, is which query the model writes and the prose
+ * a reviewer reads - which is exactly why every untrusted value is labelled as data here and why
+ * {@link AgentPrompts#system()} tells the model, up front, that a rule's own text can never change
+ * the procedure.
  */
 public final class PromptSafety {
 

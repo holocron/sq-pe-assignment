@@ -148,7 +148,7 @@ public final class ToolPayloads {
     // ------------------------------------------------------------------
 
     /**
-     * One rule of the checklist as the agent must judge it.
+     * One rule of the checklist as the agent must answer it.
      *
      * <p>{@code condition} is {@code risk_rules.threshold_logic}: the rule condition written in
      * prose by a bank administrator. It directs the analysis, but it is still administrator input
@@ -176,43 +176,95 @@ public final class ToolPayloads {
     }
 
     // ------------------------------------------------------------------
-    // submit_rule_evaluation / submit_final_assessment
+    // evaluate_rule / submit_final_assessment
     // ------------------------------------------------------------------
 
     public record MissingRule(String ruleId, String ruleName, String appliesTo) {
     }
 
     /**
-     * The answer to {@code submit_rule_evaluation}.
+     * The answer to a successful {@code evaluate_rule}: what PostgreSQL decided.
      *
-     * <p>It reports back exactly what was recorded, because the verdict is final: nothing downstream
-     * re-judges the rule. {@code recordedScore} is the agent's estimate after clamping to
-     * {@code weightCap}, and {@code scoreClamped} says so out loud when the model asked for more
-     * than the rule's weight.
+     * <p>Every field here is a fact about the query result rather than anything the model proposed.
+     * {@code triggered} is {@code matchedTransactions > 0}, {@code score} is {@code weight} or zero,
+     * and {@code matchedTransactionIds} are the rows the query returned. It is echoed back in full
+     * so the model can see the verdict it did <em>not</em> get to choose, and so it can cite the
+     * matched transactions in its summary without inventing any.
+     *
+     * <p>{@code sql} is the model's own fragment, <b>not</b> the wrapped statement that executed.
+     * The two differ by 1,300 characters of identical boilerplate, and a run that echoed the wrapper
+     * back for all twelve rules spent thousands of tokens of a 32k context window repeating text the
+     * model wrote itself - one live run died on "Context size has been exceeded" doing it. The
+     * executed statement is kept where it is actually needed: in {@link AgentRuleVerdict}, in the
+     * trace, and on the analysis screen.
      */
     public record VerdictAck(
             boolean accepted,
             String ruleId,
             String ruleName,
-            boolean recordedAsTriggered,
-            BigDecimal recordedScore,
-            BigDecimal weightCap,
-            boolean scoreClamped,
-            int matchedTransactionsRecorded,
+            boolean triggered,
+            BigDecimal score,
+            BigDecimal weight,
+            int matchedTransactions,
+            boolean matchedIdsCapped,
+            List<String> matchedTransactionIds,
+            String sql,
+            long queryMs,
             int rulesTotal,
             int verdictsSubmitted,
             int verdictsStillRequired,
             List<MissingRule> rulesStillMissingAVerdict,
             String note,
             String nextAction) {
+
+        public VerdictAck {
+            matchedTransactionIds = matchedTransactionIds == null ? List.of()
+                    : List.copyOf(matchedTransactionIds);
+            rulesStillMissingAVerdict = rulesStillMissingAVerdict == null ? List.of()
+                    : List.copyOf(rulesStillMissingAVerdict);
+        }
     }
 
+    /**
+     * The answer to an {@code evaluate_rule} whose query never produced an answer.
+     *
+     * <p>Nothing was recorded: the rule is still outstanding and still has to be judged. That is the
+     * point of returning a document rather than an error - {@code reason} is what the validator or
+     * PostgreSQL actually said, so the model can repair the query, and {@code attemptsRemaining}
+     * says how much rope it has left before the rule is abandoned as unjudged and the run fails.
+     * {@code sql} is the fragment the model sent, echoed back so the reason and the statement it
+     * refers to arrive together.
+     */
+    public record QueryRejected(
+            boolean accepted,
+            String ruleId,
+            String ruleName,
+            String reason,
+            String sql,
+            int attemptsUsed,
+            int attemptsRemaining,
+            int verdictsStillRequired,
+            String hint) {
+    }
+
+    /**
+     * The answer to {@code submit_final_assessment}.
+     *
+     * <p>{@code mechanicalRiskLevel} is {@code totalScore} banded, and {@code totalScore} is the sum
+     * of scores no model chose. It is reported back on acceptance and on refusal alike, because it
+     * is the floor: the agent may record a band above it with a justification - {@code escalated} -
+     * and may never record one below it.
+     */
     public record FinalAck(
             boolean accepted,
             int rulesTotal,
             int verdictsSubmitted,
             int verdictsStillRequired,
             List<MissingRule> rulesStillMissingAVerdict,
+            String recordedRiskLevel,
+            String mechanicalRiskLevel,
+            BigDecimal totalScore,
+            boolean escalated,
             String message) {
     }
 

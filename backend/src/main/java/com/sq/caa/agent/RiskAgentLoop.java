@@ -41,12 +41,14 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * the database gets to decide when the analysis is over except the code below.
  *
  * <h2>The rule-coverage guarantee</h2>
- * <p>The agent is the only source of verdicts: a rule condition is prose, the model reads it, uses
- * its data tools and judges it. There is no engine left to quietly close a rule the model skipped,
- * so coverage is guaranteed by refusing to call such a run finished rather than by filling the gap.
+ * <p>A rule condition is prose; the model reads it, writes the SELECT that answers it and
+ * {@code evaluate_rule} runs that query. There is no engine left to quietly close a rule the model
+ * skipped, so coverage is guaranteed by refusing to call such a run finished rather than by filling
+ * the gap.
  * <ol>
  *   <li>The coverage set is fixed in the {@link AgentRunContext} before the first turn.</li>
- *   <li>{@code submit_rule_evaluation} is the only way into the evaluated set.</li>
+ *   <li>{@code evaluate_rule} is the only way into the evaluated set, and only a query that actually
+ *       executed gets a rule in. A rejected or failed query records nothing.</li>
  *   <li>If the model tries to conclude - by calling {@code submit_final_assessment} or simply by
  *       answering without any tool call - while a rule is still unjudged, the loop does <b>not</b>
  *       exit. It records a {@code coverage_reprompt} step, appends a user message naming every
@@ -60,9 +62,18 @@ import tools.jackson.databind.node.JsonNodeFactory;
  *       reported as {@code COMPLETED}.</li>
  * </ol>
  *
- * <p>The cost of this design is stated rather than hidden: scores are the model's estimates, so two
- * runs of the same customer can differ. What does not vary is the coverage claim - a
- * {@code COMPLETED} run has a verdict for every applicable rule, or it is not {@code COMPLETED}.
+ * <h2>Which band is recorded</h2>
+ * <p>{@link #settle} sums the per-rule scores - each one a rule's weight because that rule's query
+ * returned rows, or zero because it did not - and bands the total. That mechanical band is the floor.
+ * The agent's own proposal is honoured only when it is <em>higher</em> and comes with a
+ * justification, which is recorded beside it; anything lower is discarded here exactly as the tool
+ * refuses it, so a narrative can never talk a scored breach down into a clean review.
+ *
+ * <p>The cost of this design is stated rather than hidden: the model writes the query afresh each
+ * run, so two runs of the same customer can differ. What does not vary is what happens once a query
+ * has run - the verdict is its row count and the score is the rule's weight, never an estimate - and
+ * the coverage claim: a {@code COMPLETED} run has a verdict for every applicable rule, or it is not
+ * {@code COMPLETED}.
  */
 @Component
 public class RiskAgentLoop {
@@ -221,7 +232,7 @@ public class RiskAgentLoop {
                     List<RiskRule> stillMissing = context.missingRules();
                     if (stillMissing.isEmpty()) {
                         // A later tool call in the same batch closed the coverage set - the model
-                        // emitted [submit_final_assessment, submit_rule_evaluation] in one turn.
+                        // emitted [submit_final_assessment, evaluate_rule] in one turn.
                         // Telling it that "0 rule(s) still have no verdict" would be a lie and would
                         // burn a coverage reprompt on a run that is now ready to conclude; ask it for
                         // the conclusion instead.
@@ -425,12 +436,17 @@ public class RiskAgentLoop {
 
     /**
      * Turns the agent's verdicts into the run's result: one {@link RuleOutcome} per rule it judged,
-     * the total score, the band, and the list of rules it never judged.
+     * the total score, the band that is actually recorded, and the list of rules it never judged.
      *
      * <p>Nothing is invented here. A rule with no verdict produces no outcome and therefore no
      * {@code risk_assessments} row - writing "not triggered, 0.00" for a rule nobody looked at would
      * be a false record - and it is instead named in {@link AgentRunResult#unjudgedRules()}, which is
      * what makes the run fail.
+     *
+     * <p>Nothing is re-judged here either. Each outcome carries the verdict PostgreSQL gave, the ids
+     * its query returned and the query itself; this method only sums, bands and applies the one
+     * discretionary move the agent has - an escalation above the mechanical band, taken only when it
+     * is upwards and justified.
      *
      * <p>Called after every loop, and on its own when the conversation broke part-way.
      */
@@ -447,9 +463,9 @@ public class RiskAgentLoop {
                 continue;
             }
             List<UUID> inScope = context.inScopeTransactionIds(ruleId);
-            // Every matched id was checked against this rule's scope by submit_rule_evaluation
-            // before the verdict was recorded, so the rows written from here cannot name a
-            // transaction the rule does not apply to.
+            // Every matched id came out of the query and was checked against this rule's scope by
+            // evaluate_rule before the verdict was recorded, so the rows written from here cannot
+            // name a transaction the rule does not apply to.
             List<UUID> matched = verdict.transactionIds();
             BigDecimal score = verdict.triggered() ? scale(verdict.score()) : ZERO;
             total = total.add(score);
@@ -460,14 +476,13 @@ public class RiskAgentLoop {
                     scale(rule.getWeight()),
                     verdict.triggered(),
                     score,
-                    RuleVerdictSource.AGENT_JUDGED,
+                    RuleVerdictSource.SQL_DERIVED,
                     inScope.size(),
-                    matched.size(),
+                    verdict.matchedCount(),
                     matched,
                     inScope,
-                    verdict.rationale(),
-                    verdict.claimedScore(),
-                    verdict.scoreClamped()));
+                    verdict.explanation(),
+                    verdict.sql()));
         }
 
         if (!unjudged.isEmpty()) {
@@ -476,22 +491,38 @@ public class RiskAgentLoop {
                     unjudged.stream().map(UnjudgedRule::ruleName).toList());
         }
 
-        RiskLevel banded = RiskLevel.forScore(total);
+        // The floor: the summed weights of the rules whose queries returned rows, banded. Every term
+        // of it came out of a query result, which is why the agent may only argue it upwards.
+        RiskLevel mechanical = RiskLevel.forScore(total);
         FinalAssessment conclusion = context.finalAssessment();
+        // An escalation is honoured only when it is one - higher than the floor and justified. The
+        // tool already refuses anything else, but the prose path has no tool to refuse it, so the
+        // decision is taken here as well and both paths land on the same rule.
+        boolean escalated = conclusion != null && conclusion.escalates(mechanical);
+        RiskLevel recorded = conclusion == null ? mechanical : conclusion.bandOver(mechanical);
+        String justification = escalated ? conclusion.escalationJustification() : null;
+        if (conclusion != null && conclusion.riskLevel() != null && !escalated
+                && conclusion.riskLevel() != mechanical) {
+            log.info("Analysis {}: the agent proposed {} but the rule scores band to {}; {} was "
+                            + "recorded", context.assessmentId(), conclusion.riskLevel(), mechanical,
+                    mechanical);
+        }
         String summary = conclusion != null && conclusion.summary() != null
                 ? conclusion.summary()
-                : fallbackSummary(context, outcomes, unjudged, total, banded);
+                : fallbackSummary(context, outcomes, unjudged, total, mechanical);
         String recommendations = conclusion != null && conclusion.recommendations() != null
                 ? conclusion.recommendations()
-                : fallbackRecommendations(outcomes, unjudged, banded);
+                : fallbackRecommendations(outcomes, unjudged, recorded);
 
-        context.trace().finalStep(banded.name(), summary, total, context.ruleCount(),
-                unjudged.isEmpty());
+        context.trace().finalStep(recorded.name(), mechanical.name(), justification, summary, total,
+                context.ruleCount(), unjudged.isEmpty());
 
         return new AgentRunResult(
                 context.assessmentId(),
-                banded,
+                recorded,
+                mechanical,
                 conclusion == null ? null : conclusion.riskLevel(),
+                justification,
                 total,
                 summary,
                 recommendations,
@@ -535,7 +566,8 @@ public class RiskAgentLoop {
                     .append(" judged rules were found to be breached: ").append(names).append('.');
         }
         summary.append(" Total score ").append(total.toPlainString()).append(", banded ")
-                .append(banded).append(", from the analyst's own per-rule estimates.");
+                .append(banded).append(", summed from the weights of the rules whose queries "
+                        + "returned rows.");
         return summary.toString();
     }
 

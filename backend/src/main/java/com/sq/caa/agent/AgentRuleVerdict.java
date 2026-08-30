@@ -6,37 +6,41 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * The agent's judgement of one rule, as submitted through {@code submit_rule_evaluation}.
+ * One rule's verdict, as PostgreSQL answered it.
  *
- * <p>This is the whole verdict: there is no engine behind it to confirm or overturn it. What the
- * tool accepts is therefore what gets scored and what a compliance officer reads, which is why the
- * tool validates hard before a verdict is ever recorded - a rationale is mandatory, matched
- * transaction ids must belong to the rule's own scope, and the score is clamped to the rule's
- * weight.
+ * <p>Nothing here is the model's opinion. The agent wrote a SELECT expressing the rule's condition
+ * and {@code evaluate_rule} ran it; {@link #triggered()} is {@code matchedCount > 0},
+ * {@link #score()} is the rule's weight or zero, and {@link #transactionIds()} are the ids the query
+ * returned. The one model-authored field is {@link #explanation()} - what the query was looking for
+ * - which is what a compliance officer reads as the reason. It cannot contradict the verdict,
+ * because the verdict was not taken from it.
  *
- * @param score        the score after clamping; this is what the run is scored on
- * @param claimedScore the number the model actually asked for, or {@code null} when it named none.
- *                     Kept so that {@link #scoreClamped()} can say honestly that the model tried to
- *                     award a rule more than its weight
+ * @param score          the rule's weight when the query matched, {@code 0.00} when it did not
+ * @param matchedCount   how many rows the query returned in total, even when the id list was capped
+ * @param transactionIds the matched transaction ids, possibly capped by the evaluator
+ * @param sql            the full SQL that was actually executed, kept for the audit trail
+ * @param queryMs        how long PostgreSQL took
  */
 public record AgentRuleVerdict(
         UUID ruleId,
         boolean triggered,
         BigDecimal score,
-        BigDecimal claimedScore,
+        int matchedCount,
         List<UUID> transactionIds,
-        String rationale,
+        String explanation,
+        String sql,
+        long queryMs,
         Instant submittedAt) {
 
     public AgentRuleVerdict {
         transactionIds = transactionIds == null ? List.of() : List.copyOf(transactionIds);
-        // The rationale is rendered verbatim in the coverage table, so it gets the same
-        // cleaning as the final narrative - see Narrative.
-        rationale = Narrative.clean(rationale);
+        // The explanation is rendered verbatim in the coverage table, so it gets the same cleaning
+        // as the final narrative - see Narrative.
+        explanation = Narrative.clean(explanation);
     }
 
-    /** True when the model asked for a score the rule's weight did not allow. */
-    public boolean scoreClamped() {
-        return claimedScore != null && score != null && claimedScore.compareTo(score) != 0;
+    /** True when the evaluator returned fewer ids than it matched, i.e. the list was truncated. */
+    public boolean matchedIdsCapped() {
+        return matchedCount > transactionIds.size();
     }
 }

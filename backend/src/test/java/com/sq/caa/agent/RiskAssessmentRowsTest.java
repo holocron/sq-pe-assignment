@@ -18,7 +18,7 @@ import org.junit.jupiter.api.Test;
  * <p>Two invariants are load-bearing and are asserted here: one row exists for every (transaction,
  * rule) pair the agent judged - including the rules it found not triggered, at {@code 0.00} - and
  * the score contributed by a rule sums to exactly the score the agent gave it, which
- * {@code submit_rule_evaluation} has already capped at the rule's weight, whatever the number of
+ * {@code evaluate_rule} has already fixed at the rule's weight, whatever the number of
  * transactions cited.
  *
  * <p>A rule the agent never judged has no outcome and so appears nowhere below: that case is the
@@ -99,9 +99,9 @@ class RiskAssessmentRowsTest {
     private static RuleOutcome outcome(String name, String weight, boolean triggered, String score,
             List<UUID> matched, List<UUID> inScope) {
         return new RuleOutcome(UUID.randomUUID(), name, RuleScope.ALL, new BigDecimal(weight), triggered,
-                new BigDecimal(score), RuleVerdictSource.AGENT_JUDGED, inScope.size(), matched.size(),
-                matched, inScope, "The agent judged " + name + " from the evidence it cited.", null,
-                false);
+                new BigDecimal(score), RuleVerdictSource.SQL_DERIVED, inScope.size(), matched.size(),
+                matched, inScope, "Looks for the activity " + name + " describes.",
+                "SELECT t.transaction_id FROM tx t");
     }
 
     private static List<UUID> ids(int count) {

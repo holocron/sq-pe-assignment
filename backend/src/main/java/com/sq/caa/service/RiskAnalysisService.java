@@ -60,8 +60,10 @@ import tools.jackson.databind.node.ObjectNode;
  * {@code RUNNING} in one of two ways - completed or failed with the reason recorded - because the
  * worker's {@code finally} block always writes an end state.
  *
- * <p><b>Why a run can fail on coverage alone.</b> The agent is the only source of verdicts: it reads
- * each rule's condition, gathers the evidence and judges it. Nothing fills in a rule it skipped. So
+ * <p><b>Why a run can fail on coverage alone.</b> A verdict exists only where a query ran: the agent
+ * reads each rule's condition, writes the SELECT that answers it, and PostgreSQL decides. Nothing
+ * fills in a rule it skipped, and a rule whose query never executed is unjudged rather than
+ * cleared. So
  * the guarantee is enforced at the only place that can write {@code COMPLETED} - a run reaches that
  * status only when every applicable rule has an agent verdict, and a run that ran out of turns with
  * rules unjudged is written as {@code FAILED} with those rules named in {@code error} and in the
@@ -82,10 +84,10 @@ import tools.jackson.databind.node.ObjectNode;
  *
  * <p><b>How a rule's score is written.</b> {@code risk_assessments} carries one row per
  * (transaction, rule) pair judged - "in scope" meaning every transaction whose activity type matches
- * the rule's {@code applies_to} - and a rule's score is capped at its weight. Those two requirements
- * are reconciled by distributing the rule's score across the transactions the agent cited as
- * evidence, largest-remainder style, and writing {@code 0.00} for the in-scope transactions it did
- * not cite and for every rule it judged as not triggered. The sum of the column is then exactly the
+ * the rule's {@code applies_to} - and a rule contributes exactly its weight, once. Those two
+ * requirements are reconciled by distributing the rule's score across the transactions its query
+ * returned, largest-remainder style, and writing {@code 0.00} for the in-scope transactions the
+ * query did not return and for every rule whose query returned nothing. The sum of the column is then exactly the
  * run's total score, and the table alone shows which rules were judged - for every rule that had at
  * least one transaction in scope. A rule whose scope is empty (an {@code ALL}-scoped rule for a
  * customer with no activity) is judged like any other but has no transaction to key a row on; for
@@ -424,6 +426,16 @@ public class RiskAnalysisService {
         if (result.agentRiskLevel() != null) {
             document.put("agentRiskLevel", result.agentRiskLevel().name());
         }
+        // The escalation pair. analysis_runs.risk_level holds the band that stands and its columns
+        // are fixed by the assignment, so the band the rule scores alone produced - and the reason
+        // the agent was allowed to raise it - are kept here. Without both, a raised band would be
+        // indistinguishable from one the arithmetic produced.
+        if (result.mechanicalRiskLevel() != null) {
+            document.put("mechanicalRiskLevel", result.mechanicalRiskLevel().name());
+        }
+        if (result.escalationJustification() != null) {
+            document.put("escalationJustification", result.escalationJustification());
+        }
         ObjectNode coverage = document.putObject("coverage");
         coverage.put("rulesTotal", result.rulesTotal());
         coverage.put("rulesEvaluated", evaluations.size());
@@ -468,7 +480,9 @@ public class RiskAnalysisService {
                 run.getCustomer().getFullName(),
                 run.getStatus(),
                 run.getRiskLevel(),
-                agentRiskLevel(stored),
+                mechanicalRiskLevel(stored, run),
+                riskLevel(stored, "agentRiskLevel"),
+                text(stored, "escalationJustification"),
                 run.getTotalScore(),
                 run.getSummary(),
                 run.getRecommendations(),
@@ -560,16 +574,36 @@ public class RiskAnalysisService {
         }
     }
 
-    private static RiskLevel agentRiskLevel(JsonNode trace) {
-        JsonNode node = trace == null ? null : trace.get("agentRiskLevel");
-        if (node == null || !node.isString()) {
+    /**
+     * The band the rule scores alone produced.
+     *
+     * <p>Read from the trace of runs written since verdicts became SQL-derived, and re-derived from
+     * the stored total for older ones - the two agree by construction, because the recorded band is
+     * only ever the banded total or an escalation above it.
+     */
+    private static RiskLevel mechanicalRiskLevel(JsonNode trace, AnalysisRun run) {
+        RiskLevel stored = riskLevel(trace, "mechanicalRiskLevel");
+        if (stored != null) {
+            return stored;
+        }
+        return run.getTotalScore() == null ? run.getRiskLevel() : RiskLevel.forScore(run.getTotalScore());
+    }
+
+    private static RiskLevel riskLevel(JsonNode trace, String field) {
+        String value = text(trace, field);
+        if (value == null) {
             return null;
         }
         try {
-            return RiskLevel.valueOf(node.stringValue());
+            return RiskLevel.valueOf(value);
         } catch (IllegalArgumentException e) {
             return null;
         }
+    }
+
+    private static String text(JsonNode trace, String field) {
+        JsonNode node = trace == null ? null : trace.get(field);
+        return node == null || !node.isString() ? null : node.stringValue();
     }
 
     private JsonNode readTree(String json) {

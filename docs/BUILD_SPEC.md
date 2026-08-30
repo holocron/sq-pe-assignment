@@ -107,6 +107,30 @@ risk_assessments(assessment_id UUID, transaction_id UUID FK->transactions, rule_
                  triggered_at TIMESTAMP, score_contribution DECIMAL(5,2))
 ```
 
+`V5__readonly_role.sql` — the sandbox the agent's SQL executes in. **It changes none of the seven
+assignment tables** — no columns, constraints, indexes or RLS. It adds:
+
+* a login role `caa_readonly` (`NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION
+  NOBYPASSRLS`, `CONNECTION LIMIT 8`) whose role-level settings are
+  `default_transaction_read_only=on, statement_timeout=5s, lock_timeout=2s,
+  idle_in_transaction_session_timeout=30s, search_path=caa_ro, work_mem=4MB,
+  hash_mem_multiplier=1, temp_file_limit=64MB`;
+* a schema `caa_ro` holding five `security_barrier` views over the five activity tables, each
+  filtered by `caa_ro.current_scope()` — a transaction-local GUC the evaluator sets as a **bound
+  parameter**. Unset, it is NULL and every view returns zero rows: the failure mode is "sees
+  nothing", never "sees everyone";
+* `REVOKE`s first, then exactly `CONNECT` on the database, `USAGE` on `caa_ro`, `SELECT` on the five
+  views and `EXECUTE` on the scope function. Nothing on `public`, nothing on any base table, no
+  `TEMPORARY`.
+
+**Deliberate deviation:** the grant is on views, not on the base tables. `GRANT SELECT ON
+public.transactions` would make `FROM public.transactions` a working cross-customer read for
+anything that got past the validator — the one guarantee that must not depend on the validator.
+
+**Superuser prerequisites** (done once by `scripts/db-setup.sh`): `ALTER ROLE caa CREATEROLE;`
+required, and `GRANT SET ON PARAMETER temp_file_limit TO caa;` optional — without it the migration
+raises a `WARNING` and carries on.
+
 ### Documented deviation — `risk_assessments` primary key
 
 The assignment lists `assessment_id` as PK, but also requires that one analysis produces
@@ -237,8 +261,41 @@ Package `com.sq.caa.agent`. Triggered by `POST /api/customers/{id}/analyses`, ru
 | `get_transaction_details` | one transaction incl. its CARD/PAYMENT/CRYPTO specifics |
 | `list_risk_rules` | every applicable rule: `rule_id`, `rule_name`, `applies_to`, the condition (fenced as data), `weight`, how many transactions are in its scope, and whether it already has a verdict |
 | `search_policy_knowledge` | **RAG** — vector similarity search over the knowledge base; returns chunks with source + section |
-| `submit_rule_evaluation` | records the agent's verdict on ONE rule: `rule_id`, `transaction_ids[]`, `triggered`, `score`, `rationale`. Validates before it records: unknown rule, blank rationale, `triggered` with no evidence, or an id that is not this customer's or not in the rule's scope are all **refused** and nothing is stored. The score is clamped to the rule's weight and the raw claim is kept |
-| `submit_final_assessment` | terminal: `risk_level`, `summary`, `recommendations` |
+| `evaluate_rule` | judges ONE rule: `rule_id`, `sql`, `explanation`. The model supplies **no verdict and no score** — its SELECT is executed and the verdict is derived from the result. Refused, storing nothing: a blank explanation, a query the sandbox or PostgreSQL will not run, a returned id outside the rule's scope, and (on any attempt but the last) a query that uses none of a number the condition states |
+| `submit_final_assessment` | terminal: `risk_level`, `summary`, `recommendations`, `escalation_justification` |
+
+### Rule verdicts — MANDATORY: the model does not compute and does not compare
+
+`threshold_logic` is prose. The agent translates it into one `SELECT`, PostgreSQL executes it, and
+everything measurable is read off the result:
+
+| | source |
+|---|---|
+| `triggered` | the query returned ≥ 1 row |
+| `score_contribution` | the rule's `weight` when triggered, `0.00` when not |
+| evidence | the `transaction_id`s the query returned |
+| summary, recommendations, risk band | the agent |
+
+Requirements:
+
+1. **The query executes in a sandbox** (`com.sq.caa.sql`) — see §Security. Four rings: an allow-list
+   validator; a wrapper that nests the fragment in CTEs filtered by a JDBC-bound customer id and
+   inner-joins its output back to that customer's transactions; a login role whose entire privilege
+   set is `SELECT` on five single-customer views; a read-only, always-rolled-back transaction under
+   `statement_timeout`, `work_mem` and `temp_file_limit`.
+2. **`ok=false` means UNJUDGED, never "not triggered".** A refused or erroring query records nothing
+   and leaves the rule outstanding. Retries are bounded by `caa.agent.max-rule-sql-attempts`
+   (default 3); the counter bounds *failures*, so a query that ran costs no budget.
+3. **Threshold fidelity.** `ThresholdFidelity` compares the numbers in the condition with the numbers
+   in the query and refuses one that uses none of a stated number, before it runs. It is bounded to
+   two prompts per rule and **must not spend a query attempt** — a prompt never reaches the database,
+   so charging it to the retry budget lets the check starve a rule of the attempts it needs to repair
+   a genuinely invalid query, which is how a live run ended with an unjudged rule.
+4. **Escalation.** The band is `RiskLevel.forScore(Σ scores)`. The agent may record a higher band
+   with a justification; a lower one is refused; a rule whose query fired can never be cleared. Both
+   bands and the justification are persisted in `analysis_runs.trace`.
+5. Scores are **not** reproducible across runs — the query is authored fresh each time. This is
+   accepted and must be stated in the UI, not hidden.
 
 ### Rule-coverage gate — MANDATORY, this is a graded requirement
 
@@ -246,7 +303,7 @@ The loop **must not be able to finish with an unevaluated rule.**
 
 1. Before the loop, load all applicable rules (`applies_to = ALL` or matching an activity type the
    customer actually has). This is the **coverage set**.
-2. Track `evaluated = {}` — filled by `submit_rule_evaluation`.
+2. Track `evaluated = {}` — filled by `evaluate_rule`, and only by a query that actually ran.
 3. When the model stops calling tools (or calls `submit_final_assessment`) while
    `coverage_set - evaluated` is non-empty, **do not exit**. Append a `UserMessage` naming the exact
    missing `rule_id` / `rule_name` values and continue the loop. Log this as a `coverage_reprompt` step.
@@ -264,8 +321,8 @@ The loop **must not be able to finish with an unevaluated rule.**
    scope" is decided by `applies_to` alone. A rule with **no** verdict writes **no** rows: a `0.00`
    row would be indistinguishable from "checked and cleared".
 
-The false-negative defence is now the gate plus the evidence rules on `submit_rule_evaluation`, not a
-second engine: the agent cannot skip a rule, and it cannot record a finding it cannot cite.
+The false-negative defence is the gate plus the SQL path, not a second engine: the agent cannot skip
+a rule, cannot record a finding it cannot cite, and cannot decide a threshold comparison at all.
 
 ### Prompting posture
 The system prompt states the bank context and that this is **asymmetric-cost** work: a missed real risk
@@ -281,17 +338,20 @@ number that did not come from a tool.
 {"steps":[{"n":1,"type":"tool_call","tool":"list_risk_rules","args":{},"result_preview":"...","ms":812,
            "outcome":"12 rules in scope"},
           {"n":2,"type":"assistant","text":"..."},
-          {"n":3,"type":"tool_call","tool":"submit_rule_evaluation","args":{"rule_id":"..."},
+          {"n":3,"type":"tool_call","tool":"evaluate_rule","args":{"rule_id":"..."},
            "result_preview":"...","ms":1421,
            "subject":"Structuring - repeated payments just below the reporting threshold",
-           "outcome":"triggered +30.00 (rule 3 of 12)"},
+           "outcome":"triggered +30.00 (rule 3 of 12)",
+           "detail":{"sql":"WITH customer AS MATERIALIZED (...) SELECT ..."}},
           {"n":4,"type":"coverage_reprompt","missing":["<rule_id>"]},
           {"n":5,"type":"coverage_failed","missing":["<rule_id>"],
            "detail":{"rules_total":12,"unjudged_rule_names":["..."]}},
-          {"n":6,"type":"final","risk_level":"HIGH"}]}
+          {"n":6,"type":"final","risk_level":"CRITICAL",
+           "detail":{"mechanical_risk_level":"HIGH","escalated":true,
+                     "escalation_justification":"..."}}]}
 ```
 The UI renders this, so keep it stable. `subject` and `outcome` are **optional** one-line labels
-written where the meaning was known — the rule name and the verdict for `submit_rule_evaluation`, the
+written where the meaning was known — the rule name and the verdict for `evaluate_rule`, the
 transaction for `get_transaction_details`, and so on. They are omitted when empty, so a step written
 before they existed is byte-identical to a note-less step today. Without them twelve rule verdicts
 render as twelve identical rows, which is the whole reason they exist.

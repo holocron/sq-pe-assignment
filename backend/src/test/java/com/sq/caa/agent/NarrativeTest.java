@@ -126,22 +126,27 @@ class NarrativeTest {
     @Test
     @DisplayName("every FinalAssessment is cleaned, whichever path built it")
     void finalAssessmentCleansBothNarratives() {
-        FinalAssessment assessment =
-                new FinalAssessment(RiskLevel.CRITICAL, NBSP.repeat(4), DEGENERATE_RUN_OUTPUT);
+        FinalAssessment assessment = new FinalAssessment(RiskLevel.CRITICAL, NBSP.repeat(3),
+                NBSP.repeat(4), DEGENERATE_RUN_OUTPUT);
 
         // A summary that says nothing is null, which is what makes the loop fall back.
         assertThat(assessment.summary()).isNull();
         assertThat(assessment.recommendations()).isEqualTo("1. File SARS ( S ) )");
+        // And a justification that says nothing is null, which is what makes an escalation
+        // inadmissible - the band cannot be raised on a reason nobody can read.
+        assertThat(assessment.escalationJustification()).isNull();
+        assertThat(assessment.escalates(RiskLevel.HIGH)).isFalse();
     }
 
     @Test
-    @DisplayName("the per-rule rationale is rendered in the coverage table, so it is cleaned too")
-    void ruleVerdictRationaleIsCleaned() {
+    @DisplayName("the per-rule explanation is rendered in the coverage table, so it is cleaned too")
+    void ruleVerdictExplanationIsCleaned() {
         AgentRuleVerdict verdict = new AgentRuleVerdict(UUID.randomUUID(), true,
-                new java.math.BigDecimal("30.00"), null, List.of(),
-                "Matched" + NBSP.repeat(5) + "five payments.", Instant.EPOCH);
+                new java.math.BigDecimal("30.00"), 5, List.of(),
+                "Looks for" + NBSP.repeat(5) + "payments above 10,000 to RU.",
+                "SELECT t.transaction_id FROM tx t", 12L, Instant.EPOCH);
 
-        assertThat(verdict.rationale()).isEqualTo("Matched five payments.");
+        assertThat(verdict.explanation()).isEqualTo("Looks for payments above 10,000 to RU.");
     }
 
     /** Longest stretch a browser cannot break, which is what widened the panel. */

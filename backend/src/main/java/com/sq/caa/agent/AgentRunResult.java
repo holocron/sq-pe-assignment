@@ -9,11 +9,13 @@ import java.util.UUID;
 /**
  * Everything one agent run produced, ready to be persisted.
  *
- * <p>{@link #totalScore()} is the sum of the scores the agent estimated for the rules it judged,
- * each already clamped to its rule's weight, and {@link #riskLevel()} is that total banded.
- * {@link #agentRiskLevel()} is the band the model itself proposed. Both are kept: the score and the
- * band can then never contradict each other, while a reviewer can still see where the model's
- * overall judgement differed from the arithmetic of its own rule scores.
+ * <p>{@link #totalScore()} is the sum of the mechanical per-rule scores - each one a rule's weight
+ * when its SQL matched and zero when it did not - and {@link #mechanicalRiskLevel()} is that total
+ * banded. {@link #riskLevel()} is the band actually recorded: the mechanical one, unless the agent
+ * escalated above it and said why, in which case {@link #escalationJustification()} carries the
+ * reason. The band can never be moved <em>down</em>, so no narrative can talk a scored breach into a
+ * clean review. {@link #agentRiskLevel()} is the band the model itself proposed, kept so a reviewer
+ * can see where its judgement differed from the arithmetic.
  *
  * <p><b>Coverage is derived, not asserted.</b> {@link #coverageComplete()} is computed from the
  * outcomes actually present, so it cannot be set true by a caller that did not earn it, and
@@ -23,7 +25,9 @@ import java.util.UUID;
 public record AgentRunResult(
         UUID assessmentId,
         RiskLevel riskLevel,
+        RiskLevel mechanicalRiskLevel,
         RiskLevel agentRiskLevel,
+        String escalationJustification,
         BigDecimal totalScore,
         String summary,
         String recommendations,
@@ -39,12 +43,18 @@ public record AgentRunResult(
         unjudgedRules = unjudgedRules == null ? List.of() : List.copyOf(unjudgedRules);
     }
 
+    /** True when the recorded band was raised above the one the rule scores band to. */
+    public boolean escalated() {
+        return mechanicalRiskLevel != null && riskLevel != null
+                && riskLevel.compareTo(mechanicalRiskLevel) > 0;
+    }
+
     /** Rules the agent actually returned a verdict for. */
     public int rulesJudged() {
         return ruleOutcomes.size();
     }
 
-    /** True only when every applicable rule ended with an agent verdict. */
+    /** True only when every applicable rule ended with a verdict. */
     public boolean coverageComplete() {
         return unjudgedRules.isEmpty() && ruleOutcomes.size() >= rulesTotal;
     }

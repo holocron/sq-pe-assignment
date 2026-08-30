@@ -30,4 +30,19 @@ ALTER SCHEMA public OWNER TO ${ROLE};
 GRANT ALL ON SCHEMA public TO ${ROLE};
 SQL
 
-echo "Database '${DB}' ready for role '${ROLE}' (pgvector + uuid-ossp installed, public schema owned by ${ROLE})."
+# Two more things only a superuser can hand over, both needed by V5__readonly_role.sql, which
+# builds the least-privilege role that the agent's SQL executes as:
+#
+#   CREATEROLE       so the migration can create caa_readonly at all. Without it V5 stops with an
+#                    exception naming the exact statement to run, rather than granting privileges
+#                    to a principal that does not exist.
+#   SET ON PARAMETER temp_file_limit is a superuser-only GUC, so ALTER ROLE caa_readonly SET
+#                    temp_file_limit is refused unless the right to set it is delegated. It caps
+#                    the disk one runaway rule query can spill; statement_timeout bounds only time.
+#                    V5 downgrades to a WARNING when this grant is absent, so setup stays optional.
+"$PSQL" -d "$DB" -v ON_ERROR_STOP=1 <<SQL
+ALTER ROLE ${ROLE} CREATEROLE;
+GRANT SET ON PARAMETER temp_file_limit TO ${ROLE};
+SQL
+
+echo "Database '${DB}' ready for role '${ROLE}' (pgvector + uuid-ossp installed, public schema owned by ${ROLE}, CREATEROLE and temp_file_limit delegated)."

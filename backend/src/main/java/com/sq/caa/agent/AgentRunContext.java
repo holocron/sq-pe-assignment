@@ -1,8 +1,11 @@
 package com.sq.caa.agent;
 
 import com.sq.caa.domain.Customer;
+import com.sq.caa.domain.RiskLevel;
 import com.sq.caa.domain.RiskRule;
 import com.sq.caa.rules.EvaluationBatch;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -24,15 +27,21 @@ import org.slf4j.LoggerFactory;
  * Mutable state of one analysis run, shared between the ReAct loop and the tools it exposes.
  *
  * <p>This is where rule coverage is tracked. The {@code coverageSet} is fixed before the first model
- * turn; {@code verdicts} only ever grows through {@code submit_rule_evaluation}; and
- * {@link #missingRules()} is the difference the loop refuses to finish with. Nothing here can widen
- * or shrink the coverage set once the run has started, so the gate cannot be talked out of by the
- * model - not by a rule whose prose asks to be skipped, and not by a conclusion that arrives early.
+ * turn; {@code verdicts} only ever grows through {@code evaluate_rule}, and only when that rule's
+ * SQL actually executed; and {@link #missingRules()} is the difference the loop refuses to finish
+ * with. Nothing here can widen or shrink the coverage set once the run has started, so the gate
+ * cannot be talked out of by the model - not by a rule whose prose asks to be skipped, and not by a
+ * conclusion that arrives early.
+ *
+ * <p>{@code sqlAttempts} is the other half of that bookkeeping. A query that is rejected or errors
+ * records nothing, so the rule stays outstanding and the model may fix its SQL and try again; the
+ * counter bounds how often, and a rule that exhausts it is left <em>unjudged</em> rather than
+ * quietly written down as "not triggered".
  *
  * <p>The scope of a rule is resolved here too, once per rule, from the run's single
  * {@link EvaluationBatch}: which of the customer's transactions a rule applies to is a fact about
- * the activity type, not a judgement, and it is what {@code submit_rule_evaluation} checks the
- * agent's cited evidence against before a verdict is accepted.
+ * the activity type, not a judgement, and it is what {@code evaluate_rule} checks the ids a query
+ * returned against before a verdict is accepted.
  *
  * <p>All mutable collections are concurrent because tool execution order is decided by the model and
  * the framework, not by this class.
@@ -52,6 +61,7 @@ public final class AgentRunContext {
 
     private final Map<UUID, Scope> scopes = new ConcurrentHashMap<>();
     private final Map<UUID, AgentRuleVerdict> verdicts = new ConcurrentHashMap<>();
+    private final Map<UUID, AtomicInteger> sqlAttempts = new ConcurrentHashMap<>();
     private final Queue<ToolTiming> timings = new ConcurrentLinkedQueue<>();
     private final AtomicReference<FinalAssessment> finalAssessment = new AtomicReference<>();
     private final AtomicBoolean finalRejected = new AtomicBoolean();
@@ -181,11 +191,58 @@ public final class AgentRunContext {
 
     public void recordVerdict(AgentRuleVerdict verdict) {
         verdicts.put(verdict.ruleId(), verdict);
+        sqlAttempts.remove(verdict.ruleId());
         publishProgress();
     }
 
     public AgentRuleVerdict verdict(UUID ruleId) {
         return verdicts.get(ruleId);
+    }
+
+    /**
+     * The run's score so far: the sum of the mechanical per-rule scores.
+     *
+     * <p>Arithmetic over weights, never over anything the model proposed - a rule contributes its
+     * weight when its query matched and nothing when it did not.
+     */
+    public BigDecimal totalScore() {
+        BigDecimal total = BigDecimal.ZERO.setScale(2, RoundingMode.HALF_UP);
+        for (AgentRuleVerdict verdict : verdicts.values()) {
+            if (verdict.triggered() && verdict.score() != null) {
+                total = total.add(verdict.score());
+            }
+        }
+        return total;
+    }
+
+    /** The band the rule scores alone produce; the floor the agent may escalate above but not below. */
+    public RiskLevel mechanicalRiskLevel() {
+        return RiskLevel.forScore(totalScore());
+    }
+
+    // ------------------------------------------------------------------
+    // Query attempts
+    // ------------------------------------------------------------------
+
+    /**
+     * Counts one attempt to answer a rule with SQL.
+     *
+     * @return how many attempts that rule has now used, including this one
+     */
+    public int recordSqlAttempt(UUID ruleId) {
+        return sqlAttempts.computeIfAbsent(ruleId, key -> new AtomicInteger()).incrementAndGet();
+    }
+
+    /**
+     * Attempts spent on one rule's query since the last one that ran.
+     *
+     * <p>The counter bounds <em>failures</em>, which is why {@link #recordVerdict} clears it: a query
+     * that executed cost the rule nothing, and a model that legitimately re-runs a rule with a better
+     * query must not find its budget already gone.
+     */
+    public int sqlAttempts(UUID ruleId) {
+        AtomicInteger attempts = sqlAttempts.get(ruleId);
+        return attempts == null ? 0 : attempts.get();
     }
 
     // ------------------------------------------------------------------

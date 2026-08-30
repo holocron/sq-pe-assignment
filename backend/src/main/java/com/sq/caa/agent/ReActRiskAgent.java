@@ -7,6 +7,7 @@ import com.sq.caa.rules.EvaluationBatch;
 import com.sq.caa.service.ActivitySummaryService;
 import com.sq.caa.service.CustomerService;
 import com.sq.caa.service.RiskRuleService;
+import com.sq.caa.sql.RuleSqlEvaluator;
 import java.util.List;
 import java.util.UUID;
 import org.springframework.beans.factory.ObjectProvider;
@@ -23,6 +24,13 @@ import tools.jackson.databind.json.JsonMapper;
  * read from. The agent therefore judges one fixed body of evidence: the transaction it quotes in a
  * rationale and the transaction whose id is written to {@code risk_assessments} are by construction
  * the same row, even if the database moves underneath the run.
+ *
+ * <p>The one deliberate exception is {@link RuleSqlEvaluator}, which is wired in here and reaches
+ * the database directly. It has to: a rule's verdict is now the answer PostgreSQL gives to the
+ * SELECT the agent wrote for that rule's condition, and an answer computed in Java over the snapshot
+ * would be the model's arithmetic again, one layer down. The evaluator runs the query scoped to this
+ * customer and read-only, and every id it returns is checked back against the run's snapshot before
+ * it can be recorded as evidence, so the widened reach cannot widen what the run may cite.
  */
 @Component
 public class ReActRiskAgent {
@@ -32,6 +40,7 @@ public class ReActRiskAgent {
     private final RiskRuleService riskRuleService;
     private final ActivitySummaryService activitySummaryService;
     private final ObjectProvider<RagService> ragServiceProvider;
+    private final RuleSqlEvaluator sqlEvaluator;
     private final JsonMapper jsonMapper;
     private final AgentProperties properties;
 
@@ -40,6 +49,7 @@ public class ReActRiskAgent {
             RiskRuleService riskRuleService,
             ActivitySummaryService activitySummaryService,
             ObjectProvider<RagService> ragServiceProvider,
+            RuleSqlEvaluator sqlEvaluator,
             JsonMapper jsonMapper,
             AgentProperties properties) {
         this.loop = loop;
@@ -47,6 +57,7 @@ public class ReActRiskAgent {
         this.riskRuleService = riskRuleService;
         this.activitySummaryService = activitySummaryService;
         this.ragServiceProvider = ragServiceProvider;
+        this.sqlEvaluator = sqlEvaluator;
         this.jsonMapper = jsonMapper;
         this.properties = properties;
     }
@@ -73,7 +84,8 @@ public class ReActRiskAgent {
             AnalysisProgressListener progress) {
         AgentRunContext context = context(assessmentId, customerId, trace, progress);
         RiskAgentTools tools = new RiskAgentTools(context, activitySummaryService,
-                ragServiceProvider.getIfAvailable(), jsonMapper, properties.transactionPageSize());
+                ragServiceProvider.getIfAvailable(), sqlEvaluator, jsonMapper,
+                properties.transactionPageSize(), properties.maxRuleSqlAttempts());
         return loop.execute(context, tools);
     }
 

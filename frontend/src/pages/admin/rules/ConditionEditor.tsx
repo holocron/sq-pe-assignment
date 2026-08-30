@@ -6,8 +6,15 @@
  * area, a live budget against the server's limit, blocking validation for the
  * two ways a condition is unusable (empty, or pasted JSON from the old DSL) and
  * an advisory checklist that teaches what a judgeable condition looks like.
+ *
+ * What the agent does with the text changed, and so does what "written well"
+ * means. It no longer answers the condition from the tool output — it translates
+ * the condition into SQL and Postgres answers it. The comparison is therefore
+ * exact, and the remaining way to get a wrong verdict is a sentence that
+ * translates ambiguously. Hence the translation notes below the checklist: they
+ * name the failure that was actually observed rather than offering style advice.
  */
-import { Check, Lightbulb, Minus } from 'lucide-react'
+import { Check, Database, Lightbulb, Minus } from 'lucide-react'
 import { useEffect, useId, type RefObject } from 'react'
 import { RULE_CONDITION_MAX_LENGTH, type FieldCatalogEntry } from '../../../api/types'
 import { Button } from '../../../components/ui/Button'
@@ -33,6 +40,40 @@ export interface ConditionEditorProps {
 const MIN_HEIGHT_PX = 176
 const MAX_HEIGHT_PX = 420
 
+/**
+ * How to word a condition so that exactly one query can come out of it.
+ *
+ * Short on purpose — this sits under a checklist an author already reads, and
+ * four lines get read where a paragraph does not. The coupled-threshold note is
+ * last because it is the one with a live incident behind it: a condition reading
+ * "eight or more transactions or a total above 50 000 within 24 hours" was
+ * translated against the wrong number, and the rule was cleared on data that
+ * breached it.
+ */
+const TRANSLATION_NOTES: readonly { id: string; rule: string; detail: string }[] = [
+  {
+    id: 'one-threshold',
+    rule: 'One threshold per sentence.',
+    detail: 'Give a second threshold its own sentence, and say how the two combine.',
+  },
+  {
+    id: 'name-fields',
+    rule: 'Name the fields.',
+    detail: 'Say amount, status, receiver bank country — not “the value” or “the destination”.',
+  },
+  {
+    id: 'explicit-numbers',
+    rule: 'Write the numbers and the window out.',
+    detail: '“10 000 CHF”, “eight or more”, “any rolling 24 hours” — never “several” or “large”.',
+  },
+  {
+    id: 'coupled',
+    rule: 'Watch coupled thresholds.',
+    detail:
+      'A count and an amount stated together in one sentence have been misread in a live run; split them.',
+  },
+]
+
 export function ConditionEditor({
   value,
   onChange,
@@ -47,6 +88,7 @@ export function ConditionEditor({
   const counterId = `${fieldId}-counter`
   const hintId = `${fieldId}-hint`
   const errorId = `${fieldId}-error`
+  const translationId = `${fieldId}-translation`
 
   const length = value.length
   const remaining = RULE_CONDITION_MAX_LENGTH - length
@@ -111,8 +153,9 @@ export function ConditionEditor({
         </p>
       ) : (
         <p id={hintId} className="text-2xs leading-relaxed text-subtle">
-          This text is given to the agent word for word. It reads the condition, calls its tools for
-          the customer’s data and decides both whether the rule is triggered and what it scores.
+          This text is given to the agent word for word. It writes a SQL query from it, Postgres
+          runs the query, and the rule is triggered when the query returns rows — so how the
+          condition is worded decides how it is measured.
         </p>
       )}
 
@@ -135,6 +178,29 @@ export function ConditionEditor({
           </li>
         ))}
       </ul>
+
+      <section
+        aria-labelledby={translationId}
+        className="flex flex-col gap-1 rounded-md border border-border bg-surface-2/40 px-3 py-2"
+      >
+        <h4
+          id={translationId}
+          className="flex items-center gap-1.5 text-2xs font-semibold tracking-caption text-muted uppercase"
+        >
+          <Database aria-hidden="true" className="size-3" />
+          Writing for the SQL translation
+        </h4>
+        <ul className="flex flex-col gap-1 text-2xs leading-relaxed text-muted">
+          {TRANSLATION_NOTES.map((note) => (
+            <li key={note.id} className="flex items-start gap-1.5">
+              <span aria-hidden="true" className="mt-1.5 size-1 shrink-0 rounded-full bg-subtle" />
+              <span>
+                <span className="font-medium text-fg">{note.rule}</span> {note.detail}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </section>
 
       {blank ? (
         <section aria-label="Starter conditions" className="flex flex-col gap-1.5">

@@ -68,25 +68,49 @@ provider-specific code exists outside configuration.
 Source: `backend/src/main/java/com/sq/caa/agent/AgentPrompts.java` and `RiskAgentTools.java`.
 
 The instruction design rests on one principle: **the prompt and the enforcement must agree.** The
-loop hard-gates rule coverage, so the prompt states that same rule in the same terms — the model is
-never pushed toward something the runtime will refuse.
+loop hard-gates rule coverage and the database — not the model — decides every rule verdict, so the
+prompt states both in the same terms the runtime uses. The model is never pushed toward something
+the runtime will refuse, and never invited to do something the runtime will ignore.
 
-### The system prompt, in four parts
+> **What changed, and why it is the centre of the prompt design.** The agent used to state each
+> rule's verdict and estimate its score. A live run then read tool output for *"eight or more
+> transactions in 24 hours"*, made the peak 8, compared it against a threshold it had misremembered
+> as 10, and cleared a rule the data breached — a 20-point false negative produced entirely by a
+> language model doing arithmetic. Prompting harder was rejected as a fix: an instruction to be
+> careful with numbers is exactly the kind of instruction that fails under load. Instead the numbers
+> were **taken away from the model**. It writes SQL; PostgreSQL computes; the verdict is the row
+> count and the score is the weight. Every prompt below is written to make that split unmissable.
+
+### The system prompt, in five parts
 
 **Role.** *"You are the transaction-monitoring analyst of a Swiss bank's financial-crime compliance
 team… using only the tools provided to you."*
 
+**The one rule that overrides everything else**, stated before the procedure and in capitals:
+
+> *"You do not do arithmetic and you do not compare numbers against thresholds. Ever. … The rule
+> counts as TRIGGERED if and only if your query returned at least one row … You never announce a
+> verdict, you read one off the result."*
+
+It then gives the reason, naming the real incident, because a rule whose purpose is visible survives
+context pressure better than one asserted flat.
+
 **How you must work** — the procedural spine:
-1. Investigate before judging — profile and activity summary first, then `list_risk_rules` for the
+1. Investigate before you query — profile and activity summary first, then `list_risk_rules` for the
    checklist.
-2. For **every** rule: `evaluate_rule_deterministically` **then** `submit_rule_evaluation`. *"The
-   rule engine, not your intuition, decides whether a numeric threshold is breached."*
-3. Inspect the underlying transactions before describing a pattern. *"Never state an amount, a
-   count, a country or a date that did not come out of a tool."*
-4. Ground policy claims with `search_policy_knowledge` and cite document and section. *"If the
-   knowledge base returns nothing relevant, say so instead of inventing a policy."*
-5. Conclude only once every rule has a verdict — *"The call is rejected while any rule is
-   outstanding."*
+2. For each rule, read its condition and work out what would settle it, using the data tools.
+3. Then write the SQL and call `evaluate_rule`. *"Put every number, every comparison and every window
+   INSIDE the SQL. Copy the thresholds from the condition one at a time and re-read it to check
+   each … 'Eight or more … above 40,000' is 8 and 40000, and a query that asks for 5 and 100000 is a
+   perfectly computed answer to a question nobody asked."* Do not state a verdict; do not propose a
+   score.
+4. A rejected or erroring query records **nothing** and the rule is still open — read the reason, fix
+   the query, retry. *"A rule whose query never runs stays UNJUDGED."*
+5. Ground every number in a tool result. *"A number you worked out in your head does not belong in
+   the summary."*
+6. Ground policy claims with `search_policy_knowledge` and cite document and section.
+7. Conclude only once every rule has a verdict — *"The call is rejected while any rule is
+   outstanding."* The band may be raised above the scored one with a justification, never lowered.
 
 **What is an instruction and what is data** — the prompt-injection boundary. Rule names are written
 by admins and policy passages come from uploaded documents, so both are untrusted. Everything a tool
@@ -130,17 +154,42 @@ relates to the others.
 | `get_customer_profile` | *"Call this first to establish who is being reviewed."* |
 | `get_customer_activity_summary` | Everything in one call — per-type totals, status split with failed ratio, currency and beneficiary-country splits, and velocity peaks — *"to find concentration, velocity, structuring and failure patterns before drilling into individual transactions."* |
 | `list_transactions` | Compact rows with a one-line counterparty description; points to `get_transaction_details` for the full record. |
-| `get_transaction_details` | Type-specific fields **plus the customer's rolling aggregates as of that transaction** — *"the same numbers the rule engine evaluates"*, so the model and the engine cannot argue from different figures. |
+| `get_transaction_details` | Type-specific fields **plus the customer's rolling aggregates as of that transaction**, so the model can understand a pattern before expressing it as a query. |
 | `list_risk_rules` | *"This list is the complete checklist… the analysis cannot be concluded until none are missing."* Also reports which rules already have a verdict. |
-| `evaluate_rule_deterministically` | Returns the engine's exact verdict with a condition-by-condition match trace. *"Use this for EVERY rule instead of judging thresholds by eye."* |
-| `submit_rule_evaluation` | *"Verdicts are cross-checked and the engine wins"* — states the consequence of disagreeing, and reports how many rules remain. |
-| `submit_final_assessment` | *"This is the terminal call…"* — states plainly that it is **rejected** while any rule is missing, and that the missing rules will be named. |
+| `evaluate_rule` | The longest description in the set, and the one that carries the design. It opens *"YOU DO NOT DECIDE WHETHER THE RULE TRIGGERED"*, gives the derivation in one sentence, forbids counting, summing, averaging, comparing and rounding outright, works the motivating case (*"eight or more" → `HAVING count(*) >= 8`*), insists on the condition's own numbers, then documents all five CTEs with their columns, the enum values, the single-SELECT constraints and one full worked query. Its `explanation` parameter says explicitly: *"Do not state whether the rule triggered."* |
+| `submit_final_assessment` | *"This is the terminal call…"* — states plainly that it is **rejected** while any rule is missing, that the missing rules will be named, and that a risk level below the scored band is refused while one above it needs a written justification. |
 | `search_policy_knowledge` | Search by meaning, returning source document and section *"so a finding can be cited"*. *"Never state a policy from memory."* |
 
 The pattern worth noting: several descriptions **state the runtime's enforcement**. The model is told
-in advance that `submit_final_assessment` will be rejected and that its verdicts will be
-cross-checked, so the gate is cooperative rather than adversarial — the model usually satisfies it
-without ever being re-prompted.
+in advance that `submit_final_assessment` will be rejected while rules are open, that a lower band
+will be refused, and that its query — not its opinion — is what will be recorded. The gate is
+therefore cooperative rather than adversarial: the model usually satisfies it without ever being
+re-prompted.
+
+### What the prompt could not fix, and what was built instead
+
+Prompting moved the failure but did not remove it. With the arithmetic in the database, the **first**
+live run after the change still missed the same velocity rule — this time by writing
+`count(*) >= 5 AND sum(amount) >= 100000` for a condition reading *"eight or more … above 40,000"*.
+The comparison was exact and the question was wrong.
+
+Two things were added, in this order of importance:
+
+1. **A mechanical check, `ThresholdFidelity`.** The numbers in the query are compared with the
+   numbers in the condition, and a query that uses none of a stated number is refused *before it
+   runs*, naming the numbers. It is deliberately advisory: a rule is asked at most twice, may then
+   resend the same query unchanged, and — the part that had to be learned — the prompts spend none
+   of the query-retry budget. The first version shared that budget, and a live run spent two of a
+   rule's three attempts being asked about thresholds, wrote an invalid query with the third, and
+   failed the analysis on an unjudged rule. A guardrail that starves the mechanism it guards is
+   worse than none. It remains a numeric-overlap check, not a proof of meaning: it cannot see an
+   operator, a misplaced window or a missing join.
+2. **Prompt text that names the failure**, in both the system prompt and the tool description,
+   with the wrong query quoted. This is the weaker half and is treated as such.
+
+After both, the rule is answered correctly in every subsequent run, and on the first attempt in most
+of them. The honest statement of the residual risk is in the README's *Known limitations*, not
+softened here.
 
 ---
 
@@ -206,3 +255,14 @@ Worth recording honestly, since it is the clearest lesson of the build:
 - **One agent died mid-run** (the machine slept) and returned `null`; the three agents downstream ran
   with an empty brief. The failure was only caught because a later review pass re-checked the work
   rather than trusting the report.
+- **Prompting was treated as a fix for an arithmetic error for too long.** The velocity false
+  negative was first met with stronger instructions about being careful with numbers. It recurred.
+  What actually worked was removing the capability: the model can no longer count or compare,
+  because it is not asked to. The general lesson — if a failure mode can be designed out of the
+  interface, do not try to instruct it away — was then *re-learned* one layer up, when the same rule
+  was missed again through a substituted threshold and prompting alone again proved insufficient.
+- **Green suites still did not imply a working feature.** 93 sandbox tests written by the author of
+  the sandbox were green; an independent penetration test written against the same source found four
+  real holes, one of which had moved a stated guarantee from the validator to the database grants
+  without anyone noticing. Adversarial verification by someone who did not write the thing remains
+  the highest-yield step in this process.

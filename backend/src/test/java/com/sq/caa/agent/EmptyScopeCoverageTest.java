@@ -10,8 +10,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.sq.caa.agent.ToolPayloads.CustomerProfile;
+import com.sq.caa.agent.ToolPayloads.QueryRejected;
 import com.sq.caa.agent.ToolPayloads.RuleList;
-import com.sq.caa.agent.ToolPayloads.ToolError;
 import com.sq.caa.agent.ToolPayloads.TransactionPage;
 import com.sq.caa.agent.ToolPayloads.VerdictAck;
 import com.sq.caa.domain.RiskAssessment;
@@ -35,7 +35,7 @@ import tools.jackson.databind.json.JsonMapper;
  * set is built from the activity types the customer actually has, so an activity-scoped rule can
  * never be listed for a customer who has none of that activity; an {@code ALL}-scoped rule, however,
  * is always in the coverage set, and for a customer with zero transactions there is nothing for the
- * agent to judge it against.
+ * agent to write a query about.
  *
  * <p>Three things have to hold there, and all three are asserted below.
  *
@@ -44,8 +44,8 @@ import tools.jackson.databind.json.JsonMapper;
  *       customer - a new account, an account whose activity was purged - and the run has to finish
  *       with a coherent band, a total score of zero and complete coverage counters.</li>
  *   <li><b>The rule still has to be judged.</b> "Nothing in scope" is not the same as "not checked":
- *       the agent must still submit a verdict, and a run that skips the rule fails like any
- *       other.</li>
+ *       the agent must still write the query, and a run that skips the rule fails
+ *       like any other.</li>
  *   <li><b>The audit claim must be exact.</b> {@code risk_assessments} is keyed by transaction, so a
  *       rule with nothing in scope writes no rows: for that rule, and only that rule, the evidence
  *       that it was checked lives in {@code analysis_runs.rules_evaluated} / {@code rules_total} /
@@ -82,10 +82,9 @@ class EmptyScopeCoverageTest {
 
         ScriptedChatModel model = new ScriptedChatModel(List.of(
                 calls(RiskAgentTools.LIST_TRANSACTIONS, "{}"),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, """
-                        {"rule_id":"%s","triggered":false,"score":0,"transaction_ids":[],\
-                        "rationale":"The customer has no transactions on file, so nothing can breach \
-                        this rule."}""".formatted(dormantAccount.getRuleId())),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(dormantAccount,
+                        "SELECT t.transaction_id FROM tx t WHERE t.amount > 100000",
+                        "Any transaction of this customer above 100,000.")),
                 calls(RiskAgentTools.SUBMIT_FINAL_ASSESSMENT, """
                         {"risk_level":"LOW","summary":"No activity on file.",\
                         "recommendations":"Schedule a periodic review."}""")));
@@ -105,11 +104,13 @@ class EmptyScopeCoverageTest {
 
         RuleOutcome outcome = result.ruleOutcomes().getFirst();
         assertFalse(outcome.triggered());
-        assertEquals(RuleVerdictSource.AGENT_JUDGED, outcome.source());
+        assertEquals(RuleVerdictSource.SQL_DERIVED, outcome.source());
         assertEquals(0, outcome.evaluatedTransactionCount());
         assertEquals(0, outcome.matchedCount());
         assertTrue(outcome.inScopeTransactionIds().isEmpty());
         assertNotNull(outcome.rationale());
+        assertNotNull(outcome.sql(), "the query that answered the rule is kept, even a query that "
+                + "could only ever return nothing");
 
         // The edge itself: nothing to key a row on, so the table records nothing for this rule...
         List<RiskAssessment> rows =
@@ -123,8 +124,8 @@ class EmptyScopeCoverageTest {
                 "rules_evaluated == rules_total is what proves coverage for an empty-scope rule");
         assertTrue(trace.steps().stream()
                         .anyMatch(step -> TraceStep.Type.TOOL_CALL.equals(step.type())
-                                && RiskAgentTools.SUBMIT_RULE_EVALUATION.equals(step.tool())),
-                "the trace must show the verdict being submitted");
+                                && RiskAgentTools.EVALUATE_RULE.equals(step.tool())),
+                "the trace must show the rule being evaluated");
         assertTrue(trace.steps().stream().anyMatch(step -> TraceStep.Type.FINAL.equals(step.type())));
     }
 
@@ -161,13 +162,18 @@ class EmptyScopeCoverageTest {
     }
 
     @Test
-    @DisplayName("the tools describe an empty customer without failing, and refuse to trigger a rule "
-            + "with nothing in scope")
+    @DisplayName("the tools describe an empty customer without failing, and no query can trigger a "
+            + "rule with nothing in scope")
     void theToolsAnswerForACustomerWithNoActivity() {
         UUID assessmentId = UUID.randomUUID();
         AnalysisTrace trace = AgentTestFixtures.trace(assessmentId);
         AgentRunContext context = AgentTestFixtures.contextOver(assessmentId, trace, rules, List.of());
-        RiskAgentTools tools = new RiskAgentTools(context, null, null, jsonMapper, 25);
+        // A query that returns an id for a customer with no activity cannot happen against the real
+        // evaluator - its CTEs are scoped to the customer - so this stub is deliberately impossible.
+        // The point is that the tools do not take a query result on trust either.
+        StubRuleSqlEvaluator sql = new StubRuleSqlEvaluator()
+                .matching("OR t.amount > 0", List.of(UUID.randomUUID()));
+        RiskAgentTools tools = new RiskAgentTools(context, null, null, sql, jsonMapper, 25, 3);
 
         CustomerProfile profile = assertInstanceOf(CustomerProfile.class, tools.getCustomerProfile());
         assertEquals(0, profile.transactionCount());
@@ -186,24 +192,32 @@ class EmptyScopeCoverageTest {
                 "the checklist tells the model up front that this rule has nothing in scope");
         assertTrue(checklist.rules().getFirst().condition().contains("more than 100,000"));
 
-        ToolError triggered = assertInstanceOf(ToolError.class, tools.submitRuleEvaluation(
-                dormantAccount.getRuleId().toString(), true, 40.0, List.of(),
-                "I think something large happened."));
-        assertTrue(triggered.error().contains("no transactions in scope"));
+        QueryRejected refused = assertInstanceOf(QueryRejected.class, tools.evaluateRule(
+                dormantAccount.getRuleId().toString(),
+                "SELECT t.transaction_id FROM tx t WHERE t.amount > 100000 OR t.amount > 0",
+                "Any transaction at all."));
+        assertTrue(refused.reason().contains("not this customer's"), refused.reason());
+        assertFalse(context.isEvaluated(dormantAccount.getRuleId()),
+                "a result that names a transaction the rule does not cover records nothing");
 
-        VerdictAck accepted = assertInstanceOf(VerdictAck.class, tools.submitRuleEvaluation(
-                dormantAccount.getRuleId().toString(), false, 0.0, List.of(),
-                "No transactions on file, so the condition cannot be met."));
+        VerdictAck accepted = assertInstanceOf(VerdictAck.class, tools.evaluateRule(
+                dormantAccount.getRuleId().toString(),
+                "SELECT t.transaction_id FROM tx t WHERE t.amount > 100000",
+                "Any transaction of this customer above 100,000."));
         assertTrue(accepted.accepted());
+        assertFalse(accepted.triggered(), "there is nothing for the query to return");
+        assertEquals(0, BigDecimal.ZERO.compareTo(accepted.score()));
         assertEquals(0, accepted.verdictsStillRequired());
     }
 
     // ------------------------------------------------------------------
 
     private AgentRunResult run(ScriptedChatModel model, AgentRunContext context, int maxSteps) {
-        AgentProperties properties = new AgentProperties(maxSteps, MAX_COVERAGE_REPROMPTS, 4096, 0.1,
-                32768, 1536, 10, "test-model", 2, 16, Duration.ofMinutes(5), Duration.ofMinutes(10), 25);
-        RiskAgentTools tools = new RiskAgentTools(context, null, null, jsonMapper, 25);
+        AgentProperties properties = new AgentProperties(maxSteps, MAX_COVERAGE_REPROMPTS, 3, 4096,
+                0.1, 32768, 1536, 10, "test-model", 2, 16, Duration.ofMinutes(5),
+                Duration.ofMinutes(10), 25);
+        RiskAgentTools tools = new RiskAgentTools(context, null, null, new StubRuleSqlEvaluator(),
+                jsonMapper, 25, 3);
         RiskAgentLoop loop = new RiskAgentLoop(model, ToolCallingManager.builder().build(), jsonMapper,
                 properties);
         return loop.execute(context, tools);

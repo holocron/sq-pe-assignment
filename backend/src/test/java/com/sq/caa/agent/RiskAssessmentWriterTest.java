@@ -258,14 +258,13 @@ class RiskAssessmentWriterTest {
                     new BigDecimal("10.00"),
                     triggered,
                     triggered ? new BigDecimal("10.00") : new BigDecimal("0.00"),
-                    RuleVerdictSource.AGENT_JUDGED,
+                    RuleVerdictSource.SQL_DERIVED,
                     transactionIds.size(),
                     matched.size(),
                     matched,
                     transactionIds,
-                    "The agent judged this rule from the transactions it cited.",
-                    null,
-                    false));
+                    "Looks for the activity this rule's condition describes.",
+                    "SELECT t.transaction_id FROM tx t"));
         }
         return RiskAssessmentRows.build(assessmentId, outcomes, NOW);
     }

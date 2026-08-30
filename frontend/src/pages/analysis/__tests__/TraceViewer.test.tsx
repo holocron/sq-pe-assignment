@@ -199,10 +199,12 @@ describe('TraceViewer — a collapsed row names what the step did', () => {
     render(<TraceViewer steps={TRACE} ruleNames={RULE_NAMES} />)
 
     expect(screen.getByText('Rule verdicts')).toBeInTheDocument()
-    expect(screen.getByText('2 rules judged')).toBeInTheDocument()
+    expect(screen.getByText('2 rules answered')).toBeInTheDocument()
     expect(verdictRows()).toHaveLength(2)
     expect(screen.getByText('#2')).toBeInTheDocument()
     expect(screen.getByText('#3')).toBeInTheDocument()
+    // These steps carry no query, so nothing may be reported as having failed.
+    expect(screen.queryByText(/attempt.? failed/)).not.toBeInTheDocument()
   })
 
   it('renders a trace persisted before the two fields existed', () => {

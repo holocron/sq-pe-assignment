@@ -10,13 +10,19 @@
  *
  * A collapsed row has to stand on its own. Twelve rules produce two dozen tool
  * calls with the same name, so each row carries what the step acted on and how
- * it came out — `Submit rule verdict · Structuring… · triggered +30.00 ·
- * rule 3/12` — and consecutive verdicts fold into one block, so the checklist
- * reads as one phase of the run rather than a wall of identical markers. The
- * outcome chip stays on the neutral/accent tokens: per DESIGN_SYSTEM.md the
- * risk ramp means a risk level, and a triggered rule is not one.
+ * it came out — `Evaluate rule · Structuring… · triggered · 8 rows · rule 3/12`
+ * — and consecutive evaluations fold into one block, so the checklist reads as
+ * one phase of the run rather than a wall of identical markers. The outcome chip
+ * stays on the neutral/accent tokens: per DESIGN_SYSTEM.md the risk ramp means a
+ * risk level, and a triggered rule is not one.
+ *
+ * An `evaluate_rule` step reveals the SQL it ran when expanded, because that
+ * statement is the whole evidence for the verdict. An attempt Postgres refused
+ * or errored on is rendered as a failure — danger marker, its reason on the face
+ * of the row — since a retry that looked like a success would tell a reviewer
+ * that a rule was measured when it never was.
  */
-import { ChevronRight, ClipboardCheck, Radio, WifiOff } from 'lucide-react'
+import { ChevronRight, ClipboardCheck, Radio, TriangleAlert, WifiOff } from 'lucide-react'
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { TraceStep, UUID } from '../../api/types'
 import { Badge, type BadgeTone } from '../../components/ui/Badge'
@@ -28,6 +34,8 @@ import { Skeleton } from '../../components/ui/Skeleton'
 import { Spinner } from '../../components/ui/Spinner'
 import { cn } from '../../lib/cn'
 import { formatDuration } from '../../lib/format'
+import { SqlBlock } from './SqlBlock'
+import { sqlFailure } from './sql'
 import {
   TOOL_KIND_LABELS,
   coverageRepromptExplanation,
@@ -41,6 +49,7 @@ import {
   traceStepIdentity,
   traceStepKey,
   traceStepMeta,
+  traceStepSql,
   type TraceStepIdentityContext,
   type TraceStepTone,
 } from './trace'
@@ -120,6 +129,8 @@ function TraceStepItem({
   const reactId = useId()
   const panelId = `${reactId}-panel`
   const Icon = meta.icon
+  const sql = traceStepSql(step)
+  const failure = sqlFailure(sql)
 
   const expandable =
     step.type === 'tool_call' ||
@@ -160,14 +171,28 @@ function TraceStepItem({
           {step.tool}
         </code>
       ) : null}
-      {step.type === 'tool_call' ? (
-        <Badge tone={TONE_BADGE[meta.tone]}>{TOOL_KIND_LABELS[toolMeta(step.tool).kind]}</Badge>
-      ) : null}
-      {identity.outcome ? (
-        <Badge tone={identity.outcomeTone} className="shrink-0">
-          {identity.outcome}
+      {/* A refused or errored query decided nothing, so the row says that
+          instead of an outcome — the two must never be confusable. */}
+      {failure ? (
+        <Badge
+          tone="danger"
+          className="shrink-0"
+          icon={<TriangleAlert aria-hidden="true" className="size-3" />}
+        >
+          {failure.label}
         </Badge>
-      ) : null}
+      ) : (
+        <>
+          {step.type === 'tool_call' ? (
+            <Badge tone={TONE_BADGE[meta.tone]}>{TOOL_KIND_LABELS[toolMeta(step.tool).kind]}</Badge>
+          ) : null}
+          {identity.outcome ? (
+            <Badge tone={identity.outcomeTone} className="shrink-0">
+              {identity.outcome}
+            </Badge>
+          ) : null}
+        </>
+      )}
       {identity.progress ? (
         <span className="numeric hidden shrink-0 text-2xs text-subtle sm:inline">
           {identity.progress}
@@ -205,11 +230,45 @@ function TraceStepItem({
       ) : null}
 
       <div className="px-1.5">
+        {/* Visible without expanding: a reviewer scrolling the timeline has to
+            see that this attempt measured nothing, and why. */}
+        {failure ? (
+          <div className="mt-1.5 ml-5 rounded-xs border border-danger/40 border-l-2 border-l-danger bg-danger-soft/50 p-3">
+            <p className={cn(CAPTION, 'text-danger-fg')}>{failure.label}</p>
+            <p className="mt-1.5 font-mono text-2xs leading-relaxed break-words text-fg">
+              {failure.reason}
+            </p>
+            <p className="mt-1.5 text-2xs leading-relaxed text-muted">
+              {failure.kind === 'rejected'
+                ? 'Validation refused the statement, so it never reached the database.'
+                : 'Postgres could not execute the statement.'}{' '}
+              Nothing was measured and the rule stayed undecided — only a later attempt that ran can
+              have judged it.
+            </p>
+          </div>
+        ) : null}
+
         {step.type === 'tool_call' && expanded ? (
           <div
             id={panelId}
             className="mt-2 ml-5 space-y-3 border-l border-border pl-3.5 animate-fade-in"
           >
+            {sql?.sql ? (
+              <SqlBlock
+                title="Query the agent wrote"
+                label={`SQL for step ${step.n}`}
+                sql={sql.sql}
+              />
+            ) : null}
+            {sql?.effectiveSql && sql.effectiveSql !== sql.sql ? (
+              <SqlBlock
+                secondary
+                title="Statement executed"
+                label={`Statement executed at step ${step.n}`}
+                sql={sql.effectiveSql}
+                note="The fragment above after the backend scoped it to this customer. This is the text Postgres actually ran."
+              />
+            ) : null}
             <StepSection title="Arguments">
               {hasJsonContent(step.args) ? (
                 <CodeBlock text={formatJsonValue(step.args)} />
@@ -340,9 +399,11 @@ interface VerdictBlockProps {
 /**
  * A run of consecutive rule verdicts, under one marker.
  *
- * The agent judging its checklist is one phase of the run; twelve markers down
+ * The agent working its checklist is one phase of the run; twelve markers down
  * the timeline said the opposite. Every verdict keeps its own row — and its own
- * rule name, score and expandable detail — inside the block.
+ * rule name, outcome and expandable SQL — inside the block, and a failed attempt
+ * is counted separately from an answered one so the block header cannot imply
+ * more rules were measured than actually were.
  */
 function VerdictBlock({
   steps,
@@ -353,6 +414,8 @@ function VerdictBlock({
   ruleNames,
   identityContextFor,
 }: VerdictBlockProps) {
+  const failed = steps.filter((step) => sqlFailure(traceStepSql(step))).length
+  const answered = steps.length - failed
   return (
     <li className="flex gap-3">
       <div className="flex flex-col items-center">
@@ -370,15 +433,20 @@ function VerdictBlock({
       </div>
 
       <div className={cn('min-w-0 flex-1', last ? 'pb-0' : 'pb-4')}>
-        <div className="flex items-center gap-2 px-1.5 py-1">
+        <div className="flex flex-wrap items-center gap-2 px-1.5 py-1">
           <span className="text-sm font-medium text-fg">Rule verdicts</span>
           <Badge tone="neutral">
-            {steps.length} {steps.length === 1 ? 'rule' : 'rules'} judged
+            {answered} {answered === 1 ? 'rule' : 'rules'} answered
           </Badge>
+          {failed > 0 ? (
+            <Badge tone="danger" icon={<TriangleAlert aria-hidden="true" className="size-3" />}>
+              {failed} attempt{failed === 1 ? '' : 's'} failed
+            </Badge>
+          ) : null}
         </div>
         <p className="px-1.5 text-xs leading-relaxed text-muted">
-          The agent worked through its checklist here. Each row is its judgement of one rule and the
-          score it estimated, capped at that rule&rsquo;s weight.
+          The agent worked through its checklist here. Each row is one rule: the query it wrote, and
+          what Postgres answered. Expand a row to read the statement.
         </p>
         <ol className="mt-1.5 ml-1 border-l border-border pl-2.5">
           {steps.map((step, index) => {
@@ -441,6 +509,12 @@ export function TraceViewer({
   )
   const repromptCount = useMemo(
     () => steps.filter((step) => step.type === 'coverage_reprompt').length,
+    [steps],
+  )
+  /* Counted at the top so a reviewer knows to look for them before scrolling:
+     a query that never ran measured nothing, whatever a later retry says. */
+  const failedQueryCount = useMemo(
+    () => steps.filter((step) => sqlFailure(traceStepSql(step))).length,
     [steps],
   )
 
@@ -508,6 +582,10 @@ export function TraceViewer({
             ? `${stepCount} steps · ${toolCallCount} tool calls${
                 repromptCount > 0
                   ? ` · ${repromptCount} coverage reprompt${repromptCount === 1 ? '' : 's'}`
+                  : ''
+              }${
+                failedQueryCount > 0
+                  ? ` · ${failedQueryCount} failed quer${failedQueryCount === 1 ? 'y' : 'ies'}`
                   : ''
               }`
             : 'Every step of the ReAct loop, in the order the agent took it.'}

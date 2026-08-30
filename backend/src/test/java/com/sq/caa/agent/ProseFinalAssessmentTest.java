@@ -7,6 +7,7 @@ import static com.sq.caa.agent.AgentTestFixtures.UNATTRIBUTED_CRYPTO;
 import static com.sq.caa.agent.ScriptedChatModel.calls;
 import static com.sq.caa.agent.ScriptedChatModel.says;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -78,8 +79,14 @@ class ProseFinalAssessmentTest {
         assertTrue(result.recommendations().contains("source-of-funds"),
                 "a list of recommendations must survive as one line each");
 
-        // The band is still derived from the rule scores, exactly as when the tool is used.
+        // The band is still derived from the rule scores, exactly as when the tool is used - and a
+        // band written into a paragraph is subject to the same rule as one passed to the tool. This
+        // message asked for CRITICAL without saying why, so the escalation is not admissible and the
+        // mechanical band stands. The prose path has no tool to refuse it; the loop refuses it.
         assertEquals(RiskLevel.HIGH, result.riskLevel());
+        assertEquals(RiskLevel.HIGH, result.mechanicalRiskLevel());
+        assertFalse(result.escalated(), "an escalation with no justification is not an escalation");
+        assertNull(result.escalationJustification());
         assertTrue(result.coverageComplete());
         assertEquals(4, result.rulesJudged());
     }
@@ -146,22 +153,27 @@ class ProseFinalAssessmentTest {
     private List<ScriptedChatModel.Turn> coverEverything(AgentRunContext context,
             ScriptedChatModel.Turn... then) {
         List<ScriptedChatModel.Turn> script = new java.util.ArrayList<>(List.of(
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                        AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE), true, 30, "RU wire.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                        AgentTestFixtures.ruleNamed(rules, STRUCTURING), true, 20, "Structuring.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                        AgentTestFixtures.ruleNamed(rules, UNATTRIBUTED_CRYPTO), true, 15, "XMR.")),
-                calls(RiskAgentTools.SUBMIT_RULE_EVALUATION, AgentTestFixtures.verdict(context,
-                        AgentTestFixtures.ruleNamed(rules, DECLINE_BURST), false, 0, "None."))));
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
+                        AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE),
+                        "Payments over 10,000 to a sanctioned jurisdiction.")),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
+                        AgentTestFixtures.ruleNamed(rules, STRUCTURING),
+                        "Three payments of 9,000-9,999 inside a rolling day.")),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
+                        AgentTestFixtures.ruleNamed(rules, UNATTRIBUTED_CRYPTO),
+                        "Crypto over 1,000 with no exchange attribution.")),
+                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
+                        AgentTestFixtures.ruleNamed(rules, DECLINE_BURST),
+                        "Five declined authorisations inside a rolling day."))));
         script.addAll(List.of(then));
         return script;
     }
 
     private AgentRunResult run(ScriptedChatModel model, AgentRunContext context) {
-        AgentProperties properties = new AgentProperties(40, 3, 4096, 0.1, 32768, 1536, 10, "test-model",
-                2, 16, Duration.ofMinutes(5), Duration.ofMinutes(10), 25);
-        RiskAgentTools tools = new RiskAgentTools(context, null, null, jsonMapper, 25);
+        AgentProperties properties = new AgentProperties(40, 3, 3, 4096, 0.1, 32768, 1536, 10,
+                "test-model", 2, 16, Duration.ofMinutes(5), Duration.ofMinutes(10), 25);
+        RiskAgentTools tools = new RiskAgentTools(context, null, null,
+                AgentTestFixtures.evaluator(context), jsonMapper, 25, 3);
         RiskAgentLoop loop = new RiskAgentLoop(model, ToolCallingManager.builder().build(), jsonMapper,
                 properties);
         return loop.execute(context, tools);

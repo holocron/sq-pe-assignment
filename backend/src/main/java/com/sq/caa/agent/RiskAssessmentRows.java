@@ -22,19 +22,20 @@ import java.util.UUID;
  *       for every rule that had at least one transaction in scope. In scope means exactly one thing:
  *       the transaction's activity type matches the rule's {@code applies_to}, {@code ALL} matching
  *       every transaction. It is a fact about the data, not a judgement;</li>
- *   <li>a rule's contribution to the score is <b>capped at its weight</b>, however many transactions
- *       it matched - {@code submit_rule_evaluation} clamps the agent's estimate before it is ever
- *       recorded.</li>
+ *   <li>a rule's contribution to the score is <b>exactly its weight</b>, however many transactions
+ *       its query matched - the score is the weight when {@code evaluate_rule} found rows and
+ *       {@code 0.00} when it did not, so there is nothing here to cap.</li>
  * </ul>
  *
- * <p>Writing the full score on every matched row would break the cap; writing it on only one row
- * would hide which transactions matched. So the score is split across the matched transactions in
- * whole cents, largest remainder first: the sum over a rule is exactly the score the agent gave it,
- * the sum over the run is exactly the run's total score, and every cited transaction still carries a
- * non-zero contribution that marks it as evidence. Transactions in scope that the agent did not
- * cite, and every transaction of a rule it judged as not triggered, get {@code 0.00}.
+ * <p>Writing the full score on every matched row would multiply the rule's weight by the number of
+ * rows its query returned; writing it on only one row would hide which transactions matched. So the
+ * score is split across the matched transactions in whole cents, largest remainder first: the sum
+ * over a rule is exactly that rule's weight, the sum over the run is exactly the run's total score,
+ * and every matched transaction still carries a non-zero contribution that marks it as evidence.
+ * Transactions in scope that the query did not return, and every transaction of a rule whose query
+ * returned nothing, get {@code 0.00}.
  *
- * <p>A rule the agent never judged has no {@link RuleOutcome} and therefore writes nothing at all -
+ * <p>A rule whose query never ran has no {@link RuleOutcome} and therefore writes nothing at all -
  * deliberately. A row of {@code 0.00} for such a rule would be indistinguishable from a rule that
  * was checked and cleared, which is the one thing this table must never say. That run is recorded as
  * {@code FAILED} instead, with the rule named.

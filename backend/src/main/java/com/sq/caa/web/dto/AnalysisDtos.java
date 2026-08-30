@@ -28,10 +28,11 @@ public final class AnalysisDtos {
      * One rule of one run, as the analysis page renders it.
      *
      * <p>Every rule of the coverage set appears here, triggered or not - that is what makes rule
-     * coverage visible. Every verdict is the agent's own judgement of the rule's condition, which is
-     * why {@code rationale} carries the reasoning it gave: there is no computation behind the score
-     * that could be shown instead. {@code claimedScore} and {@code scoreClamped} record the case
-     * where the model asked for more than the rule's weight and was capped.
+     * coverage visible. Every verdict on this list was computed by PostgreSQL: the agent wrote a
+     * SELECT expressing the rule's condition, {@code triggered} is whether that query returned rows
+     * and {@code score} is the rule's weight or {@code 0.00}. {@code rationale} is the agent's
+     * account of what its query looked for, and {@code sql} is the statement that actually ran - the
+     * two together are what let a reviewer check a verdict instead of trusting it.
      *
      * <p>The field names are also the keys used inside {@code analysis_runs.trace}, because this
      * record is what is written there and read back.
@@ -48,8 +49,7 @@ public final class AnalysisDtos {
             int matchedCount,
             List<UUID> matchedTransactionIds,
             String rationale,
-            BigDecimal claimedScore,
-            boolean scoreClamped) {
+            String sql) {
 
         /** Matched ids kept in the trace; the complete set is in {@code risk_assessments}. */
         public static final int MAX_MATCHED_IDS = 50;
@@ -72,16 +72,16 @@ public final class AnalysisDtos {
                     outcome.matchedCount(),
                     outcome.matchedTransactionIds().stream().limit(MAX_MATCHED_IDS).toList(),
                     outcome.rationale(),
-                    outcome.claimedScore(),
-                    outcome.scoreClamped());
+                    outcome.sql());
         }
 
         /**
          * Rebuilt from {@code risk_assessments} alone. Used only as a fallback when a run's trace
-         * cannot be read: the scores and counts are authoritative, the rationale is not available
-         * from the table. The source is still the agent - those rows could not have been written by
-         * anything else - so the reviewer is told the truth about where the verdict came from even
-         * when the reasoning behind it has been lost.
+         * cannot be read: the scores and counts are authoritative, while the rationale and the query
+         * behind the verdict are not available from the table. The source is still
+         * {@code SQL_DERIVED} - those rows could not have been written any other way - so the
+         * reviewer is told the truth about where the verdict came from even when the query that
+         * produced it has been lost with the trace.
          */
         public static RuleEvaluationView from(RuleEvaluationRow row) {
             boolean triggered = row.getTriggeredCount() > 0;
@@ -92,23 +92,34 @@ public final class AnalysisDtos {
                     row.getWeight(),
                     triggered,
                     row.getScore(),
-                    RuleVerdictSource.AGENT_JUDGED,
+                    RuleVerdictSource.SQL_DERIVED,
                     (int) row.getEvaluatedCount(),
                     (int) row.getTriggeredCount(),
                     List.of(),
                     null,
-                    null,
-                    false);
+                    null);
         }
     }
 
     /**
      * Full result of one analysis run: {@code GET /api/analyses/{assessmentId}}.
      *
-     * @param riskLevel      banded from {@link #totalScore()}, which is the sum of the per-rule
-     *                       scores the agent estimated, each capped at its rule's weight
+     * <p>Three bands are reported because they can legitimately differ, and a reviewer must be able
+     * to see which is which: {@code mechanicalRiskLevel} is arithmetic over SQL-derived scores,
+     * {@code agentRiskLevel} is what the model asked for, and {@code riskLevel} is what stands. The
+     * last is the mechanical one unless the agent escalated above it, which it may only do with
+     * {@code escalationJustification} recorded - so the UI can say "escalated from HIGH to CRITICAL
+     * because ..." rather than presenting a raised band as if the totals had produced it.
+     *
+     * @param riskLevel      the band on record: {@code mechanicalRiskLevel}, or the agent's higher
+     *                       one when it justified the escalation. Never lower than the mechanical
+     *                       band
+     * @param mechanicalRiskLevel {@link #totalScore()} banded, that total being the sum of the
+     *                       weights of the rules whose queries returned rows
      * @param agentRiskLevel the level the agent itself proposed, kept so the two can be compared
-     * @param coveragePercent share of the coverage set that ended with an agent verdict; 100 on
+     * @param escalationJustification why the agent raised the band; non-null exactly when
+     *                       {@code riskLevel} is above {@code mechanicalRiskLevel}
+     * @param coveragePercent share of the coverage set that ended with a verdict; 100 on
      *                        every {@code COMPLETED} run, because a run that leaves a rule unjudged
      *                        is persisted {@code FAILED} instead
      * @param trace          the ReAct transcript, {@code {"steps":[...]}} plus the persisted rule
@@ -120,7 +131,9 @@ public final class AnalysisDtos {
             String customerName,
             AnalysisStatus status,
             RiskLevel riskLevel,
+            RiskLevel mechanicalRiskLevel,
             RiskLevel agentRiskLevel,
+            String escalationJustification,
             BigDecimal totalScore,
             String summary,
             String recommendations,

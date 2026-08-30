@@ -3,22 +3,25 @@
  *
  * Full rule coverage is the guarantee this table exists to evidence: every rule
  * in the coverage set is persisted, triggered or not, and a run may only be
- * COMPLETED when every one of them has a verdict. Every verdict here is the
- * agent's own judgement of a rule written in plain English — nothing recomputed
- * it and nothing overruled it — so the panel leads with the coverage count,
- * groups triggered rules away from the quiet ones, and states plainly that the
- * scores are estimates rather than arithmetic.
+ * COMPLETED when every one of them has a verdict.
+ *
+ * What each verdict *is* changed, and the table is the place that has to say so.
+ * The agent writes a SQL query for the rule condition, Postgres runs it, and
+ * triggered means the query returned rows; the score is then the rule's weight
+ * or nothing. So every row names the database as the decider, and expanding a
+ * row shows the statement that produced the verdict alongside the transactions
+ * it returned — the audit trail is the query itself, not a paraphrase of it.
  */
-import { Bot, ChevronRight, ShieldAlert, ShieldCheck, TriangleAlert } from 'lucide-react'
+import { Bot, ChevronRight, Database, ShieldAlert, ShieldCheck, TriangleAlert } from 'lucide-react'
 import { Fragment, useId, useState, type ReactNode } from 'react'
-import type { EvaluationSource, RiskRule, RuleEvaluation, UUID } from '../../api/types'
+import type { RiskRule, RuleEvaluation, UUID } from '../../api/types'
 import { Badge } from '../../components/ui/Badge'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../../components/ui/Card'
 import { EmptyState } from '../../components/ui/EmptyState'
 import { ErrorState } from '../../components/ui/ErrorState'
 import { Skeleton } from '../../components/ui/Skeleton'
 import { cn } from '../../lib/cn'
-import { formatNumber, shortId } from '../../lib/format'
+import { formatDuration, formatNumber, shortId } from '../../lib/format'
 import {
   coverageCountLabel,
   coverageExplanation,
@@ -27,6 +30,8 @@ import {
   type CoverageStats,
 } from './coverage'
 import { MatchedTransactions } from './MatchedTransactions'
+import { SqlBlock } from './SqlBlock'
+import { evidenceCapped, scoreDerivation, sqlFailure, verdictProvenance } from './sql'
 
 const COLUMN_COUNT = 7
 
@@ -36,21 +41,28 @@ const CAPTION = 'text-2xs font-semibold tracking-caption text-muted uppercase'
 const HEADER_CELL = cn('px-3 py-2 font-semibold', CAPTION)
 
 /**
- * There is only one origin for a verdict now, and saying so on every row is the
- * point: a reviewer must never mistake an estimate for a computation.
+ * Who actually made the comparison, on every row.
+ *
+ * "Agent judged" would now be a lie for a current run: the agent chose the
+ * query, the database decided the verdict. It is still the truth for a run
+ * stored before the change, and those runs keep the old label rather than being
+ * retro-badged into an assurance nobody gave.
  */
-function SourceBadge({ source }: { source: EvaluationSource }) {
+function SourceBadge({ evaluation }: { evaluation: RuleEvaluation }) {
+  const provenance = verdictProvenance(evaluation)
   return (
     <Badge
       tone="neutral"
-      icon={<Bot aria-hidden="true" className="size-3" />}
-      title={
-        source === 'AGENT_JUDGED'
-          ? 'The agent read the rule condition, fetched the evidence and judged it. Nothing recomputed this verdict.'
-          : `Verdict source reported as ${source}.`
+      icon={
+        provenance.bySql ? (
+          <Database aria-hidden="true" className="size-3" />
+        ) : (
+          <Bot aria-hidden="true" className="size-3" />
+        )
       }
+      title={provenance.title}
     >
-      Agent judged
+      {provenance.label}
     </Badge>
   )
 }
@@ -87,6 +99,31 @@ function GroupRow({
   )
 }
 
+/**
+ * What Postgres answered, in one line under the statement.
+ *
+ * The row count is the verdict, so it is stated rather than left to be inferred
+ * from the evidence table — which may be a capped sample of it.
+ */
+function sqlNote(evaluation: RuleEvaluation): string | undefined {
+  const sql = evaluation.sql
+  if (!sql || !sql.ok) return undefined
+  const rows = sql.matchedCount ?? evaluation.matchedCount ?? null
+  const counted =
+    rows === null
+      ? evaluation.triggered
+        ? 'Postgres returned rows, so the rule is triggered.'
+        : 'Postgres returned no rows, so the rule is not triggered.'
+      : `Postgres returned ${formatNumber(rows)} row${rows === 1 ? '' : 's'}, so the rule is ${
+          evaluation.triggered ? 'triggered' : 'not triggered'
+        }.`
+  const timing = sql.ms === null ? '' : ` Took ${formatDuration(sql.ms)}.`
+  const capped = evidenceCapped(evaluation)
+    ? ' The evidence list beside it is a capped sample of them.'
+    : ''
+  return `${counted}${timing}${capped}`
+}
+
 interface CoverageRowProps {
   evaluation: RuleEvaluation
   rule?: RiskRule
@@ -98,12 +135,15 @@ function CoverageRow({ evaluation, rule, expanded, onToggle }: CoverageRowProps)
   const reactId = useId()
   const panelId = `${reactId}-rule-panel`
   const triggered = evaluation.triggered
-  const capped = evaluation.scoreClamped === true
   const weight = evaluation.weight ?? rule?.weight ?? null
   const appliesTo = evaluation.appliesTo ?? rule?.appliesTo ?? null
   /* `matchedTransactionIds` is the wire name; a run rebuilt from the assessment
      rows alone carries no evidence ids, so never dereference it blind. */
   const matchedIds = evaluation.matchedTransactionIds ?? []
+  const sql = evaluation.sql ?? null
+  const provenance = verdictProvenance(evaluation)
+  const failure = sqlFailure(sql)
+  const sampled = evidenceCapped(evaluation)
 
   return (
     <Fragment>
@@ -168,14 +208,23 @@ function CoverageRow({ evaluation, rule, expanded, onToggle }: CoverageRowProps)
         </td>
         <td className="px-3 py-2.5 align-top">
           <div className="flex flex-wrap items-center gap-1.5">
-            <SourceBadge source={evaluation.source} />
-            {capped ? (
+            <SourceBadge evaluation={evaluation} />
+            {failure ? (
+              <Badge
+                tone="danger"
+                icon={<TriangleAlert aria-hidden="true" className="size-3" />}
+                title={failure.reason}
+              >
+                {failure.label}
+              </Badge>
+            ) : null}
+            {sampled ? (
               <Badge
                 tone="warning"
                 icon={<TriangleAlert aria-hidden="true" className="size-3" />}
-                title="The agent asked for more than this rule's weight; the score was capped at the weight."
+                title="The query matched more transactions than the run stores ids for. The count is the true total; the evidence list below is a sample of it."
               >
-                Capped at weight
+                Evidence capped
               </Badge>
             ) : null}
           </div>
@@ -184,7 +233,7 @@ function CoverageRow({ evaluation, rule, expanded, onToggle }: CoverageRowProps)
           {evaluation.rationale ? (
             <p className="line-clamp-2 max-w-md text-xs leading-relaxed">{evaluation.rationale}</p>
           ) : (
-            <span className="text-xs">No rationale recorded.</span>
+            <span className="text-xs">No explanation recorded.</span>
           )}
         </td>
       </tr>
@@ -194,30 +243,6 @@ function CoverageRow({ evaluation, rule, expanded, onToggle }: CoverageRowProps)
           <td colSpan={COLUMN_COUNT} className="px-3 py-3">
             <div className="grid gap-4 lg:grid-cols-2">
               <div className="space-y-3">
-                <section>
-                  <h4 className={CAPTION}>Rationale</h4>
-                  <p className="mt-1 text-sm leading-relaxed text-fg">
-                    {evaluation.rationale ?? 'The verdict was recorded without a rationale.'}
-                  </p>
-                </section>
-
-                <section>
-                  <h4 className={CAPTION}>Verdict source</h4>
-                  <p className="mt-1 text-xs leading-relaxed text-muted">
-                    The agent read the rule condition, gathered the evidence with its tools and
-                    submitted this verdict through <code className="font-mono">
-                      submit_rule_evaluation
-                    </code>. The score is its estimate, capped at the rule&rsquo;s weight — it is a
-                    judgement, so a second run can reach a different number.
-                    {capped && evaluation.claimedScore != null
-                      ? ` It asked for ${formatNumber(evaluation.claimedScore, {
-                          minimumFractionDigits: 2,
-                          maximumFractionDigits: 2,
-                        })} here and was capped at the weight.`
-                      : ''}
-                  </p>
-                </section>
-
                 {rule ? (
                   <section>
                     <h4 className={CAPTION}>Rule condition</h4>
@@ -225,23 +250,105 @@ function CoverageRow({ evaluation, rule, expanded, onToggle }: CoverageRowProps)
                       {rule.thresholdLogic}
                     </p>
                     <p className="mt-1.5 text-2xs leading-relaxed text-subtle">
-                      This is the text the agent was shown, word for word.
+                      This is the text the agent was shown, word for word, and translated into the
+                      query below.
                     </p>
                   </section>
                 ) : null}
+
+                {failure ? (
+                  <div className="rounded-xs border border-danger/40 border-l-2 border-l-danger bg-danger-soft/50 p-3">
+                    <p className={cn(CAPTION, 'text-danger-fg')}>{failure.label}</p>
+                    <p className="mt-1.5 font-mono text-2xs leading-relaxed break-words text-fg">
+                      {failure.reason}
+                    </p>
+                    <p className="mt-1.5 text-2xs leading-relaxed text-muted">
+                      {failure.kind === 'rejected'
+                        ? 'Validation refused to run this statement, so nothing was measured.'
+                        : 'Postgres could not execute this statement, so nothing was measured.'}{' '}
+                      A rule whose query never ran is unjudged — it is not a cleared rule.
+                    </p>
+                  </div>
+                ) : null}
+
+                {sql?.sql ? (
+                  <SqlBlock
+                    title="Query that decided this verdict"
+                    label={`SQL that decided ${evaluation.ruleName}`}
+                    sql={sql.sql}
+                    note={sqlNote(evaluation)}
+                  />
+                ) : null}
+
+                {sql?.effectiveSql && sql.effectiveSql !== sql.sql ? (
+                  <SqlBlock
+                    secondary
+                    title="Statement executed"
+                    label={`Statement executed for ${evaluation.ruleName}`}
+                    sql={sql.effectiveSql}
+                    note="The agent’s fragment after the backend scoped it to this customer. This is the text Postgres actually ran."
+                  />
+                ) : null}
+
+                <section>
+                  <h4 className={CAPTION}>
+                    {provenance.bySql ? 'What the query looks for' : 'Rationale'}
+                  </h4>
+                  <p className="mt-1 text-sm leading-relaxed text-fg">
+                    {evaluation.rationale ??
+                      (provenance.bySql
+                        ? 'The agent recorded no account of what this query looks for.'
+                        : 'The verdict was recorded without a rationale.')}
+                  </p>
+                </section>
+
+                <section>
+                  <h4 className={CAPTION}>How this verdict was reached</h4>
+                  <p className="mt-1 text-xs leading-relaxed text-muted">
+                    {provenance.bySql ? (
+                      <>
+                        The agent wrote the query above; Postgres executed it and the verdict follows
+                        from the result — rows means triggered. {scoreDerivation(evaluation)} The
+                        model made no comparison and estimated no number here.
+                      </>
+                    ) : (
+                      <>
+                        This verdict predates SQL evaluation: the agent read the rule condition,
+                        gathered the evidence with its tools and decided the comparison itself, so
+                        the score is its estimate rather than the rule&rsquo;s weight applied to a
+                        row count.
+                      </>
+                    )}
+                  </p>
+                </section>
               </div>
 
               <section>
                 <h4 className={CAPTION}>
-                  Transactions cited as evidence
+                  {provenance.bySql
+                    ? 'Transactions the query returned'
+                    : 'Transactions cited as evidence'}
                   {matchedIds.length > 0 ? (
                     <span className="numeric ml-1.5 font-normal text-subtle">
-                      {matchedIds.length}
+                      {sampled
+                        ? `${matchedIds.length} of ${formatNumber(
+                            evaluation.sql?.matchedCount ?? evaluation.matchedCount ?? 0,
+                          )}`
+                        : matchedIds.length}
                     </span>
                   ) : null}
                 </h4>
                 <div className="mt-1.5">
-                  <MatchedTransactions transactionIds={matchedIds} />
+                  <MatchedTransactions
+                    transactionIds={matchedIds}
+                    emptyLabel={
+                      provenance.bySql
+                        ? failure
+                          ? 'The query never ran, so no transaction was returned.'
+                          : 'The query returned no transactions.'
+                        : 'The agent cited no transaction for this rule.'
+                    }
+                  />
                 </div>
               </section>
             </div>
@@ -252,7 +359,7 @@ function CoverageRow({ evaluation, rule, expanded, onToggle }: CoverageRowProps)
   )
 }
 
-/** The headline "18 / 18 rules judged" block — the evidence a reviewer looks for first. */
+/** The headline "18 / 18 rules answered" block — the evidence a reviewer looks for first. */
 function CoverageMeter({
   stats,
   running,
@@ -284,7 +391,7 @@ function CoverageMeter({
           {stats.total}
         </p>
         <p aria-hidden="true" className={cn('mt-1.5', CAPTION)}>
-          Rules judged
+          Rules answered
         </p>
         <span className="sr-only">{coverageCountLabel(stats)}</span>
       </div>
@@ -348,8 +455,8 @@ export function RuleCoverageTable({
       <CardHeader>
         <CardTitle>Rule coverage</CardTitle>
         <CardDescription>
-          Every rule that applies to this customer, with the agent&rsquo;s verdict — including the
-          rules it judged and cleared.
+          Every rule that applies to this customer, with the query that decided it — including the
+          rules the database cleared. Expand a rule to read the statement that produced its verdict.
         </CardDescription>
       </CardHeader>
 
@@ -357,7 +464,7 @@ export function RuleCoverageTable({
         <div className="flex flex-wrap items-center justify-between gap-4">
           <CoverageMeter stats={stats} running={running} />
           <div className="flex flex-wrap items-center gap-1.5">
-            <Badge tone="neutral" title="Rules the agent judged to be triggered by this activity.">
+            <Badge tone="neutral" title="Rules whose query returned at least one transaction.">
               {stats.triggered} triggered
             </Badge>
             <Badge
@@ -366,13 +473,22 @@ export function RuleCoverageTable({
             >
               {stats.unjudged} unjudged
             </Badge>
-            {stats.cappedCount > 0 ? (
+            {stats.sqlBacked > 0 ? (
               <Badge
-                tone="warning"
-                icon={<TriangleAlert aria-hidden="true" className="size-3" />}
-                title="Rules where the agent estimated a score above the rule's weight and the backend capped it."
+                tone="neutral"
+                icon={<Database aria-hidden="true" className="size-3" />}
+                title="Verdicts that carry the statement Postgres answered them with. Expand a rule to read it."
               >
-                {stats.cappedCount} capped at weight
+                {stats.sqlBacked} decided by query
+              </Badge>
+            ) : null}
+            {stats.sqlFailed > 0 ? (
+              <Badge
+                tone="danger"
+                icon={<TriangleAlert aria-hidden="true" className="size-3" />}
+                title="Rules whose query was rejected or errored. Such a rule was never measured and must not be read as cleared."
+              >
+                {stats.sqlFailed} query failed
               </Badge>
             ) : null}
           </div>
@@ -383,7 +499,7 @@ export function RuleCoverageTable({
           aria-valuenow={stats.evaluated}
           aria-valuemin={0}
           aria-valuemax={stats.total}
-          aria-label="Rules judged"
+          aria-label="Rules answered"
           className="mt-3 h-2 w-full overflow-hidden rounded-full bg-surface-3"
         >
           <div
@@ -403,7 +519,7 @@ export function RuleCoverageTable({
         {stats.complete ? (
           <p className="mt-2 inline-flex items-center gap-1.5 text-xs text-fg">
             <ShieldCheck aria-hidden="true" className="size-3.5 text-accent" />
-            The coverage gate confirmed the agent judged the full rule set.
+            The coverage gate confirmed every rule of the set reached a verdict.
           </p>
         ) : null}
 
@@ -413,11 +529,11 @@ export function RuleCoverageTable({
             <div className="min-w-0">
               <p className={cn(CAPTION, 'text-warning-fg')}>Incomplete review</p>
               <p className="mt-1.5 text-xs leading-relaxed text-fg">
-                The agent never returned a verdict for{' '}
+                No verdict was ever recorded for{' '}
                 {stats.unjudged > 0 ? stats.unjudged : stats.total - stats.evaluated} rule
-                {stats.unjudged === 1 ? '' : 's'}. Nothing fills that gap in — the run is recorded
-                as FAILED and the verdicts below are partial. Re-run the analysis before relying on
-                this assessment.
+                {stats.unjudged === 1 ? '' : 's'}. Nothing fills that gap in, and an unanswered rule
+                is never recorded as cleared — the run is FAILED and the verdicts below are partial.
+                Re-run the analysis before relying on this assessment.
               </p>
             </div>
           </div>
@@ -464,10 +580,10 @@ export function RuleCoverageTable({
                   Score
                 </th>
                 <th scope="col" className={cn(HEADER_CELL, 'text-left')}>
-                  Source
+                  Decided by
                 </th>
                 <th scope="col" className={cn(HEADER_CELL, 'text-left')}>
-                  Rationale
+                  Explanation
                 </th>
               </tr>
             </thead>
@@ -485,7 +601,7 @@ export function RuleCoverageTable({
               <tbody>
                 <GroupRow
                   triggered={false}
-                  label="Judged and cleared — no contribution"
+                  label="Answered and cleared — no contribution"
                   count={quietRows.length}
                 />
                 {renderRows(quietRows)}

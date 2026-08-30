@@ -2,11 +2,11 @@
  * Rule-coverage arithmetic for the analysis page.
  *
  * The coverage guarantee is what these helpers make visible: one row lands in
- * `risk_assessments` for every rule the agent judged, triggered or not, and a
- * run may only reach COMPLETED when every applicable rule has a verdict. There
- * is no engine behind the agent to close a gap, so an incomplete coverage set
- * is not a footnote on a finished review — it is the reason the run was stored
- * as FAILED, and the wording here says exactly that.
+ * `risk_assessments` for every rule that was answered, triggered or not, and a
+ * run may only reach COMPLETED when every applicable rule has a verdict. A rule
+ * whose query never executed is unjudged, not "not triggered" — so an incomplete
+ * coverage set is not a footnote on a finished review, it is the reason the run
+ * was stored as FAILED, and the wording here says exactly that.
  */
 import type { AnalysisResult, AnalysisSummary, RuleEvaluation } from '../../api/types'
 
@@ -24,8 +24,14 @@ export interface CoverageStats {
   percent: number
   /** Sum of the persisted score contributions. */
   scoreFromRules: number
-  /** Verdicts whose score the model overstated and the backend capped. */
-  cappedCount: number
+  /** Verdicts that carry the query Postgres answered them with. */
+  sqlBacked: number
+  /**
+   * Verdicts whose query is on record as rejected or errored. Such a rule was
+   * never decided, so a run that persisted one is not the complete review its
+   * counters claim — the panel says so instead of letting it read as cleared.
+   */
+  sqlFailed: number
 }
 
 export type CoverageInput = Pick<
@@ -45,7 +51,8 @@ export function coverageStats(analysis: CoverageInput): CoverageStats {
   )
 
   const triggered = evaluations.filter((item) => item.triggered).length
-  const cappedCount = evaluations.filter((item) => item.scoreClamped === true).length
+  const sqlBacked = evaluations.filter((item) => item.sql != null).length
+  const sqlFailed = evaluations.filter((item) => item.sql != null && !item.sql.ok).length
   const scoreFromRules = evaluations.reduce(
     (sum, item) => sum + (Number.isFinite(item.score) ? item.score : 0),
     0,
@@ -66,13 +73,14 @@ export function coverageStats(analysis: CoverageInput): CoverageStats {
     complete,
     percent: total > 0 ? Math.min(100, Math.round((evaluated / total) * 100)) : 0,
     scoreFromRules,
-    cappedCount,
+    sqlBacked,
+    sqlFailed,
   }
 }
 
-/** `18 / 18 rules judged` — rendered as a single text node so it reads cleanly. */
+/** `18 / 18 rules answered` — rendered as a single text node so it reads cleanly. */
 export function coverageCountLabel(stats: CoverageStats): string {
-  return `${stats.evaluated} / ${stats.total} rules judged`
+  return `${stats.evaluated} / ${stats.total} rules answered`
 }
 
 export function coverageStatusLabel(stats: CoverageStats, running = false): string {
@@ -80,20 +88,29 @@ export function coverageStatusLabel(stats: CoverageStats, running = false): stri
   return running ? 'In progress' : 'Incomplete'
 }
 
-/** The explanatory line under the coverage meter. */
+/**
+ * The explanatory line under the coverage meter.
+ *
+ * The completed wording is the one that matters most, and it has to be exact.
+ * The verdicts are no longer estimates — Postgres made every comparison and a
+ * triggered rule contributes its whole weight — but the run is still not
+ * reproducible, because the agent writes the query afresh each time and a
+ * different query can select differently. Claiming either less or more than that
+ * would be a lie about what a reviewer is holding.
+ */
 export function coverageExplanation(stats: CoverageStats, running = false): string {
   if (stats.total === 0) {
     return running
-      ? 'The coverage set is fixed at the start of the run; verdicts appear here as the agent submits them.'
+      ? 'The coverage set is fixed at the start of the run; verdicts appear here as each rule’s query is answered.'
       : 'No applicable rules were recorded for this analysis.'
   }
   if (!stats.complete) {
     const missing = stats.unjudged > 0 ? stats.unjudged : stats.total - stats.evaluated
     return running
-      ? `${missing} rule(s) still to judge. The loop cannot finish until every rule has a verdict.`
-      : `${missing} rule(s) were never judged, so this run was recorded as FAILED rather than reported as a complete review. The verdicts it did reach are kept below; re-run the analysis for a complete one.`
+      ? `${missing} rule(s) still to answer. The loop cannot finish until every rule has a verdict.`
+      : `${missing} rule(s) were never answered, so this run was recorded as FAILED rather than reported as a complete review. The verdicts it did reach are kept below; re-run the analysis for a complete one.`
   }
-  return 'Every applicable rule was judged by the agent. Each verdict is its own reading of the rule condition against this customer’s activity, not a recomputation — running the analysis again can reach different scores.'
+  return 'Every applicable rule was answered by a query the agent wrote and Postgres executed. Triggered means the query returned rows, and a triggered rule contributes its full weight, so the arithmetic is exact. The agent still chooses how to express each condition, so a re-run can write a different query and reach a different score.'
 }
 
 /**

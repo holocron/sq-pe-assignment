@@ -84,6 +84,12 @@ caa:
   agent:
     max-steps: 40
     max-coverage-reprompts: 3
+    # How many times one rule's condition may be re-expressed as SQL after a query was refused or
+    # errored. Only failures count - a query that ran costs nothing here - so this bounds how long
+    # the model may spend repairing one rule, never how many rules it may judge. Exhausting it does
+    # NOT record the rule as "not triggered": the rule stays unjudged and the coverage gate fails
+    # the run naming it, which is the whole point of the guarantee.
+    max-rule-sql-attempts: 3
     # gpt-oss-120b advertises a 131072-token window, but the lemonade backend serving it was
     # started with ctx_size=32768 - that is the limit actually enforced, and exceeding it fails
     # the whole request with "500: Context size has been exceeded". A full analysis is ~30 turns
@@ -110,6 +116,36 @@ caa:
       max-tokens: 4096
       max-transactions: 80
       temperature: 0.1
+  sql:
+    # The rule SQL layer: the agent writes a SELECT that answers a rule condition, PostgreSQL
+    # computes the answer, and "triggered" is read off the result. That means model-authored SQL
+    # runs against the customer database, so it runs as its own login role - see
+    # db/migration/V5__readonly_role.sql - whose entire privilege set is SELECT on five views that
+    # already contain nothing but the customer under analysis.
+    #
+    # This is NOT spring.datasource. It is a second, small pool that no transaction manager knows
+    # about, and it must never be pointed at the owner role: the credentials below are the security
+    # boundary, not a convenience.
+    datasource:
+      url: ${DB_URL:jdbc:postgresql://localhost:5432/caa}
+      username: ${DB_READONLY_USER:caa_readonly}
+      # Local-demo default, exactly like the caa/caa owner role above, and equally committed to the
+      # repository. The shipped pg_hba trusts loopback so it protects nothing here - the privilege
+      # set does. Anywhere the database is reachable over a network, set DB_READONLY_PASSWORD and
+      # ALTER ROLE caa_readonly PASSWORD to match.
+      password: ${DB_READONLY_PASSWORD:caa_readonly}
+      pool-size: 3
+      connection-timeout: 10s
+    # Every legitimate rule query reads a few hundred rows of one customer's activity and answers in
+    # single-digit milliseconds. Five seconds is therefore not a performance budget, it is the point
+    # at which a query has stopped being a rule query - a cartesian product, a pg_sleep that somehow
+    # got past the validator - and the server cancels it. Set on the transaction as a bound
+    # parameter, on the role in V5, and again as a JDBC query timeout.
+    statement-timeout: 5s
+    # Cap on the ids carried back, not on the verdict: matchedCount is always the true total, so a
+    # rule that matches 900 transactions still scores exactly the same as if all 900 were listed.
+    max-matched-ids: 500
+    max-fragment-chars: 8000
   cors:
     allowed-origins: http://localhost:5173
 
