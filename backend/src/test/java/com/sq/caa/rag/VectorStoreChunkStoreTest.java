@@ -31,7 +31,7 @@ class VectorStoreChunkStoreTest {
     private final FixedDimensionEmbeddingModel embeddingModel =
             new FixedDimensionEmbeddingModel(DIMENSIONS);
     private final VectorStoreChunkStore chunkStore = new VectorStoreChunkStore(vectorStore,
-            embeddingModel, properties(4), DIMENSIONS);
+            embeddingModel, properties(4), settingsProvider(DIMENSIONS));
 
     @Test
     @DisplayName("every chunk carries the metadata the spec fixes, and its section heading")
@@ -163,7 +163,7 @@ class VectorStoreChunkStoreTest {
     @DisplayName("a model whose vectors do not fit the column is refused before the insert fails")
     void refusesAMismatchedEmbeddingModel() {
         VectorStoreChunkStore mismatched = new VectorStoreChunkStore(vectorStore,
-                new FixedDimensionEmbeddingModel(1536), properties(4), DIMENSIONS);
+                new FixedDimensionEmbeddingModel(1536), properties(4), settingsProvider(DIMENSIONS));
 
         assertThatThrownBy(() -> mismatched.index(DOCUMENT_ID, "aml.docx", "AML Policy",
                 List.of(chunk(0, 0, "One", "First."))))
@@ -184,7 +184,35 @@ class VectorStoreChunkStoreTest {
                 .hasMessageContaining("aml.docx");
     }
 
+    @Test
+    @DisplayName("a runtime embedding-model change re-verifies against the new dimension")
+    void followsRuntimeDimensionChanges() {
+        java.util.concurrent.atomic.AtomicInteger dimension =
+                new java.util.concurrent.atomic.AtomicInteger(1536);
+        VectorStoreChunkStore store = new VectorStoreChunkStore(vectorStore,
+                embeddingModel, properties(4),
+                () -> new com.sq.caa.llm.EffectiveLlmSettings("http://localhost", "chat-model",
+                        "embed-model", dimension.get(), "", "", "test", null, null));
+
+        // First configuration expects 1536 but the model serves 2560: refused.
+        assertThatThrownBy(() -> store.index(DOCUMENT_ID, "aml.docx", "AML Policy",
+                List.of(chunk(0, 0, "One", "First."))))
+                .isInstanceOf(KnowledgeIndexException.class);
+
+        // After the admin re-saves the embedding model, the column and the recorded dimension
+        // move to 2560 and the same store accepts the write.
+        dimension.set(DIMENSIONS);
+        int stored = store.index(DOCUMENT_ID, "aml.docx", "AML Policy",
+                List.of(chunk(0, 0, "One", "First.")));
+        assertThat(stored).isEqualTo(1);
+    }
+
     /* ------------------------------------------------------------------ */
+
+    private static com.sq.caa.llm.LlmSettingsProvider settingsProvider(int dimensions) {
+        return () -> new com.sq.caa.llm.EffectiveLlmSettings("http://localhost", "chat-model",
+                "embed-model", dimensions, "", "", "test", null, null);
+    }
 
     private static RagProperties properties(int batchSize) {
         return new RagProperties(800, 100, 5, 25, 0.0, batchSize, 20_971_520L, false);

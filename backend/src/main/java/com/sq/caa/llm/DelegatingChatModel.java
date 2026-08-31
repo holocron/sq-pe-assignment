@@ -33,6 +33,13 @@ public class DelegatingChatModel implements ChatModel {
     }
 
     @Override
+    public ChatOptions getOptions() {
+        // ChatModel.getOptions() is a default method that returns null unless overridden;
+        // RiskAgentLoop.modelId() reads it to record which model a run used, so it must delegate.
+        return settingsService.chatModel().getOptions();
+    }
+
+    @Override
     public ChatOptions getDefaultOptions() {
         return settingsService.chatModel().getDefaultOptions();
     }

@@ -78,18 +78,18 @@ public class VectorStoreSchemaVerifier implements InitializingBean {
     private final RagProperties properties;
     private final String schemaName;
     private final String tableName;
-    private final int dimensions;
+    private final com.sq.caa.llm.LlmSettingsProvider llmSettings;
 
     public VectorStoreSchemaVerifier(JdbcTemplate jdbcTemplate,
             RagProperties properties,
             @Value("${spring.ai.vectorstore.pgvector.schema-name:public}") String schemaName,
             @Value("${spring.ai.vectorstore.pgvector.table-name:vector_store}") String tableName,
-            @Value("${spring.ai.vectorstore.pgvector.dimensions:1536}") int dimensions) {
+            com.sq.caa.llm.LlmSettingsProvider llmSettings) {
         this.jdbcTemplate = jdbcTemplate;
         this.properties = properties;
         this.schemaName = schemaName;
         this.tableName = tableName;
-        this.dimensions = dimensions;
+        this.llmSettings = llmSettings;
     }
 
     @Override
@@ -103,6 +103,11 @@ public class VectorStoreSchemaVerifier implements InitializingBean {
 
     /** Runs the checks. Package visible so a test can call it directly. */
     void verify() {
+        // The expected dimension is the runtime one: the admin LLM settings re-create the column
+        // when the embedding model changes, and llm_settings.embed_dimension tracks that change
+        // (no settings row = the environment default, which is the same source).
+        int dimensions = llmSettings.effective().embedDimension();
+
         Set<String> actual = new LinkedHashSet<>();
         for (Map<String, Object> row : jdbcTemplate.queryForList(COLUMNS_SQL, schemaName, tableName)) {
             actual.add(String.valueOf(row.get("column_name")).toLowerCase(Locale.ROOT));
@@ -125,21 +130,22 @@ public class VectorStoreSchemaVerifier implements InitializingBean {
                 jdbcTemplate.queryForObject(EMBEDDING_DIMENSION_SQL, Integer.class, schemaName, tableName);
         if (declaredDimension == null || declaredDimension != dimensions) {
             throw new IllegalStateException("Vector store table " + qualifiedName()
-                    + " declares embedding vector(" + declaredDimension + ") but "
-                    + "spring.ai.vectorstore.pgvector.dimensions is " + dimensions
-                    + ". The column and the embedding model must agree.");
+                    + " declares embedding vector(" + declaredDimension + ") but the effective "
+                    + "embedding configuration expects " + dimensions
+                    + ". Re-save the embedding model in the admin LLM settings so the column is "
+                    + "rebuilt at the model's dimension.");
         }
 
         log.info("PgVectorStore schema verified: {} (id, content, metadata, embedding vector({}))",
                 qualifiedName(), dimensions);
-        reportVectorIndex();
+        reportVectorIndex(dimensions);
     }
 
     /**
      * Says out loud whether knowledge search is index-assisted or an exact scan, so the answer is
      * in the log rather than in someone's assumption.
      */
-    private void reportVectorIndex() {
+    private void reportVectorIndex(int dimensions) {
         List<String> indexes;
         try {
             indexes = jdbcTemplate.queryForList(EMBEDDING_INDEX_SQL, String.class, schemaName,

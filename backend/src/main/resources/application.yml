@@ -22,7 +22,9 @@ spring:
       max-request-size: 25MB
   ai:
     openai:
-      api-key: ${OPENAI_API_KEY:none}
+      # Empty default: no key means "no credential" - the clients are then built keyless and no
+      # Authorization header is sent (local model servers ignore it; see OpenAiLlmClientFactory).
+      api-key: ${OPENAI_API_KEY:}
       # Single lemonade router on holominix (port 13305) fronts every model and routes by model id.
       # Spring AI 2.x uses the official OpenAI SDK, which expects /v1 inside the base URL.
       base-url: ${LLM_BASE_URL:http://localhost:13305/api/v1}

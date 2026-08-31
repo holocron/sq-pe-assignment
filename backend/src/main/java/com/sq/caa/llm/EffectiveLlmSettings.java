@@ -26,9 +26,10 @@ public record EffectiveLlmSettings(String baseUrl, String chatModel, String embe
     public static final String SOURCE_ENVIRONMENT = "environment";
 
     /**
-     * The boot placeholder used when no credential is configured (the documented default in
-     * {@code application.yml}); it counts as <em>not set</em> and exists only because the OpenAI
-     * SDK requires a non-empty key.
+     * Legacy placeholder for "no credential" ({@code OPENAI_API_KEY=none} was the documented boot
+     * default when the SDK could not be built keyless). It still counts as <em>not set</em>; the
+     * clients now send no Authorization header at all for it (see
+     * {@link OpenAiLlmClientFactory}).
      */
     public static final String NO_KEY_PLACEHOLDER = "none";
 

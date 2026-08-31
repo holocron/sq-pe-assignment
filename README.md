@@ -77,8 +77,20 @@ support and one embedding model. The environment variables are the **boot defaul
 export LLM_BASE_URL=http://localhost:13305/api/v1   # note: /v1 must be part of the base URL
 export LLM_CHAT_MODEL=gpt-oss-120b-GGUF
 export LLM_EMBED_MODEL=Qwen3-Embedding-4B-GGUF
-export OPENAI_API_KEY=none                          # a real key if your endpoint requires one
+export OPENAI_API_KEY=                              # a real key if your endpoint requires one
 ```
+
+An empty/unset key means **no credential at all**: the clients are built keyless and no
+`Authorization` header is sent (local servers such as lemonade or LM Studio ignore it). The old
+`OPENAI_API_KEY=none` placeholder is still accepted and treated the same way.
+
+**LM Studio model loading.** LM Studio does not load models on demand by default: a call for an
+unloaded model fails with `400 Failed to load model`. On that exact error the backend posts the
+model id to LM Studio's `POST {origin}/api/v1/models/load` (bounded by the configured LLM
+timeout — loading a large model takes minutes) and retries the call once; other errors are
+untouched, and endpoints without that API (lemonade, OpenAI) just get a clear "model not loaded,
+endpoint cannot load it" message. This applies to the connection test, the ReAct analysis and the
+RAG ingest/search alike.
 
 **Runtime settings, no restart.** Once running, an admin can change all of the above from the UI at
 **`/admin/llm-settings`** (API: `GET/PUT /api/admin/llm-settings`, plus a connection `.../test`, a

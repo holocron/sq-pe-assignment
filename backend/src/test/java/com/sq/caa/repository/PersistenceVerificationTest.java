@@ -60,6 +60,7 @@ import org.springframework.data.jpa.domain.Specification;
 class PersistenceVerificationTest {
 
     @Autowired private TestEntityManager entityManager;
+    @Autowired private org.springframework.core.env.Environment environment;
     @Autowired private CustomerRepository customers;
     @Autowired private TransactionRepository transactions;
     @Autowired private CardActivityRepository cardActivities;
@@ -544,11 +545,20 @@ class PersistenceVerificationTest {
                           and a.attname = 'embedding' and a.attnum > 0 and not a.attisdropped
                         """)
                 .getSingleResult();
-        assertEquals(2560, ((Number) dimensions).intValue());
+        // The embedding model is a runtime setting: when an admin has saved one, the column
+        // length follows llm_settings.embed_dimension; otherwise the environment default applies.
+        List<?> settingsDims = entityManager.getEntityManager()
+                .createNativeQuery("select embed_dimension from llm_settings")
+                .getResultList();
+        int vectorDimension = settingsDims.isEmpty()
+                ? Integer.parseInt(
+                        environment.getProperty("spring.ai.vectorstore.pgvector.dimensions", "2560"))
+                : ((Number) settingsDims.get(0)).intValue();
+        assertEquals(vectorDimension, ((Number) dimensions).intValue());
 
         // The exact upsert PgVectorStore issues, including the ?::jsonb cast into a json column.
         UUID chunkId = UUID.randomUUID();
-        String embedding = "[" + String.join(",", Collections.nCopies(2560, "0.01")) + "]";
+        String embedding = "[" + String.join(",", Collections.nCopies(vectorDimension, "0.01")) + "]";
         entityManager.getEntityManager()
                 .createNativeQuery("""
                         insert into document_chunks (id, content, metadata, embedding)

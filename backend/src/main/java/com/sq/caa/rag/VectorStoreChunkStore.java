@@ -15,8 +15,9 @@ import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.ai.vectorstore.filter.Filter;
 import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+
+import com.sq.caa.llm.LlmSettingsProvider;
 
 /**
  * {@link ChunkStore} backed by Spring AI's pgvector store.
@@ -34,11 +35,12 @@ import org.springframework.stereotype.Component;
  * {@code ON CONFLICT (id) DO UPDATE} in the store's insert overwrites the previous revision of a
  * chunk instead of leaving a duplicate behind.
  *
- * <p><b>Dimension guard.</b> The embedding model is a GGUF build served by a router that can be
- * pointed at a different model by configuration. If that model's vectors are not
- * {@code spring.ai.vectorstore.pgvector.dimensions} long, PostgreSQL rejects the insert with an
- * opaque type error. The first write therefore asks the model for its dimensionality (Spring AI
- * caches the answer) and fails with a message that names both numbers.
+ * <p><b>Dimension guard.</b> The embedding model is configured at runtime (admin LLM settings),
+ * and an embedding-model change re-creates {@code document_chunks.embedding} at the new model's
+ * dimension. The first write under each configuration asks the model for its dimensionality and
+ * compares it to the dimension recorded in the effective settings (which the settings service keeps
+ * in sync with the column type), failing with a message that names both numbers instead of letting
+ * PostgreSQL reject the insert with an opaque type error.
  */
 @Component
 public class VectorStoreChunkStore implements ChunkStore {
@@ -51,18 +53,19 @@ public class VectorStoreChunkStore implements ChunkStore {
     private final VectorStore vectorStore;
     private final EmbeddingModel embeddingModel;
     private final RagProperties properties;
-    private final int configuredDimensions;
+    private final LlmSettingsProvider llmSettings;
 
-    private volatile boolean dimensionsVerified;
+    /** The (model, dimension) pair the guard last verified; a settings change re-verifies. */
+    private volatile String verifiedConfig;
 
     public VectorStoreChunkStore(VectorStore vectorStore,
             EmbeddingModel embeddingModel,
             RagProperties properties,
-            @Value("${spring.ai.vectorstore.pgvector.dimensions:1536}") int configuredDimensions) {
+            LlmSettingsProvider llmSettings) {
         this.vectorStore = vectorStore;
         this.embeddingModel = embeddingModel;
         this.properties = properties;
-        this.configuredDimensions = configuredDimensions;
+        this.llmSettings = llmSettings;
     }
 
     /* ------------------------------------------------------------------ */
@@ -250,7 +253,9 @@ public class VectorStoreChunkStore implements ChunkStore {
     /* ------------------------------------------------------------------ */
 
     private void verifyEmbeddingDimensions() {
-        if (dimensionsVerified) {
+        var settings = llmSettings.effective();
+        String configKey = settings.embedModel() + "@" + settings.embedDimension();
+        if (configKey.equals(verifiedConfig)) {
             return;
         }
         int actual;
@@ -261,14 +266,13 @@ public class VectorStoreChunkStore implements ChunkStore {
             throw new KnowledgeIndexException("The embedding model could not be reached, so the "
                     + "document cannot be indexed: " + rootMessage(e), e);
         }
-        if (actual != configuredDimensions) {
+        if (actual != settings.embedDimension()) {
             throw new KnowledgeIndexException("The embedding model returns " + actual
                     + "-dimensional vectors but document_chunks.embedding is vector("
-                    + configuredDimensions + "). Point spring.ai.openai.embedding.options.model at "
-                    + "the right model, or align spring.ai.vectorstore.pgvector.dimensions and the "
-                    + "Flyway migration.");
+                    + settings.embedDimension() + "). Re-save the embedding model in the admin LLM "
+                    + "settings so the column is rebuilt at the model's dimension.");
         }
-        dimensionsVerified = true;
+        verifiedConfig = configKey;
         log.info("Embedding model verified at {} dimensions", actual);
     }
 
