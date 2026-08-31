@@ -67,4 +67,12 @@ public class KnowledgeDocument {
     /** Failure detail when {@link #status} is {@link DocumentStatus#FAILED}. */
     @Column(name = "error", columnDefinition = "text")
     private String error;
+
+    /**
+     * The original upload bytes, kept so an embedding-model change can re-extract, re-chunk and
+     * re-embed the document without asking the administrator to upload it again. Null for documents
+     * uploaded before the column was added (V7).
+     */
+    @Column(name = "source_bytes")
+    private byte[] sourceBytes;
 }

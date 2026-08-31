@@ -62,7 +62,8 @@ export function normalizeLlmSettings(wire: LlmSettingsWire | null | undefined): 
     chatModel: typeof wire?.chatModel === 'string' ? wire.chatModel : '',
     embedModel: typeof wire?.embedModel === 'string' ? wire.embedModel : '',
     embedDimension: toFiniteNumber(wire?.embedDimension),
-    apiKeySet: wire?.apiKeySet === true,
+    chatApiKeySet: wire?.chatApiKeySet === true,
+    embedApiKeySet: wire?.embedApiKeySet === true,
     source: toSource(wire?.source),
     updatedAt: trimmedOrNull(wire?.updatedAt),
     updatedBy: trimmedOrNull(wire?.updatedBy),
@@ -88,16 +89,23 @@ export async function fetchLlmSettings(): Promise<LlmSettings> {
   return normalizeLlmSettings(await getJson<LlmSettingsWire>('/admin/llm-settings'))
 }
 
-/** `PUT /api/admin/llm-settings` (ADMIN) — may answer 409 on an unconfirmed embedding-model change. */
-export async function updateLlmSettings(input: LlmSettingsInput): Promise<LlmSettingsSaveResult> {
+/** Shared PUT/test body builder. Per-model keys follow the contract: field
+    omitted = keep the stored key; empty string = explicitly no key; non-empty
+    = set. Callers only pass the fields the admin actually touched. */
+function llmSettingsBody(input: LlmSettingsInput): LlmSettingsInput {
   const body: LlmSettingsInput = {
     baseUrl: input.baseUrl.trim(),
     chatModel: input.chatModel.trim(),
     embedModel: input.embedModel.trim(),
   }
-  // An empty key field means "keep the configured one" — never send ''.
-  const apiKey = input.apiKey?.trim()
-  if (apiKey) body.apiKey = apiKey
+  if (input.chatApiKey !== undefined) body.chatApiKey = input.chatApiKey.trim()
+  if (input.embedApiKey !== undefined) body.embedApiKey = input.embedApiKey.trim()
+  return body
+}
+
+/** `PUT /api/admin/llm-settings` (ADMIN) — may answer 409 on an unconfirmed embedding-model change. */
+export async function updateLlmSettings(input: LlmSettingsInput): Promise<LlmSettingsSaveResult> {
+  const body = llmSettingsBody(input)
   if (input.confirmReembed === true) body.confirmReembed = true
   const wire = await putJson<LlmSettingsSaveWire, LlmSettingsInput>('/admin/llm-settings', body)
   return { settings: normalizeLlmSettings(wire), reembedStarted: wire?.reembedStarted === true }
@@ -123,16 +131,9 @@ export async function fetchLlmModels(params: FetchLlmModelsParams): Promise<stri
 
 /** `POST /api/admin/llm-settings/test` (ADMIN) — probes chat and embeddings. */
 export async function testLlmConnection(input: LlmSettingsInput): Promise<LlmConnectionTest> {
-  const body: LlmSettingsInput = {
-    baseUrl: input.baseUrl.trim(),
-    chatModel: input.chatModel.trim(),
-    embedModel: input.embedModel.trim(),
-  }
-  const apiKey = input.apiKey?.trim()
-  if (apiKey) body.apiKey = apiKey
   const wire = await postJson<LlmConnectionTestWire, LlmSettingsInput>(
     '/admin/llm-settings/test',
-    body,
+    llmSettingsBody(input),
   )
   return {
     chat: {

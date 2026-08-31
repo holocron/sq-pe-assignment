@@ -26,8 +26,12 @@ import org.springframework.stereotype.Component;
 @Component
 public class OpenAiLlmClientFactory implements LlmClientFactory {
 
-    /** The credential placeholder sent when no key is configured; lemonade accepts anything. */
-    private static final String NO_KEY = "none";
+    /**
+     * The credential placeholder sent when no key is configured. The OpenAI SDK rejects a
+     * null/empty key at build time, but local model servers (e.g. lemonade) accept any value, so
+     * "none" is sent and ignored. See {@link EffectiveLlmSettings#NO_KEY_PLACEHOLDER}.
+     */
+    private static final String NO_KEY = EffectiveLlmSettings.NO_KEY_PLACEHOLDER;
 
     private final LlmDefaults defaults;
 
@@ -38,7 +42,7 @@ public class OpenAiLlmClientFactory implements LlmClientFactory {
     @Override
     public ChatModel chatModel(EffectiveLlmSettings settings) {
         return OpenAiChatModel.builder()
-                .openAiClient(openAiClient(settings))
+                .openAiClient(openAiClient(settings, settings.chatApiKey()))
                 .options(OpenAiChatOptions.builder()
                         .model(settings.chatModel())
                         .temperature(defaults.temperature())
@@ -55,7 +59,7 @@ public class OpenAiLlmClientFactory implements LlmClientFactory {
     @Override
     public EmbeddingModel embeddingModel(EffectiveLlmSettings settings) {
         return OpenAiEmbeddingModel.builder()
-                .openAiClient(openAiClient(settings))
+                .openAiClient(openAiClient(settings, settings.embedApiKey()))
                 .metadataMode(MetadataMode.EMBED)
                 .options(OpenAiEmbeddingOptions.builder()
                         .model(settings.embedModel())
@@ -63,15 +67,14 @@ public class OpenAiLlmClientFactory implements LlmClientFactory {
                 .build();
     }
 
-    private OpenAIClient openAiClient(EffectiveLlmSettings settings) {
-        String apiKey = settings.apiKey() == null || settings.apiKey().isBlank()
-                ? NO_KEY : settings.apiKey();
+    private OpenAIClient openAiClient(EffectiveLlmSettings settings, String apiKey) {
+        String key = apiKey == null || apiKey.isBlank() ? NO_KEY : apiKey;
         return new OpenAIClientImpl(ClientOptions.builder()
                 .httpClient(SpringAiOpenAiHttpClient.builder()
                         .timeout(defaults.timeout())
                         .build())
                 .baseUrl(settings.baseUrl())
-                .apiKey(apiKey)
+                .apiKey(key)
                 .timeout(defaults.timeout())
                 .maxRetries(defaults.maxRetries())
                 .build());

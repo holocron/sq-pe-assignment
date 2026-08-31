@@ -217,7 +217,12 @@ function LlmSettingsForm({ settings }: { settings: LlmSettings }) {
   const [baseUrl, setBaseUrl] = useState(settings.baseUrl)
   const [chatModel, setChatModel] = useState(settings.chatModel)
   const [embedModel, setEmbedModel] = useState(settings.embedModel)
-  const [apiKey, setApiKey] = useState('')
+  /* Per-model keys: a field starts "untouched" (not sent on save/test — the
+     server keeps the stored key). Once the admin edits it, the field is dirty
+     and its content is sent verbatim — an emptied field therefore goes out as
+     '' which the server reads as "explicitly no key" (local model servers). */
+  const [chatApiKey, setChatApiKey] = useState<string | null>(null)
+  const [embedApiKey, setEmbedApiKey] = useState<string | null>(null)
   const [baseUrlError, setBaseUrlError] = useState<string | null>(null)
 
   /* Model dropdowns are populated on demand; a 502/unreachable endpoint drops
@@ -277,14 +282,22 @@ function LlmSettingsForm({ settings }: { settings: LlmSettings }) {
   const busy = update.isPending
 
   function currentInput(): LlmSettingsInput {
-    return { baseUrl, chatModel, embedModel, ...(apiKey.trim() ? { apiKey } : {}) }
+    return {
+      baseUrl,
+      chatModel,
+      embedModel,
+      ...(chatApiKey !== null ? { chatApiKey } : {}),
+      ...(embedApiKey !== null ? { embedApiKey } : {}),
+    }
   }
 
   function handleFetchModels(): void {
     const error = validateBaseUrl(baseUrl)
     setBaseUrlError(error)
     if (error) return
-    modelsQuery.mutate({ baseUrl, ...(apiKey.trim() ? { apiKey } : {}) })
+    /* The models listing takes one endpoint-level key — the dirty chat key. */
+    const apiKey = chatApiKey?.trim()
+    modelsQuery.mutate({ baseUrl, ...(apiKey ? { apiKey } : {}) })
   }
 
   function handleTestConnection(): void {
@@ -423,15 +436,26 @@ function LlmSettingsForm({ settings }: { settings: LlmSettings }) {
           )}
         </div>
 
-        <Input
-          label="API key"
-          type="password"
-          value={apiKey}
-          onChange={(event) => setApiKey(event.target.value)}
-          placeholder={settings.apiKeySet ? '•••• configured' : 'Not configured'}
-          hint="Leave empty to keep the configured key."
-          autoComplete="off"
-        />
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Input
+            label="Chat model API key"
+            type="password"
+            value={chatApiKey ?? ''}
+            onChange={(event) => setChatApiKey(event.target.value)}
+            placeholder={settings.chatApiKeySet ? '•••• configured' : 'Not configured'}
+            hint="Leave empty for no key (local model servers); leave untouched to keep the current key."
+            autoComplete="off"
+          />
+          <Input
+            label="Embedding model API key"
+            type="password"
+            value={embedApiKey ?? ''}
+            onChange={(event) => setEmbedApiKey(event.target.value)}
+            placeholder={settings.embedApiKeySet ? '•••• configured' : 'Not configured'}
+            hint="Leave empty for no key (local model servers); leave untouched to keep the current key."
+            autoComplete="off"
+          />
+        </div>
 
         <div className="flex flex-wrap items-center gap-2 border-t border-border pt-4">
           <Button
@@ -515,7 +539,7 @@ export function LlmSettingsPage() {
       <PageHeader
         eyebrow={<BackLink to="/dashboard">Dashboard</BackLink>}
         title="LLM settings"
-        description="OpenAI-compatible endpoint and models used for analyses and knowledge-base embeddings. Saved settings take effect at runtime; the API key is stored server-side and never shown."
+        description="OpenAI-compatible endpoint and models used for analyses and knowledge-base embeddings. Saved settings take effect at runtime; the API keys are stored server-side and never shown."
       />
 
       {settings.isLoading ? (

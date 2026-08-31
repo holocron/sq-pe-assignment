@@ -69,7 +69,7 @@ Role checks are enforced server-side as well; the client gate is a courtesy, not
 * **Numbers are tabular** (`font-variant-numeric: tabular-nums`), measures (money, counts, scores,
   durations, sizes) are right-aligned, dates and identifiers stay left-aligned, and money is only
   labelled with a currency code when the figure is genuinely single-currency.
-* **Brand chrome, per `docs/DESIGN_SYSTEM.md`.** Swissquote-black sidebar (`#323232`) carrying the
+* **Brand chrome, per `docs/DESIGN_SYSTEM.md`.** brand-black sidebar (`#323232`) carrying the
   wordmark, brand-orange `#fa5b35` for CTAs, focus rings and the active-nav rail, white content
   surfaces on a grey-100 page, hairline borders and the restrained radius scale
   (`xxs 2 · xs 4 · md 8 · xl 12 · 2xl 16`). Uppercase micro-labels share one tracking step
@@ -77,20 +77,20 @@ Role checks are enforced server-side as well; the client gate is a courtesy, not
 
 ### The wordmark is a placeholder
 
-The licensed Swissquote logo asset is deliberately **not** bundled with this repository. The
-sign-in screen and the sidebar render a text stand-in — "Swissquote" in the brand sans stack with
-tight tracking, a brand-orange square mark beside it and "Customer Activity Analytics" as the
+The licensed logo asset is deliberately **not** bundled with this repository. The
+sign-in screen and the sidebar render a text stand-in — the company name in the brand sans stack
+with tight tracking, a brand-orange square mark beside it and "Customer Activity Analytics" as the
 lighter secondary line (`Brand` in `src/components/layout/AppShell.tsx`, `Wordmark` in
 `src/pages/LoginPage.tsx`). Swap in the real asset there; nothing else depends on it.
 
 The type stack is progressive — `"GT America", "Inter", "Helvetica Neue", Helvetica, Arial` — so a
-Swissquote workstation with the licensed face renders the true brand font and everything else
+workstation with the licensed face renders the true brand font and everything else
 degrades cleanly.
 
 ### Documented contrast trade-off
 
 White on the brand orange `#fa5b35` measures **3.2:1**, below the WCAG AA 4.5:1 required of 14px
-text. It is kept for the primary CTA only — that pairing is the Swissquote brand button, and it
+text. It is kept for the primary CTA only — that pairing is the brand button, and it
 still clears the 3:1 required of the control itself. Darkening the fill until the label passes
 lands between `#c94a2b` and `--sq-primary-700 #b24126`, which is visually the risk-HIGH fill
 (`#c2410c`): the cure would break the design system's one hard rule, that brand chrome and risk
@@ -128,5 +128,5 @@ Behaviour that depends on the backend beyond the plain contract:
 ## Placeholder assets
 
 `public/favicon.svg` is a hand-drawn shield mark on the brand orange, **not** a licensed brand
-asset. If this ships inside Swissquote it should be replaced with the real logo, along with the
-sidebar/sign-in wordmark described above.
+asset. If this ships inside the operator's organisation it should be replaced with the real logo,
+along with the sidebar/sign-in wordmark described above.

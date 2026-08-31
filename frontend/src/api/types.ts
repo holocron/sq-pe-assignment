@@ -937,14 +937,16 @@ export interface KnowledgeChunk {
 export const LLM_SETTINGS_SOURCES = ['database', 'environment'] as const
 export type LlmSettingsSource = (typeof LLM_SETTINGS_SOURCES)[number]
 
-/** Normalised `GET /api/admin/llm-settings`. The API key itself never leaves the server. */
+/** Normalised `GET /api/admin/llm-settings`. The API keys themselves never leave the server. */
 export interface LlmSettings {
   baseUrl: string
   chatModel: string
   embedModel: string
   embedDimension: number | null
-  /** True when a key is stored/configured; the value is never returned. */
-  apiKeySet: boolean
+  /** True when a chat key is stored/configured; the value is never returned. */
+  chatApiKeySet: boolean
+  /** True when an embedding key is stored/configured; the value is never returned. */
+  embedApiKeySet: boolean
   /** Where the active configuration comes from — runtime override or env fallback. */
   source: LlmSettingsSource
   updatedAt: IsoDateTime | null
@@ -957,18 +959,24 @@ export interface LlmSettingsWire {
   chatModel?: string | null
   embedModel?: string | null
   embedDimension?: number | string | null
-  apiKeySet?: boolean | null
+  chatApiKeySet?: boolean | null
+  embedApiKeySet?: boolean | null
   source?: string | null
   updatedAt?: string | null
   updatedBy?: string | null
 }
 
-/** `PUT /api/admin/llm-settings` body. Omit `apiKey` to keep the stored key. */
+/**
+ * `PUT /api/admin/llm-settings` and `POST .../test` body. Per-model keys:
+ * field omitted = keep the stored key, empty string = explicitly no key
+ * (local model servers), non-empty = set.
+ */
 export interface LlmSettingsInput {
   baseUrl: string
   chatModel: string
   embedModel: string
-  apiKey?: string
+  chatApiKey?: string
+  embedApiKey?: string
   /** Required when `embedModel` changes — every knowledge-base vector is rebuilt. */
   confirmReembed?: boolean
 }

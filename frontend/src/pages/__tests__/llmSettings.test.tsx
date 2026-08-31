@@ -32,7 +32,8 @@ const SETTINGS: LlmSettingsWire = {
   chatModel: 'gpt-oss-120b',
   embedModel: 'text-embedding-3-small',
   embedDimension: 1536,
-  apiKeySet: true,
+  chatApiKeySet: true,
+  embedApiKeySet: false,
   source: 'database',
   updatedAt: '2026-08-30T12:00:00Z',
   updatedBy: 'admin',
@@ -89,12 +90,19 @@ describe('LlmSettingsPage', () => {
     renderPage()
 
     expect(await screen.findByLabelText(/Base URL/)).toHaveValue('http://localhost:11434/v1')
-    expect(screen.getByLabelText(/Chat model/)).toHaveValue('gpt-oss-120b')
-    expect(screen.getByLabelText(/Embedding model/)).toHaveValue('text-embedding-3-small')
+    expect(screen.getByLabelText(/^Chat model \*$/)).toHaveValue('gpt-oss-120b')
+    expect(screen.getByLabelText(/^Embedding model \*$/)).toHaveValue('text-embedding-3-small')
     expect(screen.getByText('Database override')).toBeInTheDocument()
     expect(screen.getByText('Embedding dimension 1536')).toBeInTheDocument()
-    /* The stored key is never shown — only acknowledged as the placeholder. */
-    expect(screen.getByLabelText(/API key/)).toHaveAttribute('placeholder', '•••• configured')
+    /* The stored keys are never shown — only acknowledged as placeholders. */
+    expect(screen.getByLabelText('Chat model API key')).toHaveAttribute(
+      'placeholder',
+      '•••• configured',
+    )
+    expect(screen.getByLabelText('Embedding model API key')).toHaveAttribute(
+      'placeholder',
+      'Not configured',
+    )
   })
 
   it('surfaces a failed settings load with a retry affordance', async () => {
@@ -136,7 +144,7 @@ describe('model list', () => {
       })
     })
 
-    const chatSelect = (await screen.findByLabelText(/Chat model/)) as HTMLSelectElement
+    const chatSelect = (await screen.findByLabelText(/^Chat model$/)) as HTMLSelectElement
     expect(chatSelect.tagName).toBe('SELECT')
     expect(chatSelect).toHaveValue('gpt-oss-120b')
     expect(screen.getAllByRole('option', { name: 'qwen3-32b' }).length).toBeGreaterThan(0)
@@ -165,10 +173,10 @@ describe('model list', () => {
 
     expect(await screen.findByText('Model list unavailable')).toBeInTheDocument()
     expect(screen.getByText('The endpoint did not answer.')).toBeInTheDocument()
-    const chatInput = screen.getByLabelText(/Chat model/)
+    const chatInput = screen.getByLabelText(/^Chat model \*$/)
     expect(chatInput.tagName).toBe('INPUT')
     expect(chatInput).toHaveValue('gpt-oss-120b')
-    expect(screen.getByLabelText(/Embedding model/)).toHaveValue('text-embedding-3-small')
+    expect(screen.getByLabelText(/^Embedding model \*$/)).toHaveValue('text-embedding-3-small')
   })
 })
 
@@ -195,6 +203,48 @@ describe('saving', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
+  it('omits untouched keys and sends the dirty per-model keys on save', async () => {
+    mockPut.mockResolvedValue({ ...SETTINGS, chatApiKeySet: true, reembedStarted: false } as never)
+    renderPage()
+    await screen.findByLabelText(/Base URL/)
+
+    fireEvent.change(screen.getByLabelText('Chat model API key'), {
+      target: { value: 'sk-chat-new' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save settings' }))
+
+    await waitFor(() => {
+      expect(mockPut).toHaveBeenCalledWith('/admin/llm-settings', {
+        baseUrl: 'http://localhost:11434/v1',
+        chatModel: 'gpt-oss-120b',
+        embedModel: 'text-embedding-3-small',
+        chatApiKey: 'sk-chat-new',
+      })
+    })
+    /* The embedding key field was never touched — omitted, so the server
+       keeps the stored one (omitted ≠ ''). */
+    expect(mockPut.mock.calls[0][1]).not.toHaveProperty('embedApiKey')
+  })
+
+  it('sends an empty string for a key the admin typed into and then cleared', async () => {
+    mockPut.mockResolvedValue({ ...SETTINGS, chatApiKeySet: false, reembedStarted: false } as never)
+    renderPage()
+    await screen.findByLabelText(/Base URL/)
+    const chatKey = screen.getByLabelText('Chat model API key')
+
+    fireEvent.change(chatKey, { target: { value: 'sk-temp' } })
+    fireEvent.change(chatKey, { target: { value: '' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save settings' }))
+
+    /* Cleared, not untouched: '' tells the server "explicitly no key". */
+    await waitFor(() => {
+      expect(mockPut).toHaveBeenCalledWith(
+        '/admin/llm-settings',
+        expect.objectContaining({ chatApiKey: '' }),
+      )
+    })
+  })
+
   it('asks for confirmation before changing the embedding model, then sends confirmReembed', async () => {
     mockPut.mockResolvedValue({
       ...SETTINGS,
@@ -202,7 +252,7 @@ describe('saving', () => {
       reembedStarted: false,
     } as never)
     renderPage()
-    const embedField = await screen.findByLabelText(/Embedding model/)
+    const embedField = await screen.findByLabelText(/^Embedding model \*$/)
     fireEvent.change(embedField, { target: { value: 'bge-m3' } })
 
     fireEvent.click(screen.getByRole('button', { name: 'Save settings' }))
@@ -225,7 +275,7 @@ describe('saving', () => {
 
   it('does nothing when the confirmation is cancelled', async () => {
     renderPage()
-    const embedField = await screen.findByLabelText(/Embedding model/)
+    const embedField = await screen.findByLabelText(/^Embedding model \*$/)
     fireEvent.change(embedField, { target: { value: 'bge-m3' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save settings' }))
 
@@ -251,7 +301,7 @@ describe('saving', () => {
     /* Even a save that went straight to PUT (no client-side change detected
        here because the loaded value races the mock) surfaces the modal, not a
        toast. */
-    fireEvent.change(await screen.findByLabelText(/Embedding model/), {
+    fireEvent.change(await screen.findByLabelText(/^Embedding model \*$/), {
       target: { value: 'text-embedding-3-small' },
     })
     fireEvent.click(screen.getByRole('button', { name: 'Save settings' }))
@@ -266,6 +316,30 @@ describe('saving', () => {
 /* -------------------------------------------------------------------------- */
 
 describe('connection test', () => {
+  it('sends the dirty per-model keys and omits untouched ones', async () => {
+    mockPost.mockResolvedValue({
+      chat: { ok: true, detail: null },
+      embed: { ok: true, detail: null, dimension: 1536 },
+    } as never)
+    renderPage()
+    await screen.findByLabelText(/Base URL/)
+
+    fireEvent.change(screen.getByLabelText('Embedding model API key'), {
+      target: { value: 'sk-embed-new' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Test connection' }))
+
+    await waitFor(() => {
+      expect(mockPost).toHaveBeenCalledWith('/admin/llm-settings/test', {
+        baseUrl: 'http://localhost:11434/v1',
+        chatModel: 'gpt-oss-120b',
+        embedModel: 'text-embedding-3-small',
+        embedApiKey: 'sk-embed-new',
+      })
+    })
+    expect(mockPost.mock.calls[0][1]).not.toHaveProperty('chatApiKey')
+  })
+
   it('renders per-model results with the embedding dimension', async () => {
     mockPost.mockResolvedValue({
       chat: { ok: true, detail: 'Answered in 240 ms.' },

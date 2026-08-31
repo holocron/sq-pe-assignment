@@ -20,8 +20,10 @@ import org.hibernate.type.SqlTypes;
  * <p>An absent row means "use the environment configuration"; this entity only exists once an
  * admin has saved settings through {@code PUT /api/admin/llm-settings}.
  *
- * <p>{@code apiKey} is plaintext by deliberate prototype decision (see the V7 migration and the
- * README); it must never be serialised - the API exposes only whether a key is set.
+ * <p>{@code chatApiKey} and {@code embedApiKey} are plaintext by deliberate prototype decision
+ * (see the V7/V8 migrations and the README); they must never be serialised - the API exposes only
+ * whether each key is set. An empty string is an explicit "no key" (local model servers); a null
+ * column (only possible on rows migrated by V8) reads the same.
  */
 @Entity
 @Table(name = "llm_settings")
@@ -52,9 +54,13 @@ public class LlmSettings {
     @Column(name = "embed_dimension", nullable = false)
     private int embedDimension;
 
-    /** Null means "fall back to the environment key". */
-    @Column(name = "api_key", columnDefinition = "text")
-    private String apiKey;
+    /** Chat credential; empty string is an explicit "no key". */
+    @Column(name = "chat_api_key", columnDefinition = "text")
+    private String chatApiKey;
+
+    /** Embedding credential; empty string is an explicit "no key". */
+    @Column(name = "embed_api_key", columnDefinition = "text")
+    private String embedApiKey;
 
     @JdbcTypeCode(SqlTypes.TIMESTAMP)
     @Column(name = "updated_at", nullable = false)

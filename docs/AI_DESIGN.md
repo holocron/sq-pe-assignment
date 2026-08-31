@@ -203,7 +203,7 @@ subagent definitions live in `.claude/agents/` (`implementation-agent`, `code-re
 |---|---|---|
 | **Backend build** | 10 | Persistence → verify → 3 parallel core features → integrate → 3 parallel AI features → full integration |
 | **Frontend build** | 6 | Foundation → 4 parallel feature areas → integration |
-| **Swissquote re-skin** | 5 | Design tokens and primitives → 3 parallel screen passes → design/accessibility review |
+| **Brand re-skin** | 5 | Design tokens and primitives → 3 parallel screen passes → design/accessibility review |
 | **Code review** | 53 | 6 dimension reviewers → **one adversarial verifier per finding** |
 | **Fix pass** | 7 | 6 parallel fix areas → integration and re-verification |
 

@@ -1,8 +1,9 @@
-# Swissquote Corporate Design System
+# Corporate Design System
 
-This is an **internal Swissquote tool**. The UI must read as Swissquote, not as a generic dashboard.
-The tokens below were extracted from Swissquote's live production stylesheets (their `--cws--*`
-design tokens), so they are the real brand values, not an approximation.
+This is an **internal tool for a financial-services operator**. The UI must read as the operator's
+own brand, not as a generic dashboard. The tokens below were extracted from the operator's live
+production stylesheets (their `--cws--*` design tokens), so they are the real brand values, not an
+approximation.
 
 ## Brand colours
 
@@ -13,15 +14,15 @@ design tokens), so they are the real brand values, not an approximation.
 | `--sq-primary-200` | `#fdb4a2` | |
 | `--sq-primary-300` | `#fc9178` | |
 | `--sq-primary-400` | `#fb7c5d` | hover |
-| **`--sq-primary-500`** | **`#fa5b35`** | **the Swissquote brand orange — primary CTAs, active nav, focus accent** |
+| **`--sq-primary-500`** | **`#fa5b35`** | **the brand orange — primary CTAs, active nav, focus accent** |
 | `--sq-primary-600` | `#e45330` | pressed |
 | `--sq-primary-700` | `#b24126` | |
 | `--sq-primary-800` | `#8a321d` | |
 | `--sq-primary-900` | `#692616` | |
-| **`--sq-black`** | **`#323232`** | Swissquote black — header/sidebar chrome, headings |
+| **`--sq-black`** | **`#323232`** | brand black — header/sidebar chrome, headings |
 | `--sq-white` | `#ffffff` | |
 
-Neutral scale (Swissquote grey):
+Neutral scale (brand grey):
 `50 #fafafa · 100 #f9fafb · 200 #f3f4f6 · 300 #e5e7eb · 400 #98a2b3 · 500 #475467 · 600 #4b5563 · 700 #374151 · 800 #1f2937 · 900 #111827`
 
 Secondary blue (used sparingly for informational, non-risk emphasis):
@@ -29,9 +30,9 @@ Secondary blue (used sparingly for informational, non-risk emphasis):
 
 ## Typography
 
-Swissquote uses **GT America** (sans), **GT Sectra** (serif) and **SwissquoteCT** (display).
-These are licensed and are NOT bundled here. Use a progressive stack so a real Swissquote
-workstation renders the true brand font and everything else degrades cleanly:
+The brand typefaces are **GT America** (sans), **GT Sectra** (serif) and a custom display face.
+These are licensed and are NOT bundled here. Use a progressive stack so a workstation with the
+licensed fonts renders the true brand font and everything else degrades cleanly:
 
 ```css
 --sq-font-sans: "GT America", "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
@@ -43,7 +44,7 @@ Swiss typographic character: tight, confident headings; generous line-height in 
 
 ## Shape and density
 
-Restrained radii (Swissquote's scale is small): `xxs 2px · xs 4px · md 8px · xl 12px · 2xl 16px`.
+Restrained radii (the brand scale is small): `xxs 2px · xs 4px · md 8px · xl 12px · 2xl 16px`.
 Cards use `md`. Buttons use `xs`–`md`. Nothing is pill-shaped except badges.
 Layout is dense and information-first — this is a working tool for operators, not a marketing page.
 Prefer hairline borders (`grey-300`) over heavy shadows.
@@ -54,7 +55,7 @@ The brand orange `#fa5b35` sits in the same hue family as "danger". To stop the 
 operator, colour is split by ROLE and the two never mix:
 
 * **Chrome / interactive controls** — buttons, links, active nav, focus rings — use the brand orange
-  and Swissquote black. Controls are NEVER coloured by risk.
+  and brand black. Controls are NEVER coloured by risk.
 * **Data / risk signalling** — always rendered as a filled **badge or status pill**, never as a
   button or a link:
 
@@ -71,7 +72,7 @@ operator, colour is split by ROLE and the two never mix:
 
 ## Chrome layout
 
-* Left sidebar in Swissquote black (`#323232`) with the wordmark, white/grey nav labels, and the
+* Left sidebar in brand black (`#323232`) with the wordmark, white/grey nav labels, and the
   active item marked by a brand-orange left rail plus a lighter background.
 * Slim top bar on a white surface: page title/breadcrumb on the left; user name, role badge,
   theme toggle and logout on the right.
@@ -81,7 +82,7 @@ operator, colour is split by ROLE and the two never mix:
 
 ## Wordmark
 
-Do not fabricate or embed the real Swissquote logo asset. Render a clean text wordmark —
-"Swissquote" in the sans stack, tight tracking — with a small brand-orange mark beside it, and set
-the product name ("Customer Activity Analytics") as a lighter secondary line. Keep it obviously a
-placeholder for the real asset and say so in the README.
+Do not fabricate or embed the operator's real logo asset. Render a clean text wordmark in the sans
+stack, tight tracking, with a small brand-orange mark beside it, and set the product name
+("Customer Activity Analytics") as a lighter secondary line. Keep it obviously a placeholder for
+the real asset and say so in the README.

@@ -72,9 +72,12 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
             EmbeddingModel embeddingModel) {
     }
 
-    /** What a PUT wants to save; {@code apiKey} null means "keep the existing key". */
+    /**
+     * What a PUT wants to save. Per key, {@code null} keeps the current key, an empty/blank string
+     * is an explicit "no key" (local model servers), anything else sets the key.
+     */
     public record UpdateCommand(String baseUrl, String chatModel, String embedModel,
-            String apiKey, boolean confirmReembed) {
+            String chatApiKey, String embedApiKey, boolean confirmReembed) {
     }
 
     /** The saved settings and whether the embedding model (and therefore the corpus) changed. */
@@ -112,14 +115,15 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
     }
 
     private EffectiveLlmSettings fromEnvironment() {
+        // The environment has a single OPENAI_API_KEY; it is the boot credential for both models.
         return new EffectiveLlmSettings(defaults.baseUrl(), defaults.chatModel(), defaults.embedModel(),
-                defaults.embedDimension(), defaults.apiKey(),
+                defaults.embedDimension(), defaults.apiKey(), defaults.apiKey(),
                 EffectiveLlmSettings.SOURCE_ENVIRONMENT, null, null);
     }
 
     private static EffectiveLlmSettings fromRow(LlmSettings row) {
         return new EffectiveLlmSettings(row.getBaseUrl(), row.getChatModel(), row.getEmbedModel(),
-                row.getEmbedDimension(), row.getApiKey(),
+                row.getEmbedDimension(), row.getChatApiKey(), row.getEmbedApiKey(),
                 EffectiveLlmSettings.SOURCE_DATABASE, row.getUpdatedAt(), row.getUpdatedBy());
     }
 
@@ -179,10 +183,11 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
             throw new ReembedConfirmationRequiredException(current.embedModel(), embedModel);
         }
 
-        String apiKey = resolveApiKey(command.apiKey(), current);
+        String chatApiKey = resolveApiKey(command.chatApiKey(), current.chatApiKey());
+        String embedApiKey = resolveApiKey(command.embedApiKey(), current.embedApiKey());
         int embedDimension = current.embedDimension();
         if (embeddingModelChanged) {
-            embedDimension = probeDimension(baseUrl, embedModel, apiKey);
+            embedDimension = probeDimension(baseUrl, embedModel, embedApiKey);
             alterEmbeddingColumn(embedDimension);
         }
 
@@ -193,7 +198,8 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
         row.setChatModel(chatModel);
         row.setEmbedModel(embedModel);
         row.setEmbedDimension(embedDimension);
-        row.setApiKey(apiKey);
+        row.setChatApiKey(chatApiKey);
+        row.setEmbedApiKey(embedApiKey);
         row.setUpdatedAt(Instant.now());
         row.setUpdatedBy(updatedBy);
         LlmSettings saved = repository.saveAndFlush(row);
@@ -203,21 +209,22 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
     }
 
     /**
-     * The key that a row should carry: an explicit new key, null/blank for "fall back to the
-     * environment key", and - when the body omitted the field entirely - whatever the current
+     * The key that a row should carry: an explicit new key, an empty string for an explicit "no
+     * key" (local model servers - it does NOT fall back to the environment key, a row drives the
+     * whole configuration), and - when the body omitted the field entirely - whatever the current
      * configuration already resolves to.
      */
-    private String resolveApiKey(String requestedKey, EffectiveLlmSettings current) {
+    private String resolveApiKey(String requestedKey, String currentKey) {
         if (requestedKey != null) {
-            return requestedKey.isBlank() ? null : requestedKey;
+            return requestedKey.isBlank() ? "" : requestedKey.strip();
         }
-        return current.apiKey();
+        return currentKey;
     }
 
     /** One embedding of a fixed probe string; the vector's length is the model's dimension. */
-    int probeDimension(String baseUrl, String embedModel, String apiKey) {
+    int probeDimension(String baseUrl, String embedModel, String embedApiKey) {
         EffectiveLlmSettings candidate = new EffectiveLlmSettings(baseUrl, null, embedModel, 0,
-                apiKey, "candidate", null, null);
+                null, embedApiKey, "candidate", null, null);
         EmbeddingModel probe = clientFactory.embeddingModel(candidate);
         float[] vector;
         try {
@@ -257,16 +264,24 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
     /* Probes (never persist anything)                                     */
     /* ------------------------------------------------------------------ */
 
-    /** A live check of a candidate configuration: one minimal chat call, one embedding probe. */
+    /**
+     * A live check of a candidate configuration: one minimal chat call, one embedding probe. Each
+     * probe uses its model's key; an omitted key falls back to the stored key for that model, an
+     * empty string probes with no key.
+     */
     public ConnectionTestResult testConnection(String baseUrl, String chatModel, String embedModel,
-            String apiKey) {
-        String key = apiKey == null ? effective().apiKey() : apiKey;
-        EffectiveLlmSettings candidate = new EffectiveLlmSettings(
-                requireText(baseUrl, "baseUrl"),
-                requireText(chatModel, "chatModel"),
-                requireText(embedModel, "embedModel"),
-                0, key, "candidate", null, null);
-        return new ConnectionTestResult(probeChat(candidate), probeEmbed(candidate));
+            String chatApiKey, String embedApiKey) {
+        String url = requireText(baseUrl, "baseUrl");
+        EffectiveLlmSettings current = effective();
+        EffectiveLlmSettings chatCandidate = new EffectiveLlmSettings(url,
+                requireText(chatModel, "chatModel"), null, 0,
+                chatApiKey == null ? current.chatApiKey() : chatApiKey, null,
+                "candidate", null, null);
+        EffectiveLlmSettings embedCandidate = new EffectiveLlmSettings(url, null,
+                requireText(embedModel, "embedModel"), 0, null,
+                embedApiKey == null ? current.embedApiKey() : embedApiKey,
+                "candidate", null, null);
+        return new ConnectionTestResult(probeChat(chatCandidate), probeEmbed(embedCandidate));
     }
 
     private ChatProbe probeChat(EffectiveLlmSettings candidate) {
@@ -303,12 +318,13 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
     /**
      * Proxies the endpoint's OpenAI-standard {@code GET {baseUrl}/models}.
      *
-     * @param apiKey the credential to send; null means "the currently effective key"
+     * @param apiKey the endpoint-level credential to send; null means "the currently effective
+     *               chat key" (both models normally share the endpoint)
      * @throws LlmEndpointException the endpoint is unreachable or answered non-200
      */
     public List<String> listModels(String baseUrl, String apiKey) {
         String url = stripTrailingSlash(requireText(baseUrl, "baseUrl")) + "/models";
-        String key = apiKey == null ? effective().apiKey() : apiKey;
+        String key = apiKey == null ? effective().chatApiKey() : apiKey;
         HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(url))
                 .timeout(MODELS_TIMEOUT)
                 .GET();

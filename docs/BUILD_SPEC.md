@@ -410,6 +410,26 @@ DELETE /api/knowledge/documents/{documentId}  -> 204                  (ADMIN)
 POST   /api/knowledge/search {query, topK}    -> KnowledgeChunk[]     (ADMIN + OPERATOR)
 
 GET    /api/users                             -> AppUser[]            (ADMIN)
+
+GET    /api/admin/llm-settings                -> {baseUrl, chatModel, embedModel, embedDimension,
+                                                  chatApiKeySet, embedApiKeySet, source,
+                                                  updatedAt, updatedBy}                     (ADMIN)
+PUT    /api/admin/llm-settings {baseUrl, chatModel, embedModel, chatApiKey?, embedApiKey?,
+                                confirmReembed?}
+                          -> saved settings + {reembedStarted}          (ADMIN)
+                          Per API key: omitted/null keeps the stored key, "" means explicitly NO
+                          key (local model servers), any other value sets it. Keys are write-only,
+                          never returned. An embedding-model change without confirmReembed:true is
+                          409; confirmed, it probes the new dimension, re-creates
+                          document_chunks.embedding at that size and starts the re-embed job.
+POST   /api/admin/llm-settings/test {baseUrl, chatModel, embedModel, chatApiKey?, embedApiKey?}
+                          -> {chat:{ok,detail}, embed:{ok,detail,dimension}}   (ADMIN)
+                          Per-model probes; an omitted key falls back to the stored key for that
+                          model. 502 problem+json when the endpoint is unreachable.
+GET    /api/admin/llm-settings/models?baseUrl=&apiKey=   -> {models[]}  (ADMIN; apiKey optional,
+                                                  endpoint-level)
+GET    /api/admin/llm-settings/reembed-status -> {running, totalDocuments, completedDocuments,
+                                                  failedDocuments, lastError}          (ADMIN)
 ```
 
 Errors use RFC-7807 `application/problem+json` with `status`, `title`, `detail`.
@@ -493,7 +513,7 @@ src/
 
 ## 9. Frontend visual identity
 
-This is an **internal Swissquote application**. Before doing any frontend styling work, read
-`docs/DESIGN_SYSTEM.md` — it carries Swissquote's real brand tokens (extracted from their
-production stylesheets), the typography stack, and the one hard rule separating brand colour from
-risk colour. The UI must look like a Swissquote internal tool.
+This is an **internal application for a financial-services operator**. Before doing any frontend
+styling work, read `docs/DESIGN_SYSTEM.md` — it carries the operator's real brand tokens (extracted
+from their production stylesheets), the typography stack, and the one hard rule separating brand
+colour from risk colour. The UI must look like one of the operator's internal tools.

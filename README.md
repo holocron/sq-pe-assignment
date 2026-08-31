@@ -1,7 +1,8 @@
 # Customer Activity Analytics
 
-An internal Swissquote tool for customer-care operators: search a customer, review their card,
-payment and cryptocurrency activity, and run an **AI risk assessment** performed by a ReAct agent
+An internal tool for customer-care operators at a financial-services provider: search a customer,
+review their card, payment and cryptocurrency activity, and run an **AI risk assessment** performed
+by a ReAct agent
 that checks every configured risk rule, cites retrieved policy, and persists an auditable result.
 
 > **Built for a technical assignment.** Everything described here runs locally against a real
@@ -70,7 +71,7 @@ Postgres superuser (on a Homebrew install that is simply your own macOS user).
 ### 2. Model access
 
 The backend talks to any **OpenAI-compatible** endpoint. It needs one chat model with tool-calling
-support and one embedding model. Configure via environment variables:
+support and one embedding model. The environment variables are the **boot defaults**:
 
 ```bash
 export LLM_BASE_URL=http://localhost:13305/api/v1   # note: /v1 must be part of the base URL
@@ -78,6 +79,23 @@ export LLM_CHAT_MODEL=gpt-oss-120b-GGUF
 export LLM_EMBED_MODEL=Qwen3-Embedding-4B-GGUF
 export OPENAI_API_KEY=none                          # a real key if your endpoint requires one
 ```
+
+**Runtime settings, no restart.** Once running, an admin can change all of the above from the UI at
+**`/admin/llm-settings`** (API: `GET/PUT /api/admin/llm-settings`, plus a connection `.../test`, a
+`.../models` listing proxy and a `.../reembed-status` progress endpoint). The saved row overrides
+the environment on the next model call — no restart. API keys are **per model** (`chatApiKey` /
+`embedApiKey`): leaving a field out keeps the stored key, setting it to an **empty string means
+explicitly no key** (for local model servers that take none), any other value replaces it. Keys are
+write-only over the API — `GET` exposes only `chatApiKeySet`/`embedApiKeySet` booleans.
+
+**Changing the embedding model re-embeds the knowledge base.** Every stored vector becomes invalid,
+so the save is refused unless `confirmReembed: true`; when confirmed, the new model's dimension is
+probed, `document_chunks.embedding` is re-created at that size, and a background job re-extracts and
+re-embeds every document from its stored original bytes (progress at `.../reembed-status`).
+
+> **Prototype note: keys are stored in plaintext at rest.** The `llm_settings` row holds the keys
+> unencrypted — the process already holds them in memory and the database is local, but a real
+> deployment would encrypt them or keep them in a secret store.
 
 This project was developed against a **[lemonade](https://github.com/lemonade-sdk/lemonade) router**
 on a host named `holominix`. lemonade is a *router*: a single OpenAI-compatible endpoint that
@@ -88,11 +106,11 @@ same setup, open the tunnel with:
 ./scripts/tunnel.sh          # forwards localhost:13305 -> holominix
 ```
 
-> **Embedding dimensions are baked into the schema.** `document_chunks.embedding` is
-> `vector(2560)`, matching `Qwen3-Embedding-4B`. Using a different embedding model means changing
-> that column type in a migration and `spring.ai.vectorstore.pgvector.dimensions` in
-> `application.yml`. There is a startup check that fails loudly on a mismatch rather than silently
-> storing garbage.
+> **Embedding dimensions are baked into the schema, but changeable at runtime.** The boot value is
+> `vector(2560)`, matching `Qwen3-Embedding-4B` (set via
+> `spring.ai.vectorstore.pgvector.dimensions` in `application.yml`). Switching embedding models at
+> runtime through `/admin/llm-settings` probes the new dimension and alters the column itself — see
+> above. A startup check fails loudly on a mismatch rather than silently storing garbage.
 
 ### 3. Run the backend
 
@@ -173,7 +191,7 @@ customers are deliberately clean so LOW/MEDIUM outcomes are reachable.
 │  React 19 + TypeScript + Vite + Tailwind 4          (frontend/, port 5173)   │
 │                                                                              │
 │  Dashboard · Customer activity · Analysis (live SSE trace + coverage table)  │
-│  Admin: visual rule editor · knowledge base · users · RAG search             │
+│  Admin: visual rule editor · knowledge base · users · RAG search · LLM settings              │
 │  TanStack Query for server state · JWT in an axios interceptor               │
 └───────────────────────────────┬──────────────────────────────────────────────┘
                                 │  REST + Server-Sent Events (JSON, JWT bearer)
@@ -437,7 +455,7 @@ something the runtime will refuse.
 
 ### Agents used to build this
 
-Five orchestrated workflows — backend (10 agents), frontend (6), Swissquote re-skin (5), code review
+Five orchestrated workflows — backend (10 agents), frontend (6), brand re-skin (5), code review
 (53), fix pass (7). The instructions that mattered most: a spec built from *verified* API facts
 (`javap`, live spikes) because the frameworks post-date the model's training data; strict file
 ownership for parallel agents; serialised builds; *"report the true exit code, never trust a log
@@ -700,10 +718,10 @@ genuinely needs data that does not exist.
    risk patterns are always present. Timestamps are relative to a fixed reference date.
 7. **Single-node deployment.** In-memory login throttling and the SSE registry assume one instance;
    a clustered deployment would need shared state.
-8. **The Swissquote wordmark is a placeholder.** The licensed brand fonts (GT America, GT Sectra,
-   SwissquoteCT) and the logo asset are not redistributable, so the UI renders a text wordmark and a
-   progressive font stack that picks up the real face on a Swissquote workstation. Brand colours were
-   taken from Swissquote's public production stylesheets.
+8. **The wordmark is a placeholder.** The licensed brand fonts (GT America, GT Sectra, and the
+   custom display face) and the logo asset are not redistributable, so the UI renders a text
+   wordmark and a progressive font stack that picks up the real face on a workstation that has the
+   licensed fonts. Brand colours were taken from the operator's public production stylesheets.
 9. **No FX, sanctions-list or blockchain-analytics integrations.** Sanctioned jurisdictions are a
    static list inside rules and policy documents, not a live feed.
 
@@ -825,7 +843,7 @@ Verification went beyond the suites, because green tests turned out not to imply
   migration rather than papered over with an index that cannot be used.
 - **No FX normalisation** (see assumptions) — cross-currency totals are labelled, not converted.
 - **Single-node only** — in-memory throttling and SSE registry.
-- **The brand CTA's contrast is 3.18:1.** White on Swissquote orange `#fa5b35` is below WCAG AA for
+- **The brand CTA's contrast is 3.18:1.** White on the brand orange `#fa5b35` is below WCAG AA for
   14px text. Darkening it to pass lands on the same hue as the risk-HIGH badge, which would break the
   rule that keeps risk colour meaningful. The brand pairing was kept for the CTA (it clears the 3:1
   required of the control itself), while brand orange *as text* uses a 5.7:1 variant. Documented and
@@ -849,12 +867,13 @@ Verification went beyond the suites, because green tests turned out not to imply
 │       ├── service/ web/        business services, controllers, DTO records
 │       ├── security/ config/    JWT, roles, CORS, error handling
 │       └── resources/db/migration/   V1 schema · V2 app tables · V3 seed · V4 fixes ·
-│                                     V5 read-only role + customer-scoped views
+│                                     V5 read-only role + customer-scoped views · V6 analysis
+│                                     cancellation · V7 runtime LLM settings · V8 per-model keys
 ├── frontend/                    React 19 · TypeScript · Vite · Tailwind 4
 │   └── src/{api,auth,components,lib,pages}/
 ├── docs/
 │   ├── BUILD_SPEC.md            the authoritative build contract
-│   ├── DESIGN_SYSTEM.md         Swissquote brand tokens and the brand-vs-risk colour rule
+│   ├── DESIGN_SYSTEM.md         brand tokens and the brand-vs-risk colour rule
 │   ├── CODE_REVIEW.md           adversarial review findings
 │   ├── METHODOLOGY.md           how the project was built, and what the process got wrong
 │   ├── AI_DESIGN.md             model choices and the agent instruction design

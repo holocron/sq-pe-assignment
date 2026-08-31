@@ -247,7 +247,8 @@ public class RagService {
         KnowledgeFormat format = formatDetector.detect(filename, content);
         replaceOrRejectExisting(filename);
 
-        KnowledgeDocument document = newDocument(filename, format, content.length, uploadedBy);
+        KnowledgeDocument document = newDocument(filename, format, content.length, uploadedBy,
+                content);
         insert(document);
 
         try {
@@ -272,6 +273,58 @@ public class RagService {
             KnowledgeDocument indexed = documentRepository.saveAndFlush(document);
             log.info("Indexed '{}' as {} chunk(s) across {} section(s)", filename, stored,
                     parsed.sectionCount());
+            return indexed;
+        } catch (RuntimeException e) {
+            markFailed(document, e);
+            throw e;
+        }
+    }
+
+    /**
+     * Re-extracts, re-chunks and re-embeds a document from its stored original bytes, in place -
+     * the row and its {@code documentId} survive, so the chunk metadata links stay valid. Used by
+     * the re-embed job after an embedding-model change; like {@link #ingest} it is deliberately not
+     * transactional, so the embedding round trips hold no connection open.
+     *
+     * @throws KnowledgeDocumentNotFoundException no document with that id
+     * @throws KnowledgeIndexException            the document predates source-byte retention (V7),
+     *                                            so there is nothing to re-extract from
+     */
+    public KnowledgeDocument reindex(UUID documentId) {
+        KnowledgeDocument document = documentRepository.findById(documentId)
+                .orElseThrow(() -> new KnowledgeDocumentNotFoundException(documentId));
+        String filename = document.getFilename();
+        byte[] content = document.getSourceBytes();
+        if (content == null || content.length == 0) {
+            throw new KnowledgeIndexException("The original file bytes of '" + filename
+                    + "' were not stored (it predates V7), so it cannot be re-embedded.");
+        }
+
+        deleteChunksQuietly(documentId);
+        document.setChunkCount(0);
+        document.setStatus(DocumentStatus.PROCESSING);
+        document.setError(null);
+        documentRepository.saveAndFlush(document);
+
+        try {
+            KnowledgeFormat format = formatDetector.detect(filename, content);
+            ParsedDocument parsed = extractors.get(format).extract(content, filename);
+            List<TextChunk> chunks = chunker.chunk(parsed);
+            if (chunks.isEmpty()) {
+                throw new DocumentExtractionException(filename,
+                        "No text could be chunked out of the document.");
+            }
+            String title = trim(parsed.title(), MAX_NAME_LENGTH);
+            if (title != null && !title.isEmpty()) {
+                document.setTitle(title);
+            }
+            int stored = chunkStore.index(document.getDocumentId(), filename, document.getTitle(),
+                    chunks);
+            document.setChunkCount(stored);
+            document.setStatus(DocumentStatus.INDEXED);
+            document.setError(null);
+            KnowledgeDocument indexed = documentRepository.saveAndFlush(document);
+            log.info("Re-indexed '{}' as {} chunk(s)", filename, stored);
             return indexed;
         } catch (RuntimeException e) {
             markFailed(document, e);
@@ -339,7 +392,7 @@ public class RagService {
     }
 
     private KnowledgeDocument newDocument(String filename, KnowledgeFormat format, long sizeBytes,
-            String uploadedBy) {
+            String uploadedBy, byte[] content) {
         return KnowledgeDocument.builder()
                 .documentId(UUID.randomUUID())
                 .filename(filename)
@@ -350,6 +403,7 @@ public class RagService {
                 .status(DocumentStatus.PROCESSING)
                 .uploadedBy(uploadedBy)
                 .uploadedAt(Instant.now())
+                .sourceBytes(content)
                 .build();
     }
 
