@@ -9,6 +9,7 @@
     "lint": "oxlint",
     "test": "vitest run",
     "test:watch": "vitest",
+    "verify:routes": "node scripts/verify-routes.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

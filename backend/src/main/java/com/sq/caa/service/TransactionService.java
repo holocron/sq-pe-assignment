@@ -5,6 +5,7 @@ import com.sq.caa.domain.Transaction;
 import com.sq.caa.repository.TransactionRepository;
 import com.sq.caa.web.dto.PageResponse;
 import com.sq.caa.web.dto.TransactionDtos.TransactionView;
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.UUID;
 import org.springframework.data.domain.Page;
@@ -51,7 +52,9 @@ public class TransactionService {
 
     /**
      * Page of a customer's activity. Every filter is optional; {@code from}/{@code to} are inclusive
-     * bounds on {@code createdAt} and {@code status} is matched case-insensitively.
+     * bounds on {@code createdAt}, {@code minAmount}/{@code maxAmount} inclusive bounds on
+     * {@code amount} and {@code status} is matched case-insensitively. {@code sort} is a
+     * whitelist-checked order from the controller; {@code null} keeps the default, newest first.
      *
      * @throws ResponseStatusException 404 when the customer does not exist, 400 when the time window
      *                                 is inverted
@@ -62,6 +65,9 @@ public class TransactionService {
             String status,
             Instant from,
             Instant to,
+            BigDecimal minAmount,
+            BigDecimal maxAmount,
+            Sort sort,
             int page,
             int size) {
         customerService.requireCustomer(customerId);
@@ -69,9 +75,10 @@ public class TransactionService {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
                     "'from' must not be later than 'to'.");
         }
-        PageRequest pageable = CustomerService.pageRequest(page, size, NEWEST_FIRST);
+        PageRequest pageable = CustomerService.pageRequest(page, size,
+                sort == null || sort.isUnsorted() ? NEWEST_FIRST : sort);
         Page<Transaction> found = transactions.findForCustomerWithDetails(customerId, activityType,
-                CustomerService.blankToNull(status), from, to, pageable);
+                CustomerService.blankToNull(status), from, to, minAmount, maxAmount, pageable);
         return PageResponse.of(found, TransactionView::from);
     }
 }

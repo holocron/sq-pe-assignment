@@ -99,8 +99,21 @@ export function CustomerAnalysesPanel({
                   </span>
                 </span>
                 {analysis.status !== 'COMPLETED' ? (
-                  <Badge tone={analysis.status === 'FAILED' ? 'danger' : 'info'} dot>
-                    {analysis.status === 'RUNNING' ? 'Running' : 'Failed'}
+                  <Badge
+                    tone={
+                      analysis.status === 'FAILED'
+                        ? 'danger'
+                        : analysis.status === 'CANCELLED'
+                          ? 'warning'
+                          : 'info'
+                    }
+                    dot
+                  >
+                    {analysis.status === 'RUNNING'
+                      ? 'Running'
+                      : analysis.status === 'CANCELLED'
+                        ? 'Cancelled'
+                        : 'Failed'}
                   </Badge>
                 ) : null}
                 <RiskBadge

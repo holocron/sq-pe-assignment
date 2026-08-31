@@ -1,3 +1,4 @@
+import { ArrowDown, ArrowUp, ArrowUpDown } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { cn } from '../../lib/cn'
 import { EmptyState } from './EmptyState'
@@ -5,6 +6,14 @@ import { ErrorState } from './ErrorState'
 import { Skeleton } from './Skeleton'
 
 export type ColumnAlign = 'left' | 'right' | 'center'
+
+export type SortDirection = 'asc' | 'desc'
+
+/** The currently active sort: one column, one direction. */
+export interface SortState {
+  key: string
+  direction: SortDirection
+}
 
 export interface Column<T> {
   /** Stable identifier, also used as the React key. */
@@ -18,6 +27,12 @@ export interface Column<T> {
   headerClassName?: string
   /** Renders the header for screen readers only (icon/action columns). */
   hideHeader?: boolean
+  /**
+   * Makes the header clickable for sorting. The value is the sort key reported
+   * through `onSortChange` — for server-side sorting, the backend's field name.
+   * Columns without it stay plain headers.
+   */
+  sortKey?: string
 }
 
 export interface TableProps<T> {
@@ -41,6 +56,13 @@ export interface TableProps<T> {
   stickyHeader?: boolean
   skeletonRows?: number
   className?: string
+  /**
+   * Active sort, reflected as `aria-sort` on the matching header cell. Sorting
+   * itself is the caller's job (server-side param or client-side comparator).
+   */
+  sort?: SortState | null
+  /** Header click on a `sortKey` column; toggles the direction when re-clicked. */
+  onSortChange?: (sort: SortState) => void
 }
 
 const ALIGN: Record<ColumnAlign, string> = {
@@ -71,8 +93,39 @@ export function Table<T>({
   stickyHeader = false,
   skeletonRows = 6,
   className,
+  sort = null,
+  onSortChange,
 }: TableProps<T>) {
   const cellPadding = dense ? 'px-3 py-1.5' : 'px-3 py-2.5'
+
+  const renderHeader = (column: Column<T>): ReactNode => {
+    const label = column.hideHeader ? <span className="sr-only">{column.header}</span> : column.header
+    if (!column.sortKey || !onSortChange) return label
+    const active = sort?.key === column.sortKey
+    const direction: SortDirection = active && sort?.direction === 'asc' ? 'desc' : 'asc'
+    const Icon = active ? (sort?.direction === 'asc' ? ArrowUp : ArrowDown) : ArrowUpDown
+    return (
+      <button
+        type="button"
+        onClick={() => onSortChange({ key: column.sortKey as string, direction })}
+        className={cn(
+          'inline-flex items-center gap-1 rounded-xxs font-semibold tracking-caption uppercase',
+          'hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none',
+          active ? 'text-fg' : 'text-muted',
+        )}
+      >
+        {label}
+        <Icon aria-hidden="true" className={cn('size-3', active ? 'text-accent' : 'text-subtle')} />
+        <span className="sr-only">
+          {active
+            ? sort?.direction === 'asc'
+              ? 'sorted ascending, activate to sort descending'
+              : 'sorted descending, activate to sort ascending'
+            : 'not sorted, activate to sort ascending'}
+        </span>
+      </button>
+    )
+  }
 
   if (error) {
     return <ErrorState error={error} onRetry={onRetry} />
@@ -93,21 +146,27 @@ export function Table<T>({
           )}
         >
           <tr>
-            {columns.map((column) => (
-              <th
-                key={column.key}
-                scope="col"
-                className={cn(
-                  'border-b border-border text-2xs font-semibold tracking-caption text-muted uppercase',
-                  cellPadding,
-                  ALIGN[column.align ?? 'left'],
-                  column.className,
-                  column.headerClassName,
-                )}
-              >
-                {column.hideHeader ? <span className="sr-only">{column.header}</span> : column.header}
-              </th>
-            ))}
+            {columns.map((column) => {
+              const sorted = column.sortKey && sort?.key === column.sortKey
+              return (
+                <th
+                  key={column.key}
+                  scope="col"
+                  aria-sort={
+                    sorted ? (sort?.direction === 'asc' ? 'ascending' : 'descending') : undefined
+                  }
+                  className={cn(
+                    'border-b border-border text-2xs font-semibold tracking-caption text-muted uppercase',
+                    cellPadding,
+                    ALIGN[column.align ?? 'left'],
+                    column.className,
+                    column.headerClassName,
+                  )}
+                >
+                  {renderHeader(column)}
+                </th>
+              )
+            })}
           </tr>
         </thead>
         <tbody>

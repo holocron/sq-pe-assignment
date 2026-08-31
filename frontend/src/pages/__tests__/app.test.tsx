@@ -283,6 +283,31 @@ describe('role gating', () => {
     expect(within(nav).getByRole('link', { name: 'Users' })).toBeInTheDocument()
   })
 
+  it('makes the top-bar trail a navigable breadcrumb on detail pages', async () => {
+    signIn('OPERATOR')
+    renderAt(`/analyses/${ASSESSMENT_ID}`)
+    expect(await screen.findByRole('heading', { name: 'AI risk analysis' })).toBeInTheDocument()
+    const trail = screen.getByRole('navigation', { name: 'Breadcrumb' })
+    /* The current page is plain text; the way back to the list is a link. */
+    expect(within(trail).getByRole('link', { name: 'Analyses' })).toHaveAttribute(
+      'href',
+      '/analyses',
+    )
+    expect(within(trail).getByText('Analysis')).toBeInTheDocument()
+    expect(within(trail).queryByRole('link', { name: 'Analysis' })).not.toBeInTheDocument()
+  })
+
+  it('links back to the dashboard trail from a customer detail page', async () => {
+    signIn('OPERATOR')
+    renderAt(`/customers/${CUSTOMER_ID}`)
+    expect(await screen.findByRole('heading', { name: 'Mila Novak' })).toBeInTheDocument()
+    const trail = screen.getByRole('navigation', { name: 'Breadcrumb' })
+    expect(within(trail).getByRole('link', { name: 'Dashboard' })).toHaveAttribute(
+      'href',
+      '/dashboard',
+    )
+  })
+
   it('points every nav link at a path the router serves', async () => {
     signIn('ADMIN')
     renderAt('/dashboard')
@@ -297,6 +322,7 @@ describe('role gating', () => {
       '/admin/rules',
       '/admin/knowledge',
       '/admin/users',
+      '/admin/llm-settings',
     ])
   })
 })

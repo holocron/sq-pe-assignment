@@ -10,6 +10,7 @@ import type {
   SpringPage,
 } from '../../api/types'
 import { ToastProvider } from '../../components/ui/Toast'
+import { formatDateTime, EM_DASH } from '../../lib/format'
 import { RulesPage } from '../admin/RulesPage'
 
 vi.mock('../../api/client', async (importOriginal) => {
@@ -253,6 +254,35 @@ describe('RulesPage', () => {
       expect(mockDelete).toHaveBeenCalledWith(`/rules/${EXISTING_RULE.ruleId}`)
     })
   })
+
+  /* Contract D: both timestamps are nullable ISO strings. A rule that ran shows
+     the formatted date; one that never ran shows an em dash, not a blank cell. */
+  it('renders the last-fired and last-judged timestamps, em dash when null', async () => {
+    mockApi([
+      {
+        ...EXISTING_RULE,
+        lastFiredAt: '2026-08-28T10:01:30Z',
+        lastJudgedAt: '2026-08-29T07:45:00Z',
+      },
+      {
+        ...EXISTING_RULE,
+        ruleId: '22222222-3333-4444-5555-666666666666',
+        ruleName: 'Never evaluated rule',
+        lastFiredAt: null,
+        lastJudgedAt: null,
+      },
+    ])
+    renderRulesPage()
+
+    const firedRow = (
+      await screen.findByText('Payment to a sanctioned jurisdiction')
+    ).closest('tr') as HTMLElement
+    expect(within(firedRow).getByText(formatDateTime('2026-08-28T10:01:30Z'))).toBeInTheDocument()
+    expect(within(firedRow).getByText(formatDateTime('2026-08-29T07:45:00Z'))).toBeInTheDocument()
+
+    const neverRow = (await screen.findByText('Never evaluated rule')).closest('tr') as HTMLElement
+    expect(within(neverRow).getAllByText(EM_DASH).length).toBeGreaterThanOrEqual(2)
+  })
 })
 
 /* -------------------------------------------------------------------------- */
@@ -362,6 +392,32 @@ describe('condition editor', () => {
 /* -------------------------------------------------------------------------- */
 /* Starter templates                                                           */
 /* -------------------------------------------------------------------------- */
+
+describe('condition token preview', () => {
+  it('echoes the catalog fields and thresholds the condition names as chips', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+
+    typeCondition(
+      'Triggered when the amount exceeds 10 000 within any rolling 24 hours for a card payment.',
+    )
+
+    const detected = await screen.findByLabelText('Fields and thresholds named in the condition')
+    /* `amount` resolves to its catalog label; thresholds are echoed as written. */
+    expect(within(detected).getByText('Amount')).toBeInTheDocument()
+    expect(within(detected).getByText('10 000')).toBeInTheDocument()
+    expect(within(detected).getByText('24')).toBeInTheDocument()
+  })
+
+  it('shows no chips until the condition names anything', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+
+    expect(
+      screen.queryByLabelText('Fields and thresholds named in the condition'),
+    ).not.toBeInTheDocument()
+  })
+})
 
 describe('starter templates', () => {
   it('fills a blank rule from an example', async () => {

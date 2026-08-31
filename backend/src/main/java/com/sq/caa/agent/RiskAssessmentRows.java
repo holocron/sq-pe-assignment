@@ -11,6 +11,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Turns the settled rule outcomes of a run into {@code risk_assessments} rows.
@@ -32,6 +34,8 @@ import java.util.UUID;
  * score is split across the matched transactions in whole cents, largest remainder first: the sum
  * over a rule is exactly that rule's weight, the sum over the run is exactly the run's total score,
  * and every matched transaction still carries a non-zero contribution that marks it as evidence.
+ * When a rule matches more transactions than its score has cents the evidence marker wins: every
+ * matched row is floored at {@code 0.01} and the truncation is logged (see {@link #distribute}).
  * Transactions in scope that the query did not return, and every transaction of a rule whose query
  * returned nothing, get {@code 0.00}.
  *
@@ -52,7 +56,11 @@ import java.util.UUID;
  */
 public final class RiskAssessmentRows {
 
+    private static final Logger log = LoggerFactory.getLogger(RiskAssessmentRows.class);
+
     private static final BigDecimal ZERO = BigDecimal.ZERO.setScale(2, RoundingMode.HALF_UP);
+
+    private static final BigDecimal ONE_CENT = BigDecimal.valueOf(1, 2);
 
     private RiskAssessmentRows() {
     }
@@ -81,6 +89,13 @@ public final class RiskAssessmentRows {
     /**
      * Splits {@code score} into whole cents across {@code matched}, giving the remainder to the
      * first entries. Returns an empty map when there is nothing to distribute.
+     *
+     * <p>Every matched transaction is evidence, so no share may be {@code 0.00} - a zeroed matched
+     * row would be indistinguishable from a transaction the query did not return. When the matched
+     * count exceeds the score's cents ({@code matched > score * 100}) an exact split is arithmetically
+     * impossible, so the sum-over-a-rule invariant gives way to the evidence invariant: every matched
+     * row is floored at {@code 0.01} and the truncation is logged. That case needs a rule matched on
+     * more transactions than its weight has cents, which real weights never reach.
      */
     public static Map<UUID, BigDecimal> distribute(BigDecimal score, List<UUID> matched) {
         if (score == null || score.signum() <= 0 || matched == null || matched.isEmpty()) {
@@ -88,9 +103,19 @@ public final class RiskAssessmentRows {
         }
         long cents = score.movePointRight(2).setScale(0, RoundingMode.HALF_UP).longValueExact();
         int count = matched.size();
+        Map<UUID, BigDecimal> shares = new LinkedHashMap<>();
+        if (count > cents) {
+            log.warn("A rule matched {} transactions but its score {} has only {} cent(s); every "
+                    + "matched row is floored at 0.01, so the rows sum to more than the rule's score "
+                    + "(the evidence marker wins over the exact total in this degenerate case)",
+                    count, score.toPlainString(), cents);
+            for (UUID id : matched) {
+                shares.put(id, ONE_CENT);
+            }
+            return shares;
+        }
         long base = cents / count;
         long remainder = cents % count;
-        Map<UUID, BigDecimal> shares = new LinkedHashMap<>();
         for (int index = 0; index < count; index++) {
             shares.put(matched.get(index), BigDecimal.valueOf(base + (index < remainder ? 1 : 0), 2));
         }

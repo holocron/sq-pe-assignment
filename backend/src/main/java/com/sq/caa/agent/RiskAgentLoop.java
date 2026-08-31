@@ -127,6 +127,13 @@ public class RiskAgentLoop {
         int steps;
         try {
             steps = converse(context, tools, model);
+        } catch (CancellationSignal signal) {
+            // Cancelled at the user's request: settle from the verdicts already obtained, exactly as
+            // a broken conversation is settled - a cancelled run keeps its work and is persisted
+            // CANCELLED, never COMPLETED and never silently dropped.
+            AgentRunResult partial = settle(context, context.stepsTaken(),
+                    System.currentTimeMillis() - startedAt);
+            throw new AgentRunCancelledException(partial);
         } catch (RuntimeException e) {
             // The conversation died - but everything the agent had already submitted is still in the
             // context, so the run is settled from it rather than thrown away. The caller marks the
@@ -183,6 +190,14 @@ public class RiskAgentLoop {
         int contextRetries = 0;
 
         while (steps < properties.maxSteps()) {
+            // The cancellation flag is polled between turns, so a cancel lands at the next step
+            // boundary rather than inside a model call or half-way through a tool batch.
+            if (context.trace().isCancellationRequested()) {
+                log.info("Analysis {}: cancellation requested; aborting after {} step(s)",
+                        context.assessmentId(), steps);
+                context.trace().cancelled();
+                throw new CancellationSignal();
+            }
             // The schemas ride along with every request, so they are part of the budget, and the
             // budget is re-derived each turn because calibration keeps moving the estimate.
             history = fitToContext(context, history, compactor.estimateTools(callbacks));
@@ -485,7 +500,9 @@ public class RiskAgentLoop {
                     verdict.sql()));
         }
 
-        if (!unjudged.isEmpty()) {
+        if (!unjudged.isEmpty() && !context.trace().isCancellationRequested()) {
+            // Skipped for a cancelled run: "recorded as FAILED" would be a lie, and the cancelled
+            // step already says why the checklist was left unfinished.
             context.trace().coverageFailed(context.ruleCount(),
                     unjudged.stream().map(rule -> rule.ruleId().toString()).toList(),
                     unjudged.stream().map(UnjudgedRule::ruleName).toList());
@@ -598,6 +615,13 @@ public class RiskAgentLoop {
                     + "Re-assess after the next 30 days of activity.";
             case LOW -> "Record the triggered rule and keep the customer on standard monitoring.";
         };
+    }
+
+    /** Internal control flow: the user asked to cancel; unwind out of {@link #converse}. */
+    private static final class CancellationSignal extends RuntimeException {
+        private CancellationSignal() {
+            super(null, null, false, false);
+        }
     }
 
     /** The administrator-authored rule name, safe to show in a trace or a prompt. */

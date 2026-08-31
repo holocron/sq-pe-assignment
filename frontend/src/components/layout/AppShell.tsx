@@ -62,24 +62,46 @@ function Brand({
   )
 }
 
+interface TrailCrumb {
+  label: string
+  /** Set on every crumb except the current page. */
+  to?: string
+}
+
 /**
  * Detail routes that have no nav entry of their own. Everything else derives
  * from `NAV_SECTIONS`, which already mirrors the router.
  */
-const DETAIL_TRAILS: ReadonlyArray<readonly [string, readonly string[]]> = [
-  ['/customers', ['Dashboard', 'Customer']],
+const DETAIL_TRAILS: ReadonlyArray<readonly [string, readonly TrailCrumb[]]> = [
+  ['/customers', [{ label: 'Dashboard', to: '/dashboard' }, { label: 'Customer' }]],
+  ['/analyses', [{ label: 'Analyses', to: '/analyses' }, { label: 'Analysis' }]],
 ]
 
 /** Section trail for the top bar, e.g. `Admin › Risk Rules`. */
-function sectionTrail(pathname: string): readonly string[] {
+function sectionTrail(pathname: string): readonly TrailCrumb[] {
   for (const section of NAV_SECTIONS) {
     for (const item of section.items) {
-      if (pathname === item.to || pathname.startsWith(`${item.to}/`)) {
-        return section.title ? [section.title, item.label] : [item.label]
+      if (pathname === item.to) {
+        return section.title
+          ? [{ label: section.title }, { label: item.label }]
+          : [{ label: item.label }]
       }
     }
   }
-  return DETAIL_TRAILS.find(([prefix]) => pathname.startsWith(prefix))?.[1] ?? []
+  /* A detail route under a nav entry (e.g. /analyses/<id>) is NOT that nav
+     page — the trail must not present the list as the current page. */
+  const detail = DETAIL_TRAILS.find(([prefix]) => pathname.startsWith(`${prefix}/`))
+  if (detail) return detail[1]
+  for (const section of NAV_SECTIONS) {
+    for (const item of section.items) {
+      if (pathname.startsWith(`${item.to}/`)) {
+        return section.title
+          ? [{ label: section.title }, { label: item.label }]
+          : [{ label: item.label }]
+      }
+    }
+  }
+  return []
 }
 
 /**
@@ -177,25 +199,39 @@ export function AppShell() {
           </div>
 
           {/* Section trail — the top bar's left-hand context, per the design
-              system. The page's own <h1> stays the accessible heading. */}
+              system. Crumbs that name another page are real links, so the
+              trail is a way back, not just a label. The page's own <h1>
+              stays the accessible heading. */}
           {trail.length > 0 ? (
-            <p className="hidden min-w-0 items-center gap-1.5 text-xs text-muted lg:flex">
+            <nav
+              aria-label="Breadcrumb"
+              className="hidden min-w-0 items-center gap-1.5 text-xs text-muted lg:flex"
+            >
               {trail.map((crumb, index) => (
-                <span key={crumb} className="flex min-w-0 items-center gap-1.5">
+                <span key={crumb.label} className="flex min-w-0 items-center gap-1.5">
                   {index > 0 ? (
                     <ChevronRight aria-hidden="true" className="size-3 shrink-0 text-subtle" />
                   ) : null}
-                  <span
-                    className={cn(
-                      'truncate',
-                      index === trail.length - 1 && 'font-medium text-fg',
-                    )}
-                  >
-                    {crumb}
-                  </span>
+                  {crumb.to ? (
+                    <Link
+                      to={crumb.to}
+                      className="truncate rounded-xs underline-offset-4 hover:text-fg hover:underline focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                    >
+                      {crumb.label}
+                    </Link>
+                  ) : (
+                    <span
+                      className={cn(
+                        'truncate',
+                        index === trail.length - 1 && 'font-medium text-fg',
+                      )}
+                    >
+                      {crumb.label}
+                    </span>
+                  )}
                 </span>
               ))}
-            </p>
+            </nav>
           ) : null}
 
           <div className="flex-1" />

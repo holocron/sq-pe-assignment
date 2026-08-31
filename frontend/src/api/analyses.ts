@@ -286,6 +286,16 @@ export function fetchCustomerAnalyses(customerId: UUID): Promise<AnalysisSummary
   return getJson<AnalysisSummary[]>(`/customers/${customerId}/analyses`)
 }
 
+/**
+ * `POST /api/analyses/{assessmentId}/cancel` — asks the backend to stop a
+ * RUNNING run. 200 on success (the run ends CANCELLED); 409 when the run
+ * already reached a terminal state, which the page treats as "finished
+ * meanwhile" and simply refetches.
+ */
+export function cancelAnalysis(assessmentId: UUID): Promise<AnalysisRun> {
+  return postJson<AnalysisRun>(`/analyses/${assessmentId}/cancel`)
+}
+
 /* -------------------------------------------------------------------------- */
 /* Hooks                                                                       */
 /* -------------------------------------------------------------------------- */
@@ -461,6 +471,26 @@ export function useStartAnalysis(
     onSuccess: (data, customerId, onMutateResult, context) => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.customers.analyses(customerId) })
       options?.onSuccess?.(data, customerId, onMutateResult, context)
+    },
+  })
+}
+
+/**
+ * Cancels a RUNNING run; refreshes the run detail and every history list that
+ * may show it (per-customer and the cross-customer fan-out share the
+ * `customers.analyses` key prefix).
+ */
+export function useCancelAnalysis(
+  options?: MutationOpts<AnalysisRun, UUID>,
+): UseMutationResult<AnalysisRun, ApiError, UUID> {
+  const queryClient = useQueryClient()
+  return useMutation<AnalysisRun, ApiError, UUID>({
+    mutationFn: cancelAnalysis,
+    ...options,
+    onSuccess: (data, assessmentId, onMutateResult, context) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.analyses.detail(assessmentId) })
+      void queryClient.invalidateQueries({ queryKey: ['customers', 'analyses'] })
+      options?.onSuccess?.(data, assessmentId, onMutateResult, context)
     },
   })
 }

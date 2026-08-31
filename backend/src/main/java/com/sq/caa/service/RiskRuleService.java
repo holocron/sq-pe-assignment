@@ -6,13 +6,16 @@ import com.sq.caa.domain.RiskRule;
 import com.sq.caa.domain.RuleScope;
 import com.sq.caa.domain.Transaction;
 import com.sq.caa.repository.CustomerRepository;
+import com.sq.caa.repository.RiskAssessmentRepository;
 import com.sq.caa.repository.RiskRuleRepository;
 import com.sq.caa.repository.TransactionRepository;
+import com.sq.caa.repository.projection.RuleActivityStats;
 import com.sq.caa.rules.DuplicateRuleNameException;
 import com.sq.caa.rules.EvaluationBatch;
 import com.sq.caa.rules.FieldCatalog;
 import com.sq.caa.rules.FieldDefinition;
 import com.sq.caa.rules.RuleDraft;
+import com.sq.caa.rules.RuleInUseException;
 import com.sq.caa.rules.RuleJudge;
 import com.sq.caa.rules.RuleJudgement;
 import com.sq.caa.rules.RuleJudgementException;
@@ -66,6 +69,7 @@ public class RiskRuleService {
     private static final int MAX_CACHED_BATCHES = 16;
 
     private final RiskRuleRepository ruleRepository;
+    private final RiskAssessmentRepository riskAssessmentRepository;
     private final TransactionRepository transactionRepository;
     private final CustomerRepository customerRepository;
     private final ObjectProvider<RuleJudge> ruleJudgeProvider;
@@ -73,11 +77,13 @@ public class RiskRuleService {
     private final Map<UUID, CachedBatch> batchCache = new ConcurrentHashMap<>();
 
     public RiskRuleService(RiskRuleRepository ruleRepository,
+            RiskAssessmentRepository riskAssessmentRepository,
             TransactionRepository transactionRepository,
             CustomerRepository customerRepository,
             ObjectProvider<RuleJudge> ruleJudgeProvider,
             @Value("${caa.rules.batch-cache-ttl-seconds:120}") long batchCacheTtlSeconds) {
         this.ruleRepository = ruleRepository;
+        this.riskAssessmentRepository = riskAssessmentRepository;
         this.transactionRepository = transactionRepository;
         this.customerRepository = customerRepository;
         this.ruleJudgeProvider = ruleJudgeProvider;
@@ -90,6 +96,16 @@ public class RiskRuleService {
 
     public List<RiskRule> findAll() {
         return ruleRepository.findAllByOrderByRuleNameAsc();
+    }
+
+    /**
+     * Latest judgement and latest firing per rule, keyed by rule id. One aggregate query for every
+     * rule at once - the rule list never pays a per-rule lookup. A rule absent from the map has no
+     * assessment rows at all.
+     */
+    public Map<UUID, RuleActivityStats> activityStatsByRule() {
+        return riskAssessmentRepository.activityStatsByRule().stream()
+                .collect(java.util.stream.Collectors.toMap(RuleActivityStats::ruleId, stats -> stats));
     }
 
     public RiskRule findById(UUID ruleId) {
@@ -136,10 +152,19 @@ public class RiskRuleService {
         return saved;
     }
 
-    /** Deletes a rule. Its {@code risk_assessments} rows cascade away with it. */
+    /**
+     * Deletes a rule - but only while nothing historical points at it. A rule referenced by any
+     * {@code risk_assessments} row is evidence of past analyses, and the {@code ON DELETE CASCADE}
+     * on that table would erase it with the rule, so such a delete is refused instead.
+     *
+     * @throws RuleInUseException when a recorded assessment still references the rule
+     */
     @Transactional
     public void delete(UUID ruleId) {
         RiskRule rule = findById(ruleId);
+        if (riskAssessmentRepository.existsById_RuleId(ruleId)) {
+            throw new RuleInUseException(ruleId);
+        }
         ruleRepository.delete(rule);
         log.info("Deleted risk rule {} '{}'", ruleId, rule.getRuleName());
     }

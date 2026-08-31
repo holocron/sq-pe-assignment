@@ -59,6 +59,8 @@ public final class AnalysisTrace {
     private final List<TraceStep> steps = new ArrayList<>();
     private final List<Subscription> subscribers = new ArrayList<>();
     private final Object lock = new Object();
+    private final java.util.concurrent.atomic.AtomicBoolean cancellationRequested =
+            new java.util.concurrent.atomic.AtomicBoolean();
     private String lastStatusEvent;
     private boolean closed;
 
@@ -79,6 +81,22 @@ public final class AnalysisTrace {
 
     public UUID assessmentId() {
         return assessmentId;
+    }
+
+    // ------------------------------------------------------------------
+    // Cancellation
+    // ------------------------------------------------------------------
+
+    /**
+     * The run's cancellation flag rides the per-run trace: it is the one object the cancel endpoint
+     * and the agent loop both already hold. The loop polls it between turns and aborts promptly.
+     */
+    public void requestCancellation() {
+        cancellationRequested.set(true);
+    }
+
+    public boolean isCancellationRequested() {
+        return cancellationRequested.get();
     }
 
     /** Immutable snapshot of the transcript so far. */
@@ -230,6 +248,13 @@ public final class AnalysisTrace {
 
     public TraceStep error(String message) {
         return add(builder(TraceStep.Type.ERROR).text(TraceStep.truncate(message, TraceStep.TEXT_LIMIT)));
+    }
+
+    /** The run was aborted at the user's request; recorded so the transcript says why it stopped. */
+    public TraceStep cancelled() {
+        return add(builder(TraceStep.Type.CANCELLED)
+                .text("The analysis was cancelled at the user's request. The verdicts obtained so "
+                        + "far are kept and the run is recorded as CANCELLED."));
     }
 
     private StepBuilder builder(String type) {

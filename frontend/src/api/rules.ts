@@ -61,6 +61,8 @@ export function normalizeRule(wire: RiskRuleWire): RiskRule {
     appliesTo: wire.appliesTo,
     thresholdLogic: wire.thresholdLogic ?? '',
     weight: toFiniteNumber(wire.weight) ?? 0,
+    lastFiredAt: trimmedOrNull(wire.lastFiredAt),
+    lastJudgedAt: trimmedOrNull(wire.lastJudgedAt),
   }
 }
 

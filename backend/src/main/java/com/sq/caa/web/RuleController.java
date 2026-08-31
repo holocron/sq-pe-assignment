@@ -4,6 +4,7 @@ import com.sq.caa.domain.RiskRule;
 import com.sq.caa.rules.DuplicateRuleNameException;
 import com.sq.caa.rules.FieldDefinition;
 import com.sq.caa.rules.RuleDraft;
+import com.sq.caa.rules.RuleInUseException;
 import com.sq.caa.rules.RuleJudgementException;
 import com.sq.caa.rules.RuleNotFoundException;
 import com.sq.caa.rules.RuleValidationException;
@@ -62,11 +63,14 @@ public class RuleController {
         this.riskRuleService = riskRuleService;
     }
 
-    /** Every rule, name ascending. */
+    /** Every rule, name ascending, with the latest judgement and firing times of each. */
     @GetMapping
     @PreAuthorize(SecurityRoles.IS_OPERATOR_OR_ADMIN)
     public List<RiskRuleDto> list() {
-        return riskRuleService.findAll().stream().map(RiskRuleDto::from).toList();
+        var statsByRule = riskRuleService.activityStatsByRule();
+        return riskRuleService.findAll().stream()
+                .map(rule -> RiskRuleDto.from(rule, statsByRule.get(rule.getRuleId())))
+                .toList();
     }
 
     /** Creates a rule. */
@@ -88,7 +92,10 @@ public class RuleController {
         return RiskRuleDto.from(rule);
     }
 
-    /** Deletes a rule and, by cascade, its recorded assessments. */
+    /**
+     * Deletes a rule. A rule that historical {@code risk_assessments} rows still reference is not
+     * deleted - the service refuses with {@code 409} so past analyses keep their evidence.
+     */
     @DeleteMapping("/{ruleId}")
     @PreAuthorize(SecurityRoles.IS_ADMIN)
     @ResponseStatus(HttpStatus.NO_CONTENT)
@@ -174,6 +181,14 @@ public class RuleController {
             HttpServletRequest request) {
         ProblemDetail problem = problem(HttpStatus.NOT_FOUND, "Customer not found", e.getMessage(), request);
         problem.setProperty("customerId", String.valueOf(e.customerId()));
+        return respond(problem);
+    }
+
+    @ExceptionHandler(RuleInUseException.class)
+    public ResponseEntity<ProblemDetail> onRuleInUse(RuleInUseException e, HttpServletRequest request) {
+        ProblemDetail problem = problem(HttpStatus.CONFLICT, "Rule is referenced by past analyses",
+                e.getMessage(), request);
+        problem.setProperty("ruleId", String.valueOf(e.ruleId()));
         return respond(problem);
     }
 

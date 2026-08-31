@@ -45,6 +45,7 @@ function CountryCell({ code }: { code: string | null | undefined }) {
 const dateColumn: Column<Transaction> = {
   key: 'createdAt',
   header: 'Date',
+  sortKey: 'createdAt',
   cell: (transaction) => (
     <span className="numeric whitespace-nowrap text-muted" title={formatDateTimeSeconds(transaction.createdAt)}>
       {formatDateTime(transaction.createdAt)}
@@ -56,6 +57,7 @@ const dateColumn: Column<Transaction> = {
 const amountColumn: Column<Transaction> = {
   key: 'amount',
   header: 'Amount',
+  sortKey: 'amount',
   align: 'right',
   cell: (transaction) => (
     <span className="numeric font-medium whitespace-nowrap text-fg">
@@ -68,6 +70,7 @@ const amountColumn: Column<Transaction> = {
 const statusColumn: Column<Transaction> = {
   key: 'status',
   header: 'Status',
+  sortKey: 'status',
   cell: (transaction) => <StatusBadge status={transaction.status} />,
   className: 'w-28',
 }
@@ -104,6 +107,7 @@ const allColumns: Column<Transaction>[] = [
   {
     key: 'activityType',
     header: 'Type',
+    sortKey: 'activityType',
     cell: (transaction) => (
       <Badge tone="neutral">{ACTIVITY_TYPE_LABELS[transaction.activityType]}</Badge>
     ),

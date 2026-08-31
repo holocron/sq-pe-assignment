@@ -18,6 +18,7 @@ import {
   CardContent,
   CardHeader,
   CardTitle,
+  Checkbox,
   EmptyState,
   ErrorState,
   Input,
@@ -128,9 +129,11 @@ function RecentAnalysesPanel({
                       ? 'Running now'
                       : analysis.status === 'FAILED'
                         ? 'Failed'
-                        : `${formatNumber(analysis.rulesEvaluated ?? 0)}/${formatNumber(
-                            analysis.rulesTotal ?? 0,
-                          )} rules evaluated`}
+                        : analysis.status === 'CANCELLED'
+                          ? 'Cancelled'
+                          : `${formatNumber(analysis.rulesEvaluated ?? 0)}/${formatNumber(
+                              analysis.rulesTotal ?? 0,
+                            )} rules evaluated`}
                   </span>
                 </span>
                 <RiskBadge
@@ -156,6 +159,7 @@ function RecentAnalysesPanel({
 export function DashboardPage() {
   const navigate = useNavigate()
   const [queryInput, setQueryInput] = useState('')
+  const [elevatedOnly, setElevatedOnly] = useState(false)
   const [size, setSize] = useState(DEFAULT_PAGE_SIZE)
   const query = useDebouncedValue(queryInput.trim(), 300)
 
@@ -177,6 +181,21 @@ export function DashboardPage() {
      the panels do not churn while the operator types. */
   const overview = useAnalysesAcrossCustomers()
   const latestRiskByCustomer = overview.latestByCustomer
+
+  /** Latest verdict for a row: the summary column first, then the fan-out. */
+  const latestRiskOf = (customer: CustomerSummary) =>
+    customer.lastRiskLevel ?? latestRiskByCustomer.get(customer.customerId)?.riskLevel ?? null
+
+  /* The elevated-risk toggle narrows the page already loaded — the risk verdict
+     is not a search parameter of `GET /api/customers`, so it cannot be pushed
+     server-side without a contract change, and the label says as much. */
+  const visibleCustomers =
+    elevatedOnly && results
+      ? results.content.filter((customer) => {
+          const level = latestRiskOf(customer)
+          return level === 'HIGH' || level === 'CRITICAL'
+        })
+      : (results?.content ?? [])
 
   const elevatedCustomers = overview.customers.filter((customer) => {
     const level = latestRiskByCustomer.get(customer.customerId)?.riskLevel
@@ -294,8 +313,7 @@ export function DashboardPage() {
       key: 'risk',
       header: 'Latest risk',
       cell: (customer) => {
-        const level =
-          customer.lastRiskLevel ?? latestRiskByCustomer.get(customer.customerId)?.riskLevel ?? null
+        const level = latestRiskOf(customer)
         return level ? (
           <RiskBadge level={level} size="sm" />
         ) : (
@@ -408,6 +426,15 @@ export function DashboardPage() {
                   className="h-11 text-base"
                 />
               </form>
+
+              <div className="mt-3">
+                <Checkbox
+                  label="Elevated risk only"
+                  hint="Narrows the listed page to customers whose latest analysis is HIGH or CRITICAL."
+                  checked={elevatedOnly}
+                  onChange={(event) => setElevatedOnly(event.target.checked)}
+                />
+              </div>
             </div>
 
             <CardHeader
@@ -433,18 +460,26 @@ export function DashboardPage() {
             >
               <Table
                 columns={columns}
-                rows={results?.content ?? []}
+                rows={visibleCustomers}
                 rowKey={(customer) => customer.customerId}
                 loading={customersQuery.isLoading}
                 error={customersQuery.error}
                 onRetry={() => void customersQuery.refetch()}
                 caption="Customer search results"
                 onRowClick={(customer) => navigate(`/customers/${customer.customerId}`)}
-                emptyTitle={query ? 'No matching customers' : 'No customers on file'}
+                emptyTitle={
+                  elevatedOnly
+                    ? 'No elevated-risk customers on this page'
+                    : query
+                      ? 'No matching customers'
+                      : 'No customers on file'
+                }
                 emptyDescription={
-                  query
-                    ? 'Check the spelling, or paste a full customer UUID.'
-                    : 'The backend returned an empty customer list. Confirm the seed data was applied.'
+                  elevatedOnly
+                    ? 'No customer listed here has a latest analysis at HIGH or CRITICAL. Clear the filter to see everyone.'
+                    : query
+                      ? 'Check the spelling, or paste a full customer UUID.'
+                      : 'The backend returned an empty customer list. Confirm the seed data was applied.'
                 }
               />
             </div>

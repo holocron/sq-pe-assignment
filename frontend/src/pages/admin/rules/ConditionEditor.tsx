@@ -17,10 +17,12 @@
 import { Check, Database, Lightbulb, Minus } from 'lucide-react'
 import { useEffect, useId, type RefObject } from 'react'
 import { RULE_CONDITION_MAX_LENGTH, type FieldCatalogEntry } from '../../../api/types'
+import { Badge } from '../../../components/ui/Badge'
 import { Button } from '../../../components/ui/Button'
 import { INPUT_BASE, INPUT_TONE, INPUT_TONE_INVALID } from '../../../components/ui/Input'
 import { cn } from '../../../lib/cn'
 import { conditionChecks } from './conditionText'
+import { detectConditionTokens } from './conditionTokens'
 import { RULE_TEMPLATES, type RuleTemplate } from './templates'
 
 export interface ConditionEditorProps {
@@ -96,6 +98,9 @@ export function ConditionEditor({
   const nearLimit = !over && remaining <= RULE_CONDITION_MAX_LENGTH * 0.1
   const checks = conditionChecks(value, catalog)
   const blank = value.trim().length === 0
+  /* The fields and thresholds the condition names, echoed as chips below the
+     box. A reading aid only — a field the scan misses is still judged. */
+  const tokens = detectConditionTokens(value, catalog)
 
   /* Auto-grow: the height follows the content up to a cap, after which the box
      scrolls. Guarded because jsdom reports a scrollHeight of 0. */
@@ -158,6 +163,30 @@ export function ConditionEditor({
           condition is worded decides how it is measured.
         </p>
       )}
+
+      {tokens.length > 0 ? (
+        <div aria-label="Fields and thresholds named in the condition" className="flex flex-wrap items-center gap-1.5">
+          <span className="text-2xs font-semibold tracking-caption text-subtle uppercase">
+            Detected
+          </span>
+          {tokens.map((token) =>
+            token.kind === 'field' ? (
+              <Badge key={token.id} tone="info" title={`Matches “${token.matched}” in the text`}>
+                {token.label}
+              </Badge>
+            ) : (
+              <Badge
+                key={token.id}
+                tone="outline"
+                className="numeric"
+                title="Threshold named in the condition"
+              >
+                {token.label}
+              </Badge>
+            ),
+          )}
+        </div>
+      ) : null}
 
       <ul className="flex flex-col gap-1 rounded-md border border-border bg-surface-2/40 px-3 py-2">
         <li className="text-2xs font-semibold tracking-caption text-muted uppercase">

@@ -1,5 +1,6 @@
-export { ActivityBreakdownCard, ActivityTimelineCard, TIMELINE_DAYS } from './ActivityCharts'
-export type { ActivityBreakdownCardProps, ActivityTimelineCardProps } from './ActivityCharts'
+/* ActivityCharts is deliberately NOT re-exported here: CustomerPage lazy-loads
+   it so recharts stays out of every chunk that never draws a chart. A static
+   re-export through this barrel would defeat that split. */
 export { ActivityPanel, type ActivityPanelProps } from './ActivityPanel'
 export { ActivitySummaryCards, type ActivitySummaryCardsProps } from './ActivitySummaryCards'
 export {

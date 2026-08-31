@@ -82,6 +82,8 @@ public interface TransactionRepository
               and lower(t.status) = lower(coalesce(cast(:status as string), t.status))
               and t.createdAt >= coalesce(:from, t.createdAt)
               and t.createdAt <= coalesce(:to, t.createdAt)
+              and t.amount >= coalesce(:minAmount, t.amount)
+              and t.amount <= coalesce(:maxAmount, t.amount)
             """,
             countQuery = """
             select count(t)
@@ -91,12 +93,16 @@ public interface TransactionRepository
               and lower(t.status) = lower(coalesce(cast(:status as string), t.status))
               and t.createdAt >= coalesce(:from, t.createdAt)
               and t.createdAt <= coalesce(:to, t.createdAt)
+              and t.amount >= coalesce(:minAmount, t.amount)
+              and t.amount <= coalesce(:maxAmount, t.amount)
             """)
     Page<Transaction> findForCustomerWithDetails(@Param("customerId") UUID customerId,
             @Param("activityType") ActivityType activityType,
             @Param("status") String status,
             @Param("from") Instant from,
             @Param("to") Instant to,
+            @Param("minAmount") BigDecimal minAmount,
+            @Param("maxAmount") BigDecimal maxAmount,
             Pageable pageable);
 
     /** Every transaction of a customer with its detail row - the evidence the agent reads. */

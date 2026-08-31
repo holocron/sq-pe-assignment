@@ -242,7 +242,7 @@ function respond(url: string, params: Params): unknown {
 }
 
 /** Records every call so assertions can check the query string we sent. */
-function calledWith(url: string, key: string, value: string): boolean {
+function calledWith(url: string, key: string, value: string | number): boolean {
   return getJsonMock.mock.calls.some((call) => {
     const [calledUrl, config] = call as [string, { params?: Record<string, unknown> } | undefined]
     return calledUrl === url && config?.params?.[key] === value
@@ -322,7 +322,7 @@ describe('customer activity table', () => {
 
     expect(await screen.findByText('No transactions found')).toBeInTheDocument()
     expect(
-      screen.getByText('No records match the current status or date filters.'),
+      screen.getByText('No records match the current status, date or amount filters.'),
     ).toBeInTheDocument()
     expect(calledWith(`/customers/${CUSTOMER_ID}/activity`, 'status', 'Reversed')).toBe(true)
   })
@@ -340,6 +340,91 @@ describe('customer activity table', () => {
     expect(getJsonMock).toHaveBeenCalledWith(
       '/transactions/f47ac10b-58cc-4372-a567-0e02b2c3d479',
     )
+  })
+
+  it('sends the sort parameter when a sortable column header is clicked', async () => {
+    renderWithProviders(<ActivityPanel customerId={CUSTOMER_ID} summary={undefined} />)
+    await screen.findByText('Aurora Electronics · MCC 5732')
+
+    fireEvent.click(screen.getByRole('button', { name: /amount/i }))
+    await waitFor(() => {
+      expect(calledWith(`/customers/${CUSTOMER_ID}/activity`, 'sort', 'amount,asc')).toBe(true)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /amount/i }))
+    await waitFor(() => {
+      expect(calledWith(`/customers/${CUSTOMER_ID}/activity`, 'sort', 'amount,desc')).toBe(true)
+    })
+
+    /* Date, status and type are the other sortable columns of the contract. */
+    fireEvent.click(screen.getByRole('button', { name: /date/i }))
+    await waitFor(() => {
+      expect(calledWith(`/customers/${CUSTOMER_ID}/activity`, 'sort', 'createdAt,asc')).toBe(true)
+    })
+    fireEvent.click(screen.getByRole('button', { name: /^status/i }))
+    await waitFor(() => {
+      expect(calledWith(`/customers/${CUSTOMER_ID}/activity`, 'sort', 'status,asc')).toBe(true)
+    })
+    fireEvent.click(screen.getByRole('button', { name: /^type/i }))
+    await waitFor(() => {
+      expect(calledWith(`/customers/${CUSTOMER_ID}/activity`, 'sort', 'activityType,asc')).toBe(true)
+    })
+  })
+
+  it('sends the amount-range filters once a bound reads as a number', async () => {
+    renderWithProviders(<ActivityPanel customerId={CUSTOMER_ID} summary={undefined} />)
+    await screen.findByText('Aurora Electronics · MCC 5732')
+
+    fireEvent.change(screen.getByLabelText('Min amount'), { target: { value: '4000' } })
+    fireEvent.change(screen.getByLabelText('Max amount'), { target: { value: '10000' } })
+
+    /* Both bounds are debounced, so the assertion waits for the settled values. */
+    await waitFor(() => {
+      expect(calledWith(`/customers/${CUSTOMER_ID}/activity`, 'minAmount', 4000)).toBe(true)
+      expect(calledWith(`/customers/${CUSTOMER_ID}/activity`, 'maxAmount', 10000)).toBe(true)
+    })
+  })
+
+  it('blocks an inverted amount range and keeps it off the request', async () => {
+    renderWithProviders(<ActivityPanel customerId={CUSTOMER_ID} summary={undefined} />)
+    await screen.findByText('Aurora Electronics · MCC 5732')
+
+    fireEvent.change(screen.getByLabelText('Min amount'), { target: { value: '9000' } })
+    fireEvent.change(screen.getByLabelText('Max amount'), { target: { value: '100' } })
+
+    expect(
+      await screen.findByText('Max amount must be at least the min amount.'),
+    ).toBeInTheDocument()
+
+    /* While the range is inverted the settled request carries neither bound —
+       check the latest activity call, not the intermediate one-sided ones. */
+    await waitFor(() => {
+      const lastCall = getJsonMock.mock.calls
+        .filter(([url]) => url === `/customers/${CUSTOMER_ID}/activity`)
+        .pop() as [string, { params: Record<string, unknown> }]
+      expect(lastCall[1].params.minAmount).toBeUndefined()
+      expect(lastCall[1].params.maxAmount).toBeUndefined()
+    })
+  })
+
+  it('clears the amount filters with the rest of the filter row', async () => {
+    renderWithProviders(<ActivityPanel customerId={CUSTOMER_ID} summary={undefined} />)
+    await screen.findByText('Aurora Electronics · MCC 5732')
+
+    fireEvent.change(screen.getByLabelText('Min amount'), { target: { value: '4000' } })
+    await waitFor(() => {
+      expect(calledWith(`/customers/${CUSTOMER_ID}/activity`, 'minAmount', 4000)).toBe(true)
+    })
+
+    fireEvent.click(await screen.findByRole('button', { name: /clear filters/i }))
+
+    expect(screen.getByLabelText('Min amount')).toHaveValue(null)
+    await waitFor(() => {
+      const lastCall = getJsonMock.mock.calls
+        .filter(([url]) => url === `/customers/${CUSTOMER_ID}/activity`)
+        .pop() as [string, { params: Record<string, unknown> }]
+      expect(lastCall[1].params.minAmount).toBeUndefined()
+    })
   })
 
   it('surfaces a failed activity request', async () => {
@@ -448,6 +533,23 @@ describe('dashboard customer search', () => {
     const row = (await screen.findByText('Mila Novak')).closest('tr') as HTMLElement
     expect(within(row).getAllByText(EM_DASH).length).toBeGreaterThanOrEqual(3)
     expect(within(row).getByText('Not assessed')).toBeInTheDocument()
+  })
+
+  it('narrows the listed page to HIGH or CRITICAL when elevated-only is on', async () => {
+    renderDashboard()
+    await screen.findByText('Mila Novak')
+
+    fireEvent.click(screen.getByLabelText(/Elevated risk only/))
+
+    /* Mila's latest verdict is HIGH; Ada's is LOW — no extra request is made,
+       the page already loaded is narrowed client-side. */
+    await waitFor(() => {
+      expect(screen.queryByText('Ada Sterling')).not.toBeInTheDocument()
+    })
+    expect(screen.getByText('Mila Novak')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText(/Elevated risk only/))
+    expect(await screen.findByText('Ada Sterling')).toBeInTheDocument()
   })
 
   it('shows an empty state when the search matches nothing', async () => {

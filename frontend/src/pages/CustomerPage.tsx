@@ -1,22 +1,42 @@
-import { ArrowLeft, History, Sparkles, UserX } from 'lucide-react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { History, Sparkles, UserX } from 'lucide-react'
+import { lazy, Suspense } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
 import { sortAnalysesNewestFirst, useCustomerAnalyses, useStartAnalysis } from '../api/analyses'
 import { useCustomer, useCustomerSummary } from '../api/customers'
 import { errorMessage, isApiError } from '../api/errors'
+import { BackLink } from '../components/ui/BackLink'
 import { Button } from '../components/ui/Button'
 import { Card } from '../components/ui/Card'
 import { EmptyState } from '../components/ui/EmptyState'
 import { LinkButton } from '../components/ui/LinkButton'
+import { Skeleton } from '../components/ui/Skeleton'
 import { useToast } from '../components/ui/Toast'
 import { fullName } from '../lib/format'
 import {
-  ActivityBreakdownCard,
   ActivityPanel,
   ActivitySummaryCards,
-  ActivityTimelineCard,
   CustomerAnalysesPanel,
   CustomerHeader,
 } from './customer'
+
+/* The charts carry recharts (~100 kB gzipped); they load on demand so the rest
+   of the page — and every route that never draws a chart — stays free of it. */
+const ActivityTimelineCard = lazy(() =>
+  import('./customer/ActivityCharts').then((m) => ({ default: m.ActivityTimelineCard })),
+)
+const ActivityBreakdownCard = lazy(() =>
+  import('./customer/ActivityCharts').then((m) => ({ default: m.ActivityBreakdownCard })),
+)
+
+/** Placeholder with the card's footprint so the grid does not jump. */
+function ChartFallback() {
+  return (
+    <Card className="p-4">
+      <Skeleton className="h-4 w-40" />
+      <Skeleton className="mt-4 h-48 w-full" />
+    </Card>
+  )
+}
 
 /**
  * The operator's working view of one customer: identity, aggregates, volume
@@ -54,7 +74,7 @@ export function CustomerPage() {
           icon={<UserX className="size-5" />}
           title="Customer not found"
           description="This customer does not exist, or the identifier in the URL is not a valid UUID."
-          action={<LinkButton to="/dashboard">Back to customer search</LinkButton>}
+          action={<LinkButton to="/dashboard">Back to customer activity</LinkButton>}
         />
       </Card>
     )
@@ -66,15 +86,9 @@ export function CustomerPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <nav aria-label="Breadcrumb">
-        <Link
-          to="/dashboard"
-          className="inline-flex w-fit items-center gap-1.5 rounded-xs text-xs font-medium text-muted transition-colors hover:text-accent-strong"
-        >
-          <ArrowLeft aria-hidden="true" className="size-3.5" />
-          Customer search
-        </Link>
-      </nav>
+      <BackLink to="/dashboard" className="text-xs text-muted">
+        Customer activity
+      </BackLink>
 
       <CustomerHeader
         customerId={customerId}
@@ -114,17 +128,21 @@ export function CustomerPage() {
 
       <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-4">
         <div className="lg:col-span-2">
-          <ActivityTimelineCard
-            customerId={customerId}
-            currencies={summaryQuery.data?.currencies ?? []}
-          />
+          <Suspense fallback={<ChartFallback />}>
+            <ActivityTimelineCard
+              customerId={customerId}
+              currencies={summaryQuery.data?.currencies ?? []}
+            />
+          </Suspense>
         </div>
-        <ActivityBreakdownCard
-          summary={summaryQuery.data}
-          loading={summaryQuery.isLoading}
-          error={summaryQuery.error}
-          onRetry={() => void summaryQuery.refetch()}
-        />
+        <Suspense fallback={<ChartFallback />}>
+          <ActivityBreakdownCard
+            summary={summaryQuery.data}
+            loading={summaryQuery.isLoading}
+            error={summaryQuery.error}
+            onRetry={() => void summaryQuery.refetch()}
+          />
+        </Suspense>
         <CustomerAnalysesPanel
           customerId={customerId}
           analyses={analyses}

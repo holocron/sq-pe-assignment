@@ -4,5 +4,7 @@ package com.sq.caa.domain;
 public enum AnalysisStatus {
     RUNNING,
     COMPLETED,
-    FAILED
+    FAILED,
+    /** Aborted at the user's request while still running; verdicts obtained so far are kept. */
+    CANCELLED
 }

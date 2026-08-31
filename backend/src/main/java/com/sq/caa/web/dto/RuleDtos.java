@@ -8,6 +8,7 @@ import com.sq.caa.rules.FieldType;
 import com.sq.caa.rules.JudgedTransaction;
 import com.sq.caa.rules.RuleJudgement;
 import com.sq.caa.rules.RuleValidator;
+import com.sq.caa.repository.projection.RuleActivityStats;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.Digits;
@@ -29,17 +30,29 @@ public final class RuleDtos {
      * A stored rule.
      *
      * @param thresholdLogic the rule condition in plain English, exactly the text the agent is shown
+     * @param lastFiredAt    latest assessment where the rule fired (score &gt; 0); {@code null} when
+     *                       it never fired or was never judged
+     * @param lastJudgedAt   latest assessment recorded for the rule whatever the score; {@code null}
+     *                       when the rule has no assessment rows
      */
     public record RiskRuleDto(
             UUID ruleId,
             String ruleName,
             RuleScope appliesTo,
             String thresholdLogic,
-            BigDecimal weight) {
+            BigDecimal weight,
+            Instant lastFiredAt,
+            Instant lastJudgedAt) {
+
+        public static RiskRuleDto from(RiskRule rule, RuleActivityStats stats) {
+            return new RiskRuleDto(rule.getRuleId(), rule.getRuleName(), rule.getAppliesTo(),
+                    rule.getThresholdLogic(), rule.getWeight(),
+                    stats == null ? null : stats.lastFiredAt(),
+                    stats == null ? null : stats.lastJudgedAt());
+        }
 
         public static RiskRuleDto from(RiskRule rule) {
-            return new RiskRuleDto(rule.getRuleId(), rule.getRuleName(), rule.getAppliesTo(),
-                    rule.getThresholdLogic(), rule.getWeight());
+            return from(rule, null);
         }
     }
 

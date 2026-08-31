@@ -154,7 +154,7 @@ app_users(user_id UUID PK, username VARCHAR UNIQUE, password_hash VARCHAR, full_
 
 -- AI narrative + run status for one assessment_id (the row-per-rule detail lives in risk_assessments)
 analysis_runs(assessment_id UUID PK, customer_id UUID FK->customers, status VARCHAR
-                 CHECK (status IN ('RUNNING','COMPLETED','FAILED')),
+                 CHECK (status IN ('RUNNING','COMPLETED','FAILED','CANCELLED')),  -- CANCELLED added by V6
               risk_level VARCHAR CHECK (risk_level IN ('LOW','MEDIUM','HIGH','CRITICAL')) NULL,
               total_score DECIMAL(10,2) NULL, summary TEXT NULL, recommendations TEXT NULL,
               rules_total INT, rules_evaluated INT, coverage_complete BOOLEAN,
@@ -369,19 +369,33 @@ GET    /api/auth/me               -> {username, fullName, role}
 GET    /api/customers?query=&page=&size=      -> Page<CustomerSummary>  (query matches UUID or name)
 GET    /api/customers/{customerId}            -> Customer
 GET    /api/customers/{customerId}/summary    -> activity aggregates for the dashboard
-GET    /api/customers/{customerId}/activity?type=&status=&from=&to=&page=&size=
-                                              -> Page<Transaction> (detail object inlined per type)
+GET    /api/customers/{customerId}/activity?type=&status=&from=&to=&minAmount=&maxAmount=&page=&size=&sort=
+                                              -> Page<Transaction> (detail object inlined per type);
+                                              minAmount/maxAmount = inclusive non-negative decimal
+                                              bounds on amount (400 problem+json when non-numeric,
+                                              negative or inverted); sort=<field>,<asc|desc>, field in
+                                              {amount, createdAt, status, activityType};
+                                              default createdAt,desc
 GET    /api/transactions/{transactionId}      -> Transaction (full detail)
 
 POST   /api/customers/{customerId}/analyses   -> 202 {assessmentId, status:"RUNNING"}
 GET    /api/analyses/{assessmentId}           -> AnalysisResult (incl. trace + ruleEvaluations[])
 GET    /api/analyses/{assessmentId}/stream    -> SSE live steps while RUNNING
-GET    /api/customers/{customerId}/analyses   -> AnalysisSummary[] (history, newest first)
+GET    /api/customers/{customerId}/analyses   -> AnalysisSummary[] (history, newest first;
+                                              sort=<field>,<asc|desc>, field in {createdAt|startedAt,
+                                              totalScore, riskLevel})
+POST   /api/analyses/{assessmentId}/cancel    -> 202 {assessmentId, status:"RUNNING"}: stop requested,
+                                              the run reaches CANCELLED; 409 when already terminal
 
-GET    /api/rules                             -> RiskRule[]           (ADMIN + OPERATOR read)
+GET    /api/rules                             -> RiskRule[]           (ADMIN + OPERATOR read; each
+                                              rule carries nullable lastFiredAt (latest risk_assessments
+                                              row with score_contribution > 0) and lastJudgedAt (latest
+                                              row whatever the score), null when never assessed)
 POST   /api/rules                             -> RiskRule             (ADMIN)
 PUT    /api/rules/{ruleId}                    -> RiskRule             (ADMIN)
-DELETE /api/rules/{ruleId}                    -> 204                  (ADMIN)
+DELETE /api/rules/{ruleId}                    -> 204                  (ADMIN; 409 problem+json when
+                                              recorded risk_assessments rows still reference the rule -
+                                              historical evidence is never cascade-deleted)
 GET    /api/rules/field-catalog               -> FieldCatalogEntry[]  (ADMIN)
 POST   /api/rules/test  {ruleName, thresholdLogic, appliesTo, weight, customerId}
                           -> {triggered, score, weight, rationale, matchedTransactions[],

@@ -7,6 +7,7 @@ import com.sq.caa.web.dto.AnalysisDtos.AnalysisResult;
 import com.sq.caa.web.dto.AnalysisDtos.AnalysisSummary;
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -19,7 +20,9 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.servlet.HandlerMapping;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -59,11 +62,62 @@ public class AnalysisController {
                 .body(accepted);
     }
 
-    /** Analysis history of one customer, newest first. */
+    /**
+     * Analysis history of one customer, newest first by default.
+     *
+     * @param sort optional {@code <field>,<asc|desc>} - one of {@code createdAt} (alias
+     *             {@code startedAt}), {@code totalScore}, {@code riskLevel}
+     */
     @GetMapping("/api/customers/{customerId}/analyses")
     @PreAuthorize("isAuthenticated()")
-    public List<AnalysisSummary> customerAnalyses(@PathVariable UUID customerId) {
-        return analysisService.history(customerId);
+    public List<AnalysisSummary> customerAnalyses(@PathVariable UUID customerId,
+            @RequestParam(required = false) String sort) {
+        return analysisService.history(customerId, parseHistorySort(sort));
+    }
+
+    /**
+     * Parses the history sort against a whitelist, so a client-supplied field can never become
+     * anything but a known comparison. {@code null} keeps the default, newest first.
+     */
+    private static AnalysisHistorySort parseHistorySort(String raw) {
+        String value = raw == null || raw.isBlank() ? null : raw.trim();
+        if (value == null) {
+            return null;
+        }
+        String[] parts = value.split(",");
+        String field = parts[0].trim();
+        if (!HISTORY_SORT_FIELDS.contains(field)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Unknown sort field '" + field
+                    + "'. Expected one of " + String.join(", ", HISTORY_SORT_FIELDS) + ".");
+        }
+        if (parts.length > 1 && !"asc".equalsIgnoreCase(parts[1].trim())
+                && !"desc".equalsIgnoreCase(parts[1].trim())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Parameter 'sort' direction "
+                    + "must be 'asc' or 'desc', was '" + parts[1].trim() + "'.");
+        }
+        boolean descending = parts.length == 1 || !"asc".equalsIgnoreCase(parts[1].trim());
+        return new AnalysisHistorySort(field, descending);
+    }
+
+    /** Sortable history fields. {@code startedAt} is the client-facing alias of {@code createdAt}. */
+    private static final Set<String> HISTORY_SORT_FIELDS =
+            Set.of("createdAt", "startedAt", "totalScore", "riskLevel");
+
+    /** One parsed history sort: whitelisted field plus direction (descending unless {@code asc}). */
+    public record AnalysisHistorySort(String field, boolean descending) {
+    }
+
+    /**
+     * Cancels a running analysis.
+     *
+     * <p>{@code 202 Accepted}: the stop is requested, the run settles at the next step boundary and
+     * reaches {@code CANCELLED} - follow it on the stream or by polling. A run already in a terminal
+     * state answers {@code 409}.
+     */
+    @PostMapping("/api/analyses/{assessmentId}/cancel")
+    @PreAuthorize("isAuthenticated()")
+    public ResponseEntity<AnalysisAccepted> cancelAnalysis(@PathVariable UUID assessmentId) {
+        return ResponseEntity.accepted().body(analysisService.cancel(assessmentId));
     }
 
     /** One analysis: risk level, narrative, the per-rule coverage table and the ReAct trace. */

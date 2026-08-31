@@ -834,6 +834,49 @@ describe('TraceViewer', () => {
     expect(screen.getByLabelText('SQL for step 4')).toHaveTextContent('DROP TABLE transactions')
   })
 
+  it('hides a step type when its chip is switched off, and restores it', () => {
+    render(<TraceViewer steps={TRACE} ruleNames={ruleNames} />)
+
+    // The chips count the types present in the trace.
+    const toolCalls = screen.getByRole('button', { name: /^Tool calls ?4$/ })
+    expect(toolCalls).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: /^Reasoning ?1$/ })).toBeInTheDocument()
+    expect(screen.getByText('Risk rules')).toBeInTheDocument()
+
+    fireEvent.click(toolCalls)
+
+    expect(toolCalls).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.queryByText('Risk rules')).not.toBeInTheDocument()
+    expect(screen.queryByText('Policy knowledge search')).not.toBeInTheDocument()
+    expect(screen.getByText('4 hidden')).toBeInTheDocument()
+    // The header still counts the whole trace; only the timeline is filtered.
+    expect(
+      screen.getByText('7 steps · 4 tool calls · 1 coverage reprompt · 1 failed query'),
+    ).toBeInTheDocument()
+
+    fireEvent.click(toolCalls)
+    expect(screen.getByText('Risk rules')).toBeInTheDocument()
+  })
+
+  it('says so when every step is filtered out', () => {
+    render(<TraceViewer steps={TRACE} ruleNames={ruleNames} />)
+
+    for (const name of [/Tool calls/, /Reasoning/, /Coverage reprompts/, /Final verdicts/]) {
+      fireEvent.click(screen.getByRole('button', { name }))
+    }
+
+    expect(screen.getByText(/Every step is hidden by the type filters/)).toBeInTheDocument()
+  })
+
+  it('offers a jump to the latest step', () => {
+    render(<TraceViewer steps={TRACE} ruleNames={ruleNames} />)
+
+    const jump = screen.getByRole('button', { name: /Jump to latest/ })
+    expect(jump).toBeEnabled()
+    // jsdom has no scrollIntoView; the click must simply be a safe no-op there.
+    fireEvent.click(jump)
+  })
+
   it('waits visibly for the first step of a live run', () => {
     render(<TraceViewer steps={[]} running live={{ connected: true }} />)
     expect(screen.getByText(/first step/)).toBeInTheDocument()

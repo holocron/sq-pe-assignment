@@ -26,7 +26,9 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
-    sourcemap: true,
+    /* No production sourcemaps: they tripled the published payload and the
+       app is debugged from the dev server. */
+    sourcemap: false,
   },
   test: {
     environment: 'jsdom',

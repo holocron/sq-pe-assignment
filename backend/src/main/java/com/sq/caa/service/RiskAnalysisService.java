@@ -1,6 +1,7 @@
 package com.sq.caa.service;
 
 import com.sq.caa.agent.AgentProperties;
+import com.sq.caa.agent.AgentRunCancelledException;
 import com.sq.caa.agent.AgentRunFailedException;
 import com.sq.caa.agent.AgentRunResult;
 import com.sq.caa.agent.AnalysisExecutor;
@@ -23,12 +24,14 @@ import com.sq.caa.web.dto.AnalysisDtos.AnalysisAccepted;
 import com.sq.caa.web.dto.AnalysisDtos.AnalysisResult;
 import com.sq.caa.web.dto.AnalysisDtos.AnalysisSummary;
 import com.sq.caa.web.dto.AnalysisDtos.RuleEvaluationView;
+import com.sq.caa.web.AnalysisController.AnalysisHistorySort;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -56,9 +59,9 @@ import tools.jackson.databind.node.ObjectNode;
  *
  * <p><b>Why asynchronous.</b> One run is minutes of model time. {@code POST .../analyses} therefore
  * writes a {@code RUNNING} row, hands the work to a bounded executor and answers {@code 202} with
- * the {@code assessment_id} the client then follows over SSE. A run can only ever leave
- * {@code RUNNING} in one of two ways - completed or failed with the reason recorded - because the
- * worker's {@code finally} block always writes an end state.
+ * the {@code assessment_id} the client then follows over SSE. A run can leave {@code RUNNING} in
+ * three ways - completed, failed with the reason recorded, or cancelled at the user's request
+ * ({@link #cancel}) - because the worker's {@code finally} block always writes an end state.
  *
  * <p><b>Why a run can fail on coverage alone.</b> A verdict exists only where a query ran: the agent
  * reads each rule's condition, writes the SELECT that answers it, and PostgreSQL decides. Nothing
@@ -243,6 +246,24 @@ public class RiskAnalysisService {
                     System.currentTimeMillis() - startedAt);
             log.info("Analysis {} completed: {} ({}), all {} applicable rule(s) judged by the agent",
                     assessmentId, result.riskLevel(), result.totalScore(), result.rulesTotal());
+        } catch (AgentRunCancelledException e) {
+            // The user aborted the run. What the agent had already established is still persisted -
+            // same rows, same trace - under CANCELLED, so a stopped run is distinguishable from both
+            // a finished one and a failed one.
+            long durationMs = System.currentTimeMillis() - startedAt;
+            String message = "The analysis was cancelled at the user's request.";
+            log.info("Analysis {} for customer {} was cancelled after {} step(s); keeping the {} "
+                    + "verdict(s) already obtained", assessmentId, customerId, e.result().steps(),
+                    e.result().rulesJudged());
+            try {
+                persist(e.result(), trace, AnalysisStatus.CANCELLED, message, durationMs);
+            } catch (Exception nested) {
+                log.error("Analysis {} could not persist its verdicts on cancellation", assessmentId,
+                        nested);
+                markCancelled(assessmentId, message, durationMs, trace.size());
+                trace.publishStatus(statusPayload(assessmentId, AnalysisStatus.CANCELLED, null, null,
+                        e.result().rulesTotal(), e.result().rulesJudged(), false, message));
+            }
         } catch (AgentRunFailedException e) {
             // The loop settled the run from the work the agent had done, so the partial result is
             // persisted as-is: there is nothing to re-derive it from.
@@ -398,8 +419,7 @@ public class RiskAnalysisService {
     }
 
     /** Last-resort end state: the run is marked failed even if nothing else could be written. */
-    private void markFailed(UUID assessmentId, String error, long durationMs, int steps) {
-        try {
+    private void markFailed(UUID assessmentId, String error, long durationMs, int steps) {        try {
             transactions.executeWithoutResult(tx -> analysisRuns.findById(assessmentId).ifPresent(run -> {
                 run.setStatus(AnalysisStatus.FAILED);
                 run.setError(truncate(error));
@@ -410,6 +430,22 @@ public class RiskAnalysisService {
             }));
         } catch (RuntimeException e) {
             log.error("Could not mark analysis {} as failed", assessmentId, e);
+        }
+    }
+
+    /** Last-resort end state for a cancelled run whose verdicts could not be persisted. */
+    private void markCancelled(UUID assessmentId, String error, long durationMs, int steps) {
+        try {
+            transactions.executeWithoutResult(tx -> analysisRuns.findById(assessmentId).ifPresent(run -> {
+                run.setStatus(AnalysisStatus.CANCELLED);
+                run.setError(truncate(error));
+                run.setDurationMs(durationMs);
+                run.setSteps(steps);
+                run.setCompletedAt(Instant.now());
+                analysisRuns.save(run);
+            }));
+        } catch (RuntimeException e) {
+            log.error("Could not mark analysis {} as cancelled", assessmentId, e);
         }
     }
 
@@ -454,6 +490,37 @@ public class RiskAnalysisService {
     // ==================================================================
     // Reading
     // ==================================================================
+
+    /**
+     * Asks a running analysis to stop.
+     *
+     * <p>Cancellation is a flag on the run's live trace, which the agent loop polls between turns;
+     * the worker then settles the run from the verdicts already obtained and persists it as
+     * {@code CANCELLED}. The answer here is therefore {@code 202} with the run still
+     * {@code RUNNING} - the terminal state arrives over the stream or the next poll, exactly like a
+     * completion.
+     *
+     * @throws ResponseStatusException {@code 404} for an unknown id, {@code 409} when the run is
+     *                                 already in a terminal state
+     */
+    @Transactional(readOnly = true)
+    public AnalysisAccepted cancel(UUID assessmentId) {
+        AnalysisRun run = requireRun(assessmentId);
+        if (run.getStatus() != AnalysisStatus.RUNNING) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Analysis " + assessmentId
+                    + " is already " + run.getStatus() + "; only a running analysis can be "
+                    + "cancelled.");
+        }
+        AnalysisTrace trace = streams.find(assessmentId).orElseThrow(() ->
+                // RUNNING without a live trace means the worker has already left this process; the
+                // restart sweeper will settle the row, but there is nothing here to signal.
+                new ResponseStatusException(HttpStatus.CONFLICT, "Analysis " + assessmentId
+                        + " is not running in this process and cannot be cancelled."));
+        trace.requestCancellation();
+        log.info("Cancellation of analysis {} requested; the run will abort at the next step "
+                + "boundary", assessmentId);
+        return new AnalysisAccepted(assessmentId, run.getStatus());
+    }
 
     /** One analysis with its per-rule coverage table and its ReAct transcript. */
     @Transactional(readOnly = true)
@@ -505,8 +572,40 @@ public class RiskAnalysisService {
     /** Analysis history of one customer, newest first. */
     @Transactional(readOnly = true)
     public List<AnalysisSummary> history(UUID customerId) {
+        return history(customerId, null);
+    }
+
+    /**
+     * Analysis history of one customer. Default order is newest first; a {@code sort} re-orders by
+     * one whitelisted field. {@code riskLevel} orders by severity (its enum ordinal), and nulls -
+     * runs with no score or band yet - always sort last.
+     */
+    @Transactional(readOnly = true)
+    public List<AnalysisSummary> history(UUID customerId, AnalysisHistorySort sort) {
         customerService.requireCustomer(customerId);
-        return analysisRuns.findSummaries(customerId).stream().map(AnalysisSummary::from).toList();
+        List<AnalysisSummary> summaries = analysisRuns.findSummaries(customerId).stream()
+                .map(AnalysisSummary::from)
+                .toList();
+        if (sort == null) {
+            return summaries;
+        }
+        Comparator<AnalysisSummary> comparator = switch (sort.field()) {
+            case "createdAt", "startedAt" -> Comparator.comparing(AnalysisSummary::createdAt,
+                    Comparator.nullsLast(direction(sort.descending())));
+            case "totalScore" -> Comparator.comparing(AnalysisSummary::totalScore,
+                    Comparator.nullsLast(direction(sort.descending())));
+            case "riskLevel" -> Comparator.comparing(AnalysisSummary::riskLevel,
+                    Comparator.nullsLast(direction(sort.descending())));
+            default -> throw new IllegalArgumentException("Unsortable field: " + sort.field());
+        };
+        // The id keeps the order total so two runs equal on the sort field cannot swap between calls.
+        comparator = comparator.thenComparing(AnalysisSummary::assessmentId);
+        return summaries.stream().sorted(comparator).toList();
+    }
+
+    /** Ascending or descending natural order; nulls stay last in both directions. */
+    private static <T extends Comparable<T>> Comparator<T> direction(boolean descending) {
+        return descending ? Comparator.reverseOrder() : Comparator.naturalOrder();
     }
 
     // ==================================================================

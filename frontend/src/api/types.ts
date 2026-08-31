@@ -57,7 +57,7 @@ export const TRANSACTION_STATUSES = [
 ] as const
 export type TransactionStatus = (typeof TRANSACTION_STATUSES)[number]
 
-export const ANALYSIS_STATUSES = ['RUNNING', 'COMPLETED', 'FAILED'] as const
+export const ANALYSIS_STATUSES = ['RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED'] as const
 export type AnalysisStatus = (typeof ANALYSIS_STATUSES)[number]
 
 /**
@@ -418,6 +418,10 @@ export interface TransactionWire extends TransactionBase {
   detail?: ActivityDetail | null
 }
 
+/** Sortable fields of `GET /api/customers/{customerId}/activity`. */
+export const ACTIVITY_SORT_FIELDS = ['amount', 'createdAt', 'status', 'activityType'] as const
+export type ActivitySortField = (typeof ACTIVITY_SORT_FIELDS)[number]
+
 export interface ActivityQueryParams extends PageParams {
   type?: ActivityType | null
   status?: TransactionStatus | string | null
@@ -425,6 +429,15 @@ export interface ActivityQueryParams extends PageParams {
   from?: string | null
   /** ISO-8601 instant or date, inclusive upper bound. */
   to?: string | null
+  /** Inclusive lower bound on `amount` (decimal), composable with the rest. */
+  minAmount?: number | null
+  /** Inclusive upper bound on `amount` (decimal). */
+  maxAmount?: number | null
+  /**
+   * Server-side sort, `<field>,<asc|desc>` (single field). Omitted keeps the
+   * endpoint default: `createdAt,desc`.
+   */
+  sort?: string | null
 }
 
 /* -------------------------------------------------------------------------- */
@@ -450,6 +463,10 @@ export interface RiskRule {
   /** The rule condition in plain English, exactly as the agent receives it. */
   thresholdLogic: string
   weight: number
+  /** When the rule last fired in a completed analysis; null when never. */
+  lastFiredAt?: IsoDateTime | null
+  /** When the rule was last judged (fired or cleared); null when never. */
+  lastJudgedAt?: IsoDateTime | null
 }
 
 /** `weight` is DECIMAL(5,2), so Jackson may serialise it as a string. */
@@ -459,6 +476,8 @@ export interface RiskRuleWire {
   appliesTo: RuleScope
   thresholdLogic?: string | null
   weight: number | string
+  lastFiredAt?: IsoDateTime | null
+  lastJudgedAt?: IsoDateTime | null
 }
 
 export interface RiskRuleInput {
@@ -909,6 +928,109 @@ export interface KnowledgeChunk {
   sectionTitle?: string | null
   chunkIndex?: number | null
   metadata?: JsonObject | null
+}
+
+/* -------------------------------------------------------------------------- */
+/* LLM settings (admin)                                                        */
+/* -------------------------------------------------------------------------- */
+
+export const LLM_SETTINGS_SOURCES = ['database', 'environment'] as const
+export type LlmSettingsSource = (typeof LLM_SETTINGS_SOURCES)[number]
+
+/** Normalised `GET /api/admin/llm-settings`. The API key itself never leaves the server. */
+export interface LlmSettings {
+  baseUrl: string
+  chatModel: string
+  embedModel: string
+  embedDimension: number | null
+  /** True when a key is stored/configured; the value is never returned. */
+  apiKeySet: boolean
+  /** Where the active configuration comes from — runtime override or env fallback. */
+  source: LlmSettingsSource
+  updatedAt: IsoDateTime | null
+  updatedBy: string | null
+}
+
+/** Raw wire payload; every field is tolerant to absence. */
+export interface LlmSettingsWire {
+  baseUrl?: string | null
+  chatModel?: string | null
+  embedModel?: string | null
+  embedDimension?: number | string | null
+  apiKeySet?: boolean | null
+  source?: string | null
+  updatedAt?: string | null
+  updatedBy?: string | null
+}
+
+/** `PUT /api/admin/llm-settings` body. Omit `apiKey` to keep the stored key. */
+export interface LlmSettingsInput {
+  baseUrl: string
+  chatModel: string
+  embedModel: string
+  apiKey?: string
+  /** Required when `embedModel` changes — every knowledge-base vector is rebuilt. */
+  confirmReembed?: boolean
+}
+
+export interface LlmSettingsSaveWire extends LlmSettingsWire {
+  reembedStarted?: boolean | null
+}
+
+export interface LlmSettingsSaveResult {
+  settings: LlmSettings
+  reembedStarted: boolean
+}
+
+/** `GET /api/admin/llm-settings/models` — model ids the endpoint advertises. */
+export interface LlmModelListWire {
+  models?: string[] | null
+}
+
+export interface LlmProbeResult {
+  ok: boolean
+  detail: string | null
+}
+
+export interface LlmProbeResultWire {
+  ok?: boolean | null
+  detail?: string | null
+}
+
+export interface LlmEmbedProbeResult extends LlmProbeResult {
+  dimension: number | null
+}
+
+export interface LlmEmbedProbeResultWire extends LlmProbeResultWire {
+  dimension?: number | string | null
+}
+
+/** `POST /api/admin/llm-settings/test`. */
+export interface LlmConnectionTest {
+  chat: LlmProbeResult
+  embed: LlmEmbedProbeResult
+}
+
+export interface LlmConnectionTestWire {
+  chat?: LlmProbeResultWire | null
+  embed?: LlmEmbedProbeResultWire | null
+}
+
+/** `GET /api/admin/llm-settings/reembed-status`. */
+export interface ReembedStatus {
+  running: boolean
+  totalDocuments: number
+  completedDocuments: number
+  failedDocuments: number
+  lastError: string | null
+}
+
+export interface ReembedStatusWire {
+  running?: boolean | null
+  totalDocuments?: number | string | null
+  completedDocuments?: number | string | null
+  failedDocuments?: number | string | null
+  lastError?: string | null
 }
 
 /* -------------------------------------------------------------------------- */

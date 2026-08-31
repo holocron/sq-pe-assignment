@@ -67,7 +67,7 @@ export async function fetchCustomerSummary(customerId: UUID): Promise<ActivitySu
   )
 }
 
-/** `GET /api/customers/{customerId}/activity?type=&status=&from=&to=&page=&size=` */
+/** `GET /api/customers/{customerId}/activity?type=&status=&from=&to=&minAmount=&maxAmount=&sort=&page=&size=` */
 export async function fetchCustomerActivity(
   customerId: UUID,
   params: ActivityQueryParams = {},
@@ -78,6 +78,9 @@ export async function fetchCustomerActivity(
       status: params.status,
       from: params.from,
       to: params.to,
+      minAmount: params.minAmount,
+      maxAmount: params.maxAmount,
+      sort: params.sort,
       page: params.page ?? 0,
       size: params.size ?? DEFAULT_PAGE_SIZE,
     }),

@@ -2,6 +2,7 @@ package com.sq.caa.repository;
 
 import com.sq.caa.domain.RiskAssessment;
 import com.sq.caa.domain.RiskAssessmentId;
+import com.sq.caa.repository.projection.RuleActivityStats;
 import com.sq.caa.repository.projection.RuleEvaluationRow;
 import java.math.BigDecimal;
 import java.util.List;
@@ -86,6 +87,23 @@ public interface RiskAssessmentRepository extends JpaRepository<RiskAssessment, 
             where ra.id.assessmentId = :assessmentId
             """)
     long countDistinctRules(@Param("assessmentId") UUID assessmentId);
+
+    /** Whether any recorded assessment row references the rule - the guard on rule deletion. */
+    boolean existsById_RuleId(UUID ruleId);
+
+    /**
+     * Latest judgement and latest firing per rule, one GROUP BY over {@code risk_assessments}. Rules
+     * with no assessment row simply do not appear - the caller reads that as "never judged".
+     */
+    @Query("""
+            select new com.sq.caa.repository.projection.RuleActivityStats(
+                       ra.id.ruleId,
+                       max(ra.triggeredAt),
+                       max(case when ra.scoreContribution > 0 then ra.triggeredAt end))
+            from RiskAssessment ra
+            group by ra.id.ruleId
+            """)
+    List<RuleActivityStats> activityStatsByRule();
 
     /** Ids of the rules the run already recorded a verdict for - the coverage tracker. */
     @Query("""

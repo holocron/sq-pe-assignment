@@ -20,6 +20,7 @@ export {
 } from './layout/Nav'
 export { ThemeToggle, type ThemeToggleProps } from './layout/ThemeToggle'
 
+export { BackLink, type BackLinkProps } from './ui/BackLink'
 export { Badge, type BadgeProps, type BadgeSize, type BadgeTone } from './ui/Badge'
 export { Button, type ButtonProps } from './ui/Button'
 export {

@@ -23,7 +23,7 @@ import { Select } from '../../components/ui/Select'
 import { StatCard } from '../../components/ui/StatCard'
 import { Table, type Column } from '../../components/ui/Table'
 import { useToast } from '../../components/ui/Toast'
-import { formatNumber, shortId } from '../../lib/format'
+import { formatDateTime, formatNumber, shortId } from '../../lib/format'
 import { RuleEditor, type RuleEditorMode } from './rules/RuleEditor'
 import { conditionExcerpt } from './rules/conditionText'
 
@@ -92,6 +92,33 @@ function buildColumns(
           </div>
         )
       },
+    },
+    {
+      /* Contract D: both timestamps are nullable — a rule that never ran shows
+         an em dash, never a blank or a fabricated date. */
+      key: 'lastFiredAt',
+      header: 'Last fired',
+      className: 'w-32 hidden lg:table-cell',
+      headerClassName: 'hidden lg:table-cell',
+      cell: (rule) => (
+        <span className="numeric whitespace-nowrap text-muted" title={rule.lastFiredAt ?? undefined}>
+          {formatDateTime(rule.lastFiredAt)}
+        </span>
+      ),
+    },
+    {
+      key: 'lastJudgedAt',
+      header: 'Last judged',
+      className: 'w-32 hidden lg:table-cell',
+      headerClassName: 'hidden lg:table-cell',
+      cell: (rule) => (
+        <span
+          className="numeric whitespace-nowrap text-muted"
+          title={rule.lastJudgedAt ?? undefined}
+        >
+          {formatDateTime(rule.lastJudgedAt)}
+        </span>
+      ),
     },
     {
       key: 'actions',

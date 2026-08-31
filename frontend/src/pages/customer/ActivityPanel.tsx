@@ -13,11 +13,12 @@ import { Card, CardHeader, CardTitle } from '../../components/ui/Card'
 import { Input } from '../../components/ui/Input'
 import { Pagination } from '../../components/ui/Pagination'
 import { Select } from '../../components/ui/Select'
-import { Table } from '../../components/ui/Table'
+import { Table, type SortState } from '../../components/ui/Table'
 import { TabPanel, Tabs, type TabItem } from '../../components/ui/Tabs'
 import { formatNumber } from '../../lib/format'
 import { ACTIVITY_TABS, activityColumns, activityTabLabel, type ActivityTab } from './activityColumns'
 import { TransactionDetailModal } from './TransactionDetailModal'
+import { useDebouncedValue } from './useDebouncedValue'
 
 export interface ActivityPanelProps {
   customerId: string
@@ -45,15 +46,34 @@ export function ActivityPanel({ customerId, summary }: ActivityPanelProps) {
   const [status, setStatus] = useState('')
   const [fromDate, setFromDate] = useState('')
   const [toDate, setToDate] = useState('')
+  /* Amounts are debounced so a bound being typed out does not fire a request
+     per keystroke; the dates above are discrete picker values, so they are not. */
+  const [minAmountInput, setMinAmountInput] = useState('')
+  const [maxAmountInput, setMaxAmountInput] = useState('')
+  const minAmountText = useDebouncedValue(minAmountInput.trim(), 300)
+  const maxAmountText = useDebouncedValue(maxAmountInput.trim(), 300)
   const [size, setSize] = useState(DEFAULT_PAGE_SIZE)
   const [selected, setSelected] = useState<Transaction | null>(null)
+  /** Null keeps the endpoint default (createdAt,desc). */
+  const [sort, setSort] = useState<SortState | null>(null)
 
   const rangeInvalid = Boolean(fromDate && toDate && fromDate > toDate)
-  const filtersActive = Boolean(status || fromDate || toDate)
+  /* An unparseable draft is not a filter yet: it is ignored until it reads as
+     a number, while a parsed range with min above max blocks both bounds. */
+  const minAmount = minAmountText === '' ? null : Number(minAmountText)
+  const maxAmount = maxAmountText === '' ? null : Number(maxAmountText)
+  const amountInvalid =
+    minAmount !== null &&
+    maxAmount !== null &&
+    Number.isFinite(minAmount) &&
+    Number.isFinite(maxAmount) &&
+    minAmount > maxAmount
+  const filtersActive = Boolean(status || fromDate || toDate || minAmountText || maxAmountText)
 
-  /* Changing the tab, a filter or the page size returns to the first page in
-     the same render pass, so no request is issued for a stale page index. */
-  const pageKey = `${tab}|${status}|${fromDate}|${toDate}|${size}`
+  /* Changing the tab, a filter, the sort or the page size returns to the first
+     page in the same render pass, so no request is issued for a stale page index. */
+  const sortParam = sort ? `${sort.key},${sort.direction}` : null
+  const pageKey = `${tab}|${status}|${fromDate}|${toDate}|${minAmountText}|${maxAmountText}|${size}|${sortParam ?? ''}`
   const [pageState, setPageState] = useState(() => ({ key: pageKey, page: 0 }))
   const page = pageState.key === pageKey ? pageState.page : 0
   if (pageState.key !== pageKey) setPageState({ key: pageKey, page: 0 })
@@ -64,6 +84,11 @@ export function ActivityPanel({ customerId, summary }: ActivityPanelProps) {
     status: status || undefined,
     from: !rangeInvalid && fromDate ? startOfDay(parseISO(fromDate)).toISOString() : undefined,
     to: !rangeInvalid && toDate ? endOfDay(parseISO(toDate)).toISOString() : undefined,
+    minAmount:
+      !amountInvalid && minAmount !== null && Number.isFinite(minAmount) ? minAmount : undefined,
+    maxAmount:
+      !amountInvalid && maxAmount !== null && Number.isFinite(maxAmount) ? maxAmount : undefined,
+    sort: sortParam,
     page,
     size,
   }
@@ -80,6 +105,8 @@ export function ActivityPanel({ customerId, summary }: ActivityPanelProps) {
     setStatus('')
     setFromDate('')
     setToDate('')
+    setMinAmountInput('')
+    setMaxAmountInput('')
   }
 
   return (
@@ -135,6 +162,27 @@ export function ActivityPanel({ customerId, summary }: ActivityPanelProps) {
             containerClassName="w-44"
             error={rangeInvalid ? 'End date must be on or after the start date.' : null}
           />
+          <Input
+            label="Min amount"
+            type="number"
+            inputMode="decimal"
+            min={0}
+            step="any"
+            value={minAmountInput}
+            onChange={(event) => setMinAmountInput(event.target.value)}
+            containerClassName="w-32"
+          />
+          <Input
+            label="Max amount"
+            type="number"
+            inputMode="decimal"
+            min={minAmount ?? 0}
+            step="any"
+            value={maxAmountInput}
+            onChange={(event) => setMaxAmountInput(event.target.value)}
+            containerClassName="w-32"
+            error={amountInvalid ? 'Max amount must be at least the min amount.' : null}
+          />
           {filtersActive ? (
             <Button
               variant="ghost"
@@ -165,6 +213,8 @@ export function ActivityPanel({ customerId, summary }: ActivityPanelProps) {
               error={activityQuery.error}
               onRetry={() => void activityQuery.refetch()}
               onRowClick={(transaction) => setSelected(transaction)}
+              sort={sort}
+              onSortChange={setSort}
               caption={`${activityTabLabel(item)} for this customer`}
               dense
               stickyHeader
@@ -173,7 +223,7 @@ export function ActivityPanel({ customerId, summary }: ActivityPanelProps) {
               }
               emptyDescription={
                 filtersActive
-                  ? 'No records match the current status or date filters.'
+                  ? 'No records match the current status, date or amount filters.'
                   : 'This customer has no activity of this type on file.'
               }
             />

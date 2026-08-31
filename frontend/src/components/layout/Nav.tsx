@@ -1,5 +1,6 @@
 import {
   BookOpen,
+  Cpu,
   LayoutDashboard,
   Search,
   SlidersHorizontal,
@@ -48,6 +49,7 @@ export const NAV_SECTIONS: NavSection[] = [
       { to: '/admin/rules', label: 'Risk Rules', icon: SlidersHorizontal },
       { to: '/admin/knowledge', label: 'Knowledge Base', icon: BookOpen },
       { to: '/admin/users', label: 'Users', icon: Users },
+      { to: '/admin/llm-settings', label: 'LLM Settings', icon: Cpu },
     ],
   },
 ]

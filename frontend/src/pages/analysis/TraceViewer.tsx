@@ -22,7 +22,7 @@
  * of the row — since a retry that looked like a success would tell a reviewer
  * that a rule was measured when it never was.
  */
-import { ChevronRight, ClipboardCheck, Radio, TriangleAlert, WifiOff } from 'lucide-react'
+import { ArrowDown, ChevronRight, ClipboardCheck, Radio, TriangleAlert, WifiOff } from 'lucide-react'
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { TraceStep, UUID } from '../../api/types'
 import { Badge, type BadgeTone } from '../../components/ui/Badge'
@@ -74,6 +74,21 @@ const TONE_BADGE: Record<TraceStepTone, BadgeTone> = {
 
 /** Uppercase micro-label shared by every sub-section of a step. */
 const CAPTION = 'text-2xs font-semibold tracking-caption text-muted uppercase'
+
+/**
+ * One filter chip per step type in the `TraceStep` union. The labels pluralise
+ * the per-step names from `traceStepMeta`; chips are only rendered for types
+ * that actually occur in the trace being viewed.
+ */
+const STEP_TYPE_FILTER_LABELS: Record<TraceStep['type'], string> = {
+  tool_call: 'Tool calls',
+  assistant: 'Reasoning',
+  coverage_reprompt: 'Coverage reprompts',
+  coverage_failed: 'Coverage failures',
+  final: 'Final verdicts',
+  error: 'Errors',
+  unknown: 'Unknown steps',
+}
 
 /** Longer reasoning is clamped so the timeline stays scannable. */
 const LONG_TEXT = 360
@@ -492,6 +507,8 @@ export function TraceViewer({
 }: TraceViewerProps) {
   const [expandAll, setExpandAll] = useState(false)
   const [overrides, setOverrides] = useState<Record<string, boolean>>({})
+  /* Step types the reviewer has switched off; everything renders until then. */
+  const [hiddenTypes, setHiddenTypes] = useState<ReadonlySet<TraceStep['type']>>(new Set())
   const bottomRef = useRef<HTMLDivElement | null>(null)
 
   const stepCount = steps.length
@@ -518,7 +535,36 @@ export function TraceViewer({
     [steps],
   )
 
-  const blocks = useMemo(() => groupTraceSteps(steps), [steps])
+  /* The chips are derived from the trace itself: one per step type present,
+     with its count, in the union's declaration order. */
+  const typeCounts = useMemo(() => {
+    const counts = new Map<TraceStep['type'], number>()
+    for (const step of steps) counts.set(step.type, (counts.get(step.type) ?? 0) + 1)
+    return counts
+  }, [steps])
+  const visibleSteps = useMemo(
+    () => (hiddenTypes.size === 0 ? steps : steps.filter((step) => !hiddenTypes.has(step.type))),
+    [steps, hiddenTypes],
+  )
+  const visibleBlocks = useMemo(() => groupTraceSteps(visibleSteps), [visibleSteps])
+  const hiddenCount = stepCount - visibleSteps.length
+  const showFilters = typeCounts.size > 1
+
+  const toggleType = (type: TraceStep['type']): void => {
+    setHiddenTypes((current) => {
+      const next = new Set(current)
+      if (next.has(type)) next.delete(type)
+      else next.add(type)
+      return next
+    })
+  }
+
+  const jumpToLatest = (): void => {
+    const node = bottomRef.current
+    if (node && typeof node.scrollIntoView === 'function') {
+      node.scrollIntoView({ block: 'end' })
+    }
+  }
 
   /* Where a verdict is in the checklist, counted off the trace itself, so a
      step whose result preview was not persisted still reads "rule 3/12". */
@@ -573,6 +619,15 @@ export function TraceViewer({
             >
               {expandAll ? 'Collapse all' : 'Expand all'}
             </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={jumpToLatest}
+              disabled={steps.length === 0}
+              iconLeft={<ArrowDown aria-hidden="true" className="size-3.5" />}
+            >
+              Jump to latest
+            </Button>
           </div>
         }
       >
@@ -591,6 +646,48 @@ export function TraceViewer({
             : 'Every step of the ReAct loop, in the order the agent took it.'}
         </CardDescription>
       </CardHeader>
+
+      {showFilters ? (
+        <div
+          role="group"
+          aria-label="Filter steps by type"
+          className="flex flex-wrap items-center gap-1.5 border-b border-border bg-surface-2/40 px-4 py-2"
+        >
+          <span className="text-2xs font-semibold tracking-caption text-muted uppercase">
+            Show
+          </span>
+          {(
+            Object.keys(STEP_TYPE_FILTER_LABELS) as TraceStep['type'][]
+          ).map((type) => {
+            const count = typeCounts.get(type)
+            if (!count) return null
+            const active = !hiddenTypes.has(type)
+            return (
+              <button
+                key={type}
+                type="button"
+                aria-pressed={active}
+                onClick={() => toggleType(type)}
+                className={cn(
+                  'rounded-full border px-2 py-0.5 text-2xs font-medium transition-colors',
+                  'focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none',
+                  active
+                    ? 'border-border-strong bg-surface text-fg'
+                    : 'border-border bg-transparent text-subtle line-through decoration-border-strong/60 hover:text-muted',
+                )}
+              >
+                {STEP_TYPE_FILTER_LABELS[type]}
+                <span className="numeric ml-1 text-subtle no-underline">{count}</span>
+              </button>
+            )
+          })}
+          {hiddenCount > 0 ? (
+            <span aria-live="polite" className="numeric ml-auto text-2xs text-subtle">
+              {hiddenCount} hidden
+            </span>
+          ) : null}
+        </div>
+      ) : null}
 
       <CardContent
         className={cn('py-4', running && 'max-h-[34rem] overflow-y-auto')}
@@ -621,10 +718,14 @@ export function TraceViewer({
               description="This run did not persist a trace. Nothing was hidden — the transcript simply was not stored."
             />
           )
+        ) : visibleBlocks.length === 0 ? (
+          <p className="px-1 py-4 text-sm text-muted">
+            Every step is hidden by the type filters above — switch one back on to see it.
+          </p>
         ) : (
           <ol className="space-y-0">
-            {blocks.map((block, index) => {
-              const last = index === blocks.length - 1
+            {visibleBlocks.map((block, index) => {
+              const last = index === visibleBlocks.length - 1
               if (block.kind === 'verdicts') {
                 const first = block.steps[0]
                 return (

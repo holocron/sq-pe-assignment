@@ -45,4 +45,9 @@ export const queryKeys = {
     root: ['users'] as const,
     list: () => ['users', 'list'] as const,
   },
+  llmSettings: {
+    root: ['llm-settings'] as const,
+    settings: () => ['llm-settings', 'settings'] as const,
+    reembedStatus: () => ['llm-settings', 'reembed-status'] as const,
+  },
 } as const

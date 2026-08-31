@@ -29,10 +29,18 @@ const STATUS_LABEL: Record<AnalysisStatus, string> = {
   RUNNING: 'Running',
   COMPLETED: 'Completed',
   FAILED: 'Failed',
+  CANCELLED: 'Cancelled',
 }
 
 /** Uppercase micro-label used for every field caption in the header. */
 const CAPTION = 'text-2xs font-semibold tracking-caption text-muted uppercase'
+
+/* Cancelled is an operator decision, not a failure: warning, never danger. */
+const STATUS_TONE: Record<Exclude<AnalysisStatus, 'RUNNING'>, 'neutral' | 'danger' | 'warning'> = {
+  COMPLETED: 'neutral',
+  FAILED: 'danger',
+  CANCELLED: 'warning',
+}
 
 function StatusChip({ status }: { status: AnalysisStatus }) {
   if (status === 'RUNNING') {
@@ -44,7 +52,7 @@ function StatusChip({ status }: { status: AnalysisStatus }) {
     )
   }
   return (
-    <Badge tone={status === 'FAILED' ? 'danger' : 'neutral'} size="md" dot>
+    <Badge tone={STATUS_TONE[status]} size="md" dot>
       {STATUS_LABEL[status]}
     </Badge>
   )

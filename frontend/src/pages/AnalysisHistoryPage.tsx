@@ -7,9 +7,11 @@
  * customers returned by `GET /api/customers`.
  */
 import { ChevronRight, Clock, Play, ScrollText, ShieldCheck, TriangleAlert } from 'lucide-react'
+import { useMemo, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   ANALYSES_FANOUT_CUSTOMER_LIMIT,
+  compareAnalysesNewestFirst,
   sortAnalysesNewestFirst,
   useAnalysesAcrossCustomers,
   useCustomerAnalyses,
@@ -21,13 +23,13 @@ import type { AnalysisSummary } from '../api/types'
 import { Badge } from '../components/ui/Badge'
 import { Button } from '../components/ui/Button'
 import { Card } from '../components/ui/Card'
+import { Checkbox } from '../components/ui/Checkbox'
 import { EmptyState } from '../components/ui/EmptyState'
-import { LinkButton } from '../components/ui/LinkButton'
 import { PageHeader } from '../components/ui/PageHeader'
 import { RiskBadge } from '../components/ui/RiskBadge'
 import { Spinner } from '../components/ui/Spinner'
 import { StatCard } from '../components/ui/StatCard'
-import { Table, type Column } from '../components/ui/Table'
+import { Table, type Column, type SortState } from '../components/ui/Table'
 import { useToast } from '../components/ui/Toast'
 import { cn } from '../lib/cn'
 import {
@@ -51,9 +53,13 @@ function StatusCell({ status }: { status: AnalysisSummary['status'] }) {
       </Badge>
     )
   }
+  /* Cancelled is an operator decision, not a failure — warning, not danger. */
+  const tone = status === 'FAILED' ? 'danger' : status === 'CANCELLED' ? 'warning' : 'neutral'
+  const label =
+    status === 'FAILED' ? 'Failed' : status === 'CANCELLED' ? 'Cancelled' : 'Completed'
   return (
-    <Badge tone={status === 'FAILED' ? 'danger' : 'neutral'} dot>
-      {status === 'FAILED' ? 'Failed' : 'Completed'}
+    <Badge tone={tone} dot>
+      {label}
     </Badge>
   )
 }
@@ -75,8 +81,33 @@ export function AnalysisHistoryPage() {
 
   const across = useAnalysesAcrossCustomers({ enabled: scope === 'all' })
 
-  const rows =
+  /**
+   * Client-side table state. The all-customers view is assembled by fan-out,
+   * so sorting happens here for both scopes; the per-customer endpoint's own
+   * `sort` param would only cover one of the two.
+   */
+  const [sort, setSort] = useState<SortState>({ key: 'started', direction: 'desc' })
+  const [elevatedOnly, setElevatedOnly] = useState(false)
+
+  const allRows =
     scope === 'all' ? across.rows : sortAnalysesNewestFirst(historyQuery.data ?? [])
+
+  const rows = useMemo(() => {
+    const filtered = elevatedOnly
+      ? allRows.filter((row) => row.riskLevel === 'HIGH' || row.riskLevel === 'CRITICAL')
+      : allRows
+    const sign = sort.direction === 'asc' ? 1 : -1
+    return [...filtered].sort((a, b) => {
+      if (sort.key === 'score') {
+        /* Null scores (unfinished runs) always sink to the bottom. */
+        if (a.totalScore === null || a.totalScore === undefined) return 1
+        if (b.totalScore === null || b.totalScore === undefined) return -1
+        return sign * (a.totalScore - b.totalScore)
+      }
+      return sign * -compareAnalysesNewestFirst(a, b)
+    })
+  }, [allRows, sort, elevatedOnly])
+
   const loading = scope === 'all' ? across.isPending : historyQuery.isPending
   const error = scope === 'all' ? across.error : historyQuery.error
   const retry = () => {
@@ -97,11 +128,13 @@ export function AnalysisHistoryPage() {
     },
   })
 
-  const completedRows = rows.filter((row) => row.status === 'COMPLETED')
-  const elevated = rows.filter(
+  /* Stats describe the whole history, not the sorted/filtered table window. */
+  const completedRows = allRows.filter((row) => row.status === 'COMPLETED')
+  const elevated = allRows.filter(
     (row) => row.riskLevel === 'HIGH' || row.riskLevel === 'CRITICAL',
   ).length
   const fullyJudged = completedRows.filter((row) => row.coverageComplete === true).length
+  const mostRecent = allRows.length > 0 ? sortAnalysesNewestFirst(allRows)[0] : undefined
   const customerName = customerQuery.data
     ? fullName(customerQuery.data.firstName, customerQuery.data.lastName)
     : null
@@ -117,6 +150,7 @@ export function AnalysisHistoryPage() {
     {
       key: 'started',
       header: 'Started',
+      sortKey: 'started',
       className: 'w-48',
       cell: (row) => (
         <div className="min-w-0">
@@ -156,6 +190,7 @@ export function AnalysisHistoryPage() {
     {
       key: 'score',
       header: 'Score',
+      sortKey: 'score',
       align: 'right',
       cell: (row) => (
         <span className="numeric text-fg">
@@ -231,26 +266,16 @@ export function AnalysisHistoryPage() {
             : 'Every AI risk analysis recorded for this customer, newest first.'
         }
         actions={
-          <>
-            {customerId ? (
-              <LinkButton
-                to={`/customers/${customerId}`}
-                iconLeft={<ScrollText aria-hidden="true" className="size-4" />}
-              >
-                Customer activity
-              </LinkButton>
-            ) : null}
-            {customerId ? (
-              <Button
-                variant="primary"
-                loading={startAnalysis.isPending}
-                onClick={() => startAnalysis.mutate(customerId)}
-                iconLeft={<Play aria-hidden="true" className="size-4" />}
-              >
-                Run new analysis
-              </Button>
-            ) : null}
-          </>
+          customerId ? (
+            <Button
+              variant="primary"
+              loading={startAnalysis.isPending}
+              onClick={() => startAnalysis.mutate(customerId)}
+              iconLeft={<Play aria-hidden="true" className="size-4" />}
+            >
+              Run new analysis
+            </Button>
+          ) : undefined
         }
       />
 
@@ -292,7 +317,7 @@ export function AnalysisHistoryPage() {
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
           label="Analyses"
-          value={formatNumber(rows.length)}
+          value={formatNumber(allRows.length)}
           icon={<ScrollText className="size-3.5" />}
           numeric
           loading={loading}
@@ -315,14 +340,22 @@ export function AnalysisHistoryPage() {
         />
         <StatCard
           label="Most recent run"
-          value={rows[0] ? formatRelativeTime(rows[0].createdAt) : EM_DASH}
-          hint={rows[0] ? formatDateTime(rows[0].createdAt) : undefined}
+          value={mostRecent ? formatRelativeTime(mostRecent.createdAt) : EM_DASH}
+          hint={mostRecent ? formatDateTime(mostRecent.createdAt) : undefined}
           icon={<Clock className="size-3.5" />}
           loading={loading}
         />
       </div>
 
       <Card>
+        <div className="flex flex-wrap items-center justify-end gap-3 border-b border-border px-4 py-2.5">
+          <Checkbox
+            label="HIGH / CRITICAL only"
+            checked={elevatedOnly}
+            onChange={(event) => setElevatedOnly(event.target.checked)}
+            containerClassName="items-center"
+          />
+        </div>
         <Table
           columns={columns}
           rows={rows}
@@ -330,33 +363,42 @@ export function AnalysisHistoryPage() {
           loading={loading}
           error={error}
           onRetry={retry}
-          caption="Analysis history, newest first"
+          caption="Analysis history"
+          sort={sort}
+          onSortChange={setSort}
           onRowClick={(row) => navigate(`/analyses/${row.assessmentId}`)}
           rowClassName={(row) =>
             row.status === 'RUNNING' ? 'border-l-2 border-l-accent bg-surface-2/60' : undefined
           }
           stickyHeader
           empty={
-            <EmptyState
-              title="No analyses yet"
-              description={
-                scope === 'all'
-                  ? 'No customer has been analysed yet. Open a customer and run the AI analysis to create one.'
-                  : 'This customer has never been analysed. Run the AI analysis to produce a risk verdict and a full rule-coverage record.'
-              }
-              action={
-                customerId ? (
-                  <Button
-                    variant="primary"
-                    loading={startAnalysis.isPending}
-                    onClick={() => startAnalysis.mutate(customerId)}
-                    iconLeft={<Play aria-hidden="true" className="size-4" />}
-                  >
-                    Run AI analysis
-                  </Button>
-                ) : undefined
-              }
-            />
+            elevatedOnly && allRows.length > 0 ? (
+              <EmptyState
+                title="No elevated verdicts"
+                description="No analysis in this view ended HIGH or CRITICAL. Clear the filter to see every run."
+              />
+            ) : (
+              <EmptyState
+                title="No analyses yet"
+                description={
+                  scope === 'all'
+                    ? 'No customer has been analysed yet. Open a customer and run the AI analysis to create one.'
+                    : 'This customer has never been analysed. Run the AI analysis to produce a risk verdict and a full rule-coverage record.'
+                }
+                action={
+                  customerId ? (
+                    <Button
+                      variant="primary"
+                      loading={startAnalysis.isPending}
+                      onClick={() => startAnalysis.mutate(customerId)}
+                      iconLeft={<Play aria-hidden="true" className="size-4" />}
+                    >
+                      Run AI analysis
+                    </Button>
+                  ) : undefined
+                }
+              />
+            )
           }
         />
       </Card>

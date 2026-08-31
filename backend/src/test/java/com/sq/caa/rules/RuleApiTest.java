@@ -59,6 +59,7 @@ class RuleApiTest {
     @BeforeEach
     void setUp() {
         service = mock(RiskRuleService.class);
+        when(service.activityStatsByRule()).thenReturn(java.util.Map.of());
         mockMvc = MockMvcBuilders.standaloneSetup(new RuleController(service)).build();
     }
 
@@ -78,6 +79,32 @@ class RuleApiTest {
                 .andExpect(jsonPath("$[0].weight").value(30.00))
                 .andExpect(jsonPath("$[0].thresholdLogic").value(CONDITION))
                 .andExpect(jsonPath("$[0].thresholdLogicText").doesNotExist());
+    }
+
+    @Test
+    @DisplayName("the list carries lastFiredAt/lastJudgedAt, null when the rule was never judged")
+    void listServesTheActivityStats() throws Exception {
+        Instant fired = Instant.parse("2026-08-29T10:15:30Z");
+        Instant judged = Instant.parse("2026-08-30T08:00:00Z");
+        when(service.findAll()).thenReturn(List.of(rule()));
+        when(service.activityStatsByRule()).thenReturn(java.util.Map.of(RULE_ID,
+                new com.sq.caa.repository.projection.RuleActivityStats(RULE_ID, judged, fired)));
+
+        mockMvc.perform(get("/api/rules"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].lastFiredAt").value("2026-08-29T10:15:30Z"))
+                .andExpect(jsonPath("$[0].lastJudgedAt").value("2026-08-30T08:00:00Z"));
+    }
+
+    @Test
+    @DisplayName("a rule without assessment rows has null stats")
+    void listServesNullStatsForAnUntouchedRule() throws Exception {
+        when(service.findAll()).thenReturn(List.of(rule()));
+
+        mockMvc.perform(get("/api/rules"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].lastFiredAt").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$[0].lastJudgedAt").value(org.hamcrest.Matchers.nullValue()));
     }
 
     @Test
@@ -114,6 +141,18 @@ class RuleApiTest {
         mockMvc.perform(delete("/api/rules/" + RULE_ID)).andExpect(status().isNoContent());
 
         verify(service).delete(RULE_ID);
+    }
+
+    @Test
+    @DisplayName("deleting a rule that past analyses reference is refused as 409 problem+json")
+    void deleteOfAReferencedRuleConflicts() throws Exception {
+        org.mockito.Mockito.doThrow(new RuleInUseException(RULE_ID)).when(service).delete(RULE_ID);
+
+        mockMvc.perform(delete("/api/rules/" + RULE_ID))
+                .andExpect(status().isConflict())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.title").value("Rule is referenced by past analyses"))
+                .andExpect(jsonPath("$.ruleId").value(RULE_ID.toString()));
     }
 
     @Test

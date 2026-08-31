@@ -204,7 +204,7 @@ class PersistenceVerificationTest {
                 NOW.minus(1, ChronoUnit.DAYS), NOW, page).getTotalElements());
 
         Page<Transaction> withDetails =
-                transactions.findForCustomerWithDetails(id, null, null, null, null, page);
+                transactions.findForCustomerWithDetails(id, null, null, null, null, null, null, page);
         assertEquals(3, withDetails.getTotalElements());
         assertEquals(3, withDetails.getContent().size());
         assertTrue(withDetails.getContent().stream()
@@ -583,7 +583,7 @@ class PersistenceVerificationTest {
         PageRequest one = PageRequest.of(0, 1, Sort.by(Sort.Direction.DESC, "createdAt"));
 
         assertEquals(3, transactions.findForCustomer(id, null, null, null, null, one).getTotalElements());
-        assertEquals(3, transactions.findForCustomerWithDetails(id, null, null, null, null, one)
+        assertEquals(3, transactions.findForCustomerWithDetails(id, null, null, null, null, null, null, one)
                 .getTotalElements());
         assertEquals(1, transactions.findForCustomer(id, ActivityType.CRYPTO, null, null, null, one)
                 .getTotalElements());

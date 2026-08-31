@@ -6,18 +6,20 @@
  * it arrives, with polling of `GET /api/analyses/{id}` as the fallback if the
  * stream drops. Once the run finishes the persisted result takes over.
  */
-import { ArrowLeft, ChevronRight, RotateCw, ScrollText } from 'lucide-react'
-import { useMemo } from 'react'
+import { Ban, ChevronRight, RotateCw } from 'lucide-react'
+import { useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { useAnalysis, useAnalysisStream, useStartAnalysis } from '../api/analyses'
+import { useAnalysis, useAnalysisStream, useCancelAnalysis, useStartAnalysis } from '../api/analyses'
 import { useCustomer } from '../api/customers'
 import { errorMessage } from '../api/errors'
 import { useRules } from '../api/rules'
+import { BackLink } from '../components/ui/BackLink'
 import { Button } from '../components/ui/Button'
 import { Card, CardContent } from '../components/ui/Card'
 import { EmptyState } from '../components/ui/EmptyState'
 import { ErrorState } from '../components/ui/ErrorState'
 import { LinkButton } from '../components/ui/LinkButton'
+import { Modal } from '../components/ui/Modal'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Skeleton } from '../components/ui/Skeleton'
 import { useToast } from '../components/ui/Toast'
@@ -108,6 +110,25 @@ export function AnalysisPage() {
     },
   })
 
+  const [cancelOpen, setCancelOpen] = useState(false)
+  const cancelAnalysis = useCancelAnalysis({
+    onSuccess: () => {
+      setCancelOpen(false)
+      toast.success('Analysis cancelled', 'The run was stopped and recorded as cancelled.')
+    },
+    onError: (error) => {
+      setCancelOpen(false)
+      /* 409 means the run reached a terminal state before the cancel landed —
+         not a failure; the polling refetch shows how it actually ended. */
+      if (error.status === 409) {
+        toast.info('Run already finished', 'The analysis ended before it could be cancelled.')
+        void analysisQuery.refetch()
+        return
+      }
+      toast.error('Could not cancel the analysis', errorMessage(error))
+    },
+  })
+
   const rerun = () => {
     if (!analysis?.customerId) return
     startAnalysis.mutate(analysis.customerId)
@@ -152,13 +173,7 @@ export function AnalysisPage() {
               <span className="font-mono text-fg">{shortId(assessmentId)}</span>
             </span>
           ) : (
-            <Link
-              to="/dashboard"
-              className="inline-flex items-center gap-1.5 rounded-xs underline-offset-4 hover:text-fg hover:underline focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-            >
-              <ArrowLeft aria-hidden="true" className="size-3.5" />
-              Dashboard
-            </Link>
+            <BackLink to="/dashboard">Dashboard</BackLink>
           )
         }
         title="AI risk analysis"
@@ -174,13 +189,14 @@ export function AnalysisPage() {
         }
         actions={
           <>
-            {analysis ? (
-              <LinkButton
-                to={`/customers/${analysis.customerId}/analyses`}
-                iconLeft={<ScrollText aria-hidden="true" className="size-4" />}
+            {running ? (
+              <Button
+                variant="danger"
+                onClick={() => setCancelOpen(true)}
+                iconLeft={<Ban aria-hidden="true" className="size-4" />}
               >
-                Analysis history
-              </LinkButton>
+                Cancel run
+              </Button>
             ) : null}
             <Button
               variant="primary"
@@ -231,6 +247,30 @@ export function AnalysisPage() {
           rerunPending={startAnalysis.isPending}
         />
       ) : null}
+
+      <Modal
+        open={cancelOpen}
+        onClose={() => setCancelOpen(false)}
+        title="Cancel this analysis?"
+        description="The agent stops where it is and the run is recorded as cancelled. Anything it already judged stays on file, but the review will not be complete."
+        closeOnOverlayClick={false}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setCancelOpen(false)}>
+              Keep it running
+            </Button>
+            <Button
+              variant="danger"
+              loading={cancelAnalysis.isPending}
+              onClick={() => {
+                if (assessmentId) cancelAnalysis.mutate(assessmentId)
+              }}
+            >
+              Cancel the run
+            </Button>
+          </>
+        }
+      />
     </div>
   )
 }

@@ -9,6 +9,7 @@ import com.sq.caa.web.dto.CustomerDtos.CustomerDetail;
 import com.sq.caa.web.dto.CustomerDtos.CustomerSummary;
 import com.sq.caa.web.dto.PageResponse;
 import com.sq.caa.web.dto.TransactionDtos.TransactionView;
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -17,7 +18,9 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeParseException;
 import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
+import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
@@ -89,6 +92,10 @@ public class CustomerController {
      * @param status optional status, matched case-insensitively
      * @param from   optional inclusive lower bound, an ISO date or timestamp
      * @param to     optional inclusive upper bound; a bare date covers the whole day
+     * @param minAmount optional inclusive lower bound on {@code amount}, a non-negative decimal
+     * @param maxAmount optional inclusive upper bound on {@code amount}, a non-negative decimal
+     * @param sort   optional {@code <field>,<asc|desc>} - one of {@code amount}, {@code createdAt},
+     *               {@code status}, {@code activityType}. Default is {@code createdAt,desc}.
      */
     @GetMapping("/{customerId}/activity")
     @PreAuthorize("isAuthenticated()")
@@ -97,13 +104,22 @@ public class CustomerController {
             @RequestParam(required = false) String status,
             @RequestParam(required = false) String from,
             @RequestParam(required = false) String to,
+            @RequestParam(required = false) String minAmount,
+            @RequestParam(required = false) String maxAmount,
+            @RequestParam(required = false) String sort,
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "20") int size) {
         ActivityType activityType = parseActivityType(type);
         Instant fromInstant = parseInstant(from, "from", false);
         Instant toInstant = parseInstant(to, "to", true);
+        BigDecimal min = parseAmount(minAmount, "minAmount");
+        BigDecimal max = parseAmount(maxAmount, "maxAmount");
+        if (min != null && max != null && min.compareTo(max) > 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "'minAmount' must not be greater than 'maxAmount'.");
+        }
         return transactionService.findCustomerActivity(customerId, activityType, status, fromInstant,
-                toInstant, page, size);
+                toInstant, min, max, parseActivitySort(sort), page, size);
     }
 
     // ------------------------------------------------------------------
@@ -158,6 +174,63 @@ public class CustomerController {
                     + value + "'.");
         }
     }
+
+    /**
+     * Parses an amount-range bound: a plain non-negative decimal, or {@code null} when absent. A
+     * negative or non-numeric value is refused as 400, same as the other parameter errors.
+     */
+    static BigDecimal parseAmount(String raw, String parameterName) {
+        String value = trimToNull(raw);
+        if (value == null) {
+            return null;
+        }
+        final BigDecimal amount;
+        try {
+            amount = new BigDecimal(value);
+        } catch (NumberFormatException ex) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Parameter '" + parameterName
+                    + "' must be a decimal number, was '" + value + "'.");
+        }
+        if (amount.signum() < 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Parameter '" + parameterName
+                    + "' must not be negative, was '" + value + "'.");
+        }
+        return amount;
+    }
+
+    /**
+     * Parses the activity sort, whitelisting the fields a client may order by so a {@code sort}
+     * value can never become anything but one of those column names. Returns {@code null} when no
+     * sort was given, leaving the service's default (newest first) in place.
+     */
+    static Sort parseActivitySort(String raw) {
+        String value = trimToNull(raw);
+        if (value == null) {
+            return null;
+        }
+        String[] parts = value.split(",");
+        String field = parts[0].trim();
+        String mapped = ACTIVITY_SORT_FIELDS.get(field);
+        if (mapped == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Unknown sort field '" + field
+                    + "'. Expected one of " + String.join(", ", ACTIVITY_SORT_FIELDS.keySet()) + ".");
+        }
+        boolean descending = parts.length > 1 && "desc".equalsIgnoreCase(parts[1].trim());
+        if (parts.length > 1 && !descending && !"asc".equalsIgnoreCase(parts[1].trim())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Parameter 'sort' direction "
+                    + "must be 'asc' or 'desc', was '" + parts[1].trim() + "'.");
+        }
+        Sort.Order order = descending ? Sort.Order.desc(mapped) : Sort.Order.asc(mapped);
+        // The id tie-breaker keeps paging stable for rows that compare equal on the sort field.
+        return Sort.by(order, Sort.Order.asc("transactionId"));
+    }
+
+    /** Sortable activity fields, API name to entity attribute. Whitelist - nothing else may sort. */
+    private static final Map<String, String> ACTIVITY_SORT_FIELDS = Map.of(
+            "amount", "amount",
+            "createdAt", "createdAt",
+            "status", "status",
+            "activityType", "activityType");
 
     private static String trimToNull(String value) {
         if (value == null) {

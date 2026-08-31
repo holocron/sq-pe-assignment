@@ -8,6 +8,7 @@ import com.sq.caa.domain.RuleScope;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -92,6 +93,46 @@ class RiskAssessmentRowsTest {
 
         assertEquals(4 + 4 + 3, rows.size());
         assertEquals(0, new BigDecimal("50.00").compareTo(sum(rows)));
+    }
+
+    @Test
+    @DisplayName("more matches than the weight has cents: every matched row still carries 0.01")
+    void matchedRowsNeverDegradeToZero() {
+        List<UUID> inScope = ids(3);
+        // 0.02 over 3 matched transactions cannot be split exactly into non-zero cents.
+        RuleOutcome outcome = outcome("Micro weight", "0.02", true, "0.02", inScope, inScope);
+
+        List<RiskAssessment> rows = RiskAssessmentRows.build(UUID.randomUUID(), List.of(outcome), AT);
+
+        assertEquals(3, rows.size());
+        assertTrue(rows.stream().allMatch(RiskAssessment::isTriggered),
+                "a matched row at 0.00 would be indistinguishable from a not-matched one");
+        assertTrue(rows.stream().allMatch(row ->
+                new BigDecimal("0.01").compareTo(row.getScoreContribution()) == 0));
+        assertEquals(0, new BigDecimal("0.03").compareTo(sum(rows)),
+                "the evidence floor wins over the exact total in this degenerate case");
+    }
+
+    @Test
+    @DisplayName("an exactly-divisible tiny weight still lands exactly on the score")
+    void exactTinySplitIsNotFloored() {
+        List<UUID> inScope = ids(2);
+        RuleOutcome outcome = outcome("Tiny weight", "0.02", true, "0.02", inScope, inScope);
+
+        List<RiskAssessment> rows = RiskAssessmentRows.build(UUID.randomUUID(), List.of(outcome), AT);
+
+        assertEquals(0, new BigDecimal("0.02").compareTo(sum(rows)));
+        assertTrue(rows.stream().allMatch(RiskAssessment::isTriggered));
+    }
+
+    @Test
+    @DisplayName("distribute floors at one cent per match when the cents run out")
+    void distributeFloorsAtOneCent() {
+        Map<UUID, BigDecimal> shares = RiskAssessmentRows.distribute(new BigDecimal("0.01"), ids(5));
+
+        assertEquals(5, shares.size());
+        assertTrue(shares.values().stream()
+                .allMatch(share -> new BigDecimal("0.01").compareTo(share) == 0));
     }
 
     // ------------------------------------------------------------------

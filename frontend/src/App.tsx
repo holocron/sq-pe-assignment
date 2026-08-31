@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import type { ReactNode } from 'react'
+import { lazy, Suspense, type ReactNode } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { isApiError } from './api/errors'
 import { AuthProvider } from './auth/AuthContext'
@@ -8,18 +8,41 @@ import { RoleGate } from './auth/RoleGate'
 import { AccessDenied } from './components/AccessDenied'
 import { ErrorBoundary, RouteErrorBoundary } from './components/ErrorBoundary'
 import { AppShell } from './components/layout/AppShell'
+import { Spinner } from './components/ui/Spinner'
 import { ToastProvider } from './components/ui/Toast'
 import { ThemeProvider } from './lib/theme'
-import { AnalysisHistoryPage } from './pages/AnalysisHistoryPage'
-import { AnalysisPage } from './pages/AnalysisPage'
-import { CustomerPage } from './pages/CustomerPage'
-import { DashboardPage } from './pages/DashboardPage'
-import { KnowledgeSearchPage } from './pages/KnowledgeSearchPage'
 import { LoginPage } from './pages/LoginPage'
-import { NotFoundPage } from './pages/NotFoundPage'
-import { KnowledgePage } from './pages/admin/KnowledgePage'
-import { RulesPage } from './pages/admin/RulesPage'
-import { UsersPage } from './pages/admin/UsersPage'
+
+/* Every page behind the login is code-split, so the sign-in route ships neither
+   the dashboard nor the chart library (recharts rides the customer-page chunk).
+   Each page module keeps its named export; the mapping to a default export
+   lives here. */
+const AnalysisHistoryPage = lazy(() =>
+  import('./pages/AnalysisHistoryPage').then((m) => ({ default: m.AnalysisHistoryPage })),
+)
+const AnalysisPage = lazy(() =>
+  import('./pages/AnalysisPage').then((m) => ({ default: m.AnalysisPage })),
+)
+const CustomerPage = lazy(() =>
+  import('./pages/CustomerPage').then((m) => ({ default: m.CustomerPage })),
+)
+const DashboardPage = lazy(() =>
+  import('./pages/DashboardPage').then((m) => ({ default: m.DashboardPage })),
+)
+const KnowledgeSearchPage = lazy(() =>
+  import('./pages/KnowledgeSearchPage').then((m) => ({ default: m.KnowledgeSearchPage })),
+)
+const NotFoundPage = lazy(() =>
+  import('./pages/NotFoundPage').then((m) => ({ default: m.NotFoundPage })),
+)
+const KnowledgePage = lazy(() =>
+  import('./pages/admin/KnowledgePage').then((m) => ({ default: m.KnowledgePage })),
+)
+const RulesPage = lazy(() => import('./pages/admin/RulesPage').then((m) => ({ default: m.RulesPage })))
+const UsersPage = lazy(() => import('./pages/admin/UsersPage').then((m) => ({ default: m.UsersPage })))
+const LlmSettingsPage = lazy(() =>
+  import('./pages/admin/LlmSettingsPage').then((m) => ({ default: m.LlmSettingsPage })),
+)
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -57,7 +80,14 @@ export default function App() {
                   screen or a provider renders the full-page panel instead of
                   unmounting the root to a blank page. */}
               <ErrorBoundary>
-                <Routes>
+                <Suspense
+                  fallback={
+                    <div className="flex min-h-40 items-center justify-center p-8">
+                      <Spinner label="Loading the page" />
+                    </div>
+                  }
+                >
+                  <Routes>
                   <Route path="/login" element={<LoginPage />} />
 
                   <Route element={<ProtectedRoute />}>
@@ -100,12 +130,21 @@ export default function App() {
                             </AdminRoute>
                           }
                         />
+                        <Route
+                          path="admin/llm-settings"
+                          element={
+                            <AdminRoute resource="LLM settings">
+                              <LlmSettingsPage />
+                            </AdminRoute>
+                          }
+                        />
 
                         <Route path="*" element={<NotFoundPage />} />
                       </Route>
                     </Route>
                   </Route>
-                </Routes>
+                  </Routes>
+                </Suspense>
               </ErrorBoundary>
             </AuthProvider>
           </BrowserRouter>

@@ -151,6 +151,8 @@ public record TraceStep(
         public static final String FINAL = "final";
         /** The run failed. */
         public static final String ERROR = "error";
+        /** The run was cancelled at the user's request. */
+        public static final String CANCELLED = "cancelled";
 
         private Type() {
         }

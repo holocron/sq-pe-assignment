@@ -12,3 +12,6 @@ frontend/dist/
 # Local
 *.log
 uploads/
+
+# Assignment brief - kept locally, not published
+assignment.md
