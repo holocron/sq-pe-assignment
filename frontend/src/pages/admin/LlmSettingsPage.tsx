@@ -1,6 +1,7 @@
 /**
  * Admin screen for the runtime LLM configuration: the OpenAI-compatible
- * endpoint, the chat model the agent reasons with, and the embedding model the
+ * endpoint, the reasoning model the orchestrator/judge/wand run on, the
+ * tooling model the rule subagents run on, and the embedding model the
  * knowledge base is indexed with.
  *
  * The embedding model is the dangerous field: changing it invalidates every
@@ -216,6 +217,7 @@ function LlmSettingsForm({ settings }: { settings: LlmSettings }) {
 
   const [baseUrl, setBaseUrl] = useState(settings.baseUrl)
   const [chatModel, setChatModel] = useState(settings.chatModel)
+  const [toolModel, setToolModel] = useState(settings.toolModel)
   const [embedModel, setEmbedModel] = useState(settings.embedModel)
   /* Per-model keys: a field starts "untouched" (not sent on save/test — the
      server keeps the stored key). Once the admin edits it, the field is dirty
@@ -273,11 +275,11 @@ function LlmSettingsForm({ settings }: { settings: LlmSettings }) {
     const ids = [...models]
     /* A configured model the endpoint no longer advertises must stay
        selectable — dropping it would rewrite settings just by opening the page. */
-    for (const current of [chatModel, embedModel]) {
+    for (const current of [chatModel, toolModel, embedModel]) {
       if (current && !ids.includes(current)) ids.push(current)
     }
     return ids.map((id) => ({ value: id, label: id }))
-  }, [models, chatModel, embedModel])
+  }, [models, chatModel, toolModel, embedModel])
 
   const busy = update.isPending
 
@@ -285,6 +287,7 @@ function LlmSettingsForm({ settings }: { settings: LlmSettings }) {
     return {
       baseUrl,
       chatModel,
+      toolModel,
       embedModel,
       ...(chatApiKey !== null ? { chatApiKey } : {}),
       ...(embedApiKey !== null ? { embedApiKey } : {}),
@@ -396,15 +399,24 @@ function LlmSettingsForm({ settings }: { settings: LlmSettings }) {
           ) : null}
         </div>
 
-        <div className="grid gap-4 sm:grid-cols-2">
+        <div className="grid gap-4 sm:grid-cols-3">
           {freeTextModels ? (
             <>
               <Input
-                label="Chat model"
+                label="Reasoning model"
                 required
                 value={chatModel}
                 onChange={(event) => setChatModel(event.target.value)}
                 placeholder="gpt-oss-120b"
+                hint="Orchestrator, rule judge, Enhance wand."
+              />
+              <Input
+                label="Tooling model"
+                required
+                value={toolModel}
+                onChange={(event) => setToolModel(event.target.value)}
+                placeholder="qwen3-32b"
+                hint="Rule subagents' tool loops; shares the chat API key."
               />
               <Input
                 label="Embedding model"
@@ -417,12 +429,20 @@ function LlmSettingsForm({ settings }: { settings: LlmSettings }) {
           ) : (
             <>
               <Select
-                label="Chat model"
+                label="Reasoning model"
                 required
                 value={chatModel}
                 onChange={(event) => setChatModel(event.target.value)}
                 options={modelOptions}
-                placeholder="Select a chat model"
+                placeholder="Select a reasoning model"
+              />
+              <Select
+                label="Tooling model"
+                required
+                value={toolModel}
+                onChange={(event) => setToolModel(event.target.value)}
+                options={modelOptions}
+                placeholder="Select a tooling model"
               />
               <Select
                 label="Embedding model"
@@ -438,12 +458,12 @@ function LlmSettingsForm({ settings }: { settings: LlmSettings }) {
 
         <div className="grid gap-4 sm:grid-cols-2">
           <Input
-            label="Chat model API key"
+            label="Chat models API key"
             type="password"
             value={chatApiKey ?? ''}
             onChange={(event) => setChatApiKey(event.target.value)}
             placeholder={settings.chatApiKeySet ? '•••• configured' : 'Not configured'}
-            hint="Leave empty for no key (local model servers); leave untouched to keep the current key."
+            hint="Shared by the reasoning and tooling models. Leave empty for no key (local model servers); leave untouched to keep the current key."
             autoComplete="off"
           />
           <Input
@@ -462,7 +482,9 @@ function LlmSettingsForm({ settings }: { settings: LlmSettings }) {
             variant="primary"
             onClick={handleSave}
             loading={busy}
-            disabled={chatModel.trim() === '' || embedModel.trim() === ''}
+            disabled={
+              chatModel.trim() === '' || toolModel.trim() === '' || embedModel.trim() === ''
+            }
           >
             Save settings
           </Button>
@@ -481,7 +503,16 @@ function LlmSettingsForm({ settings }: { settings: LlmSettings }) {
             aria-label="Connection test results"
             className="flex flex-col gap-1.5 rounded-md border border-border bg-surface-2/40 px-3 py-2.5"
           >
-            <ProbeLine label="Chat model" ok={testResult.chat.ok} detail={testResult.chat.detail} />
+            <ProbeLine
+              label="Reasoning model"
+              ok={testResult.chat.ok}
+              detail={testResult.chat.detail}
+            />
+            <ProbeLine
+              label="Tooling model"
+              ok={testResult.tool.ok}
+              detail={testResult.tool.detail}
+            />
             <ProbeLine
               label="Embedding model"
               ok={testResult.embed.ok}

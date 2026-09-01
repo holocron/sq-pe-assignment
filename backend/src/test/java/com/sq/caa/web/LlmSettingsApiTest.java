@@ -51,7 +51,7 @@ class LlmSettingsApiTest {
 
     private static EffectiveLlmSettings settings(String source) {
         boolean database = "database".equals(source);
-        return new EffectiveLlmSettings("http://llm:8000/v1", "chat-x", "embed-y", 1024,
+        return new EffectiveLlmSettings("http://llm:8000/v1", "chat-x", "tool-z", "embed-y", 1024,
                 database ? "sk-chat" : "none", database ? "sk-embed" : "", source,
                 database ? Instant.parse("2026-08-31T10:00:00Z") : null,
                 database ? "admin" : null);
@@ -66,6 +66,7 @@ class LlmSettingsApiTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.baseUrl").value("http://llm:8000/v1"))
                 .andExpect(jsonPath("$.chatModel").value("chat-x"))
+                .andExpect(jsonPath("$.toolModel").value("tool-z"))
                 .andExpect(jsonPath("$.embedModel").value("embed-y"))
                 .andExpect(jsonPath("$.embedDimension").value(1024))
                 .andExpect(jsonPath("$.chatApiKeySet").value(true))
@@ -84,7 +85,8 @@ class LlmSettingsApiTest {
     void putValidatesTheBody() throws Exception {
         mockMvc.perform(put("/api/admin/llm-settings")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"baseUrl\":\"http://x/v1\",\"chatModel\":\" \",\"embedModel\":\"e\"}"))
+                        .content("{\"baseUrl\":\"http://x/v1\",\"chatModel\":\" \","
+                                + "\"toolModel\":\"t\",\"embedModel\":\"e\"}"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.title").value("Validation failed"))
                 .andExpect(jsonPath("$.errors.chatModel").exists());
@@ -99,7 +101,7 @@ class LlmSettingsApiTest {
         mockMvc.perform(put("/api/admin/llm-settings")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"baseUrl\":\"http://x/v1\",\"chatModel\":\"c\","
-                                + "\"embedModel\":\"embed-z\"}"))
+                                + "\"toolModel\":\"t\",\"embedModel\":\"embed-z\"}"))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.title")
                         .value("Embedding model change requires re-embedding"))
@@ -116,7 +118,7 @@ class LlmSettingsApiTest {
         mockMvc.perform(put("/api/admin/llm-settings")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"baseUrl\":\"http://x/v1\",\"chatModel\":\"c\","
-                                + "\"embedModel\":\"embed-z\",\"chatApiKey\":\"sk-c\","
+                                + "\"toolModel\":\"t\",\"embedModel\":\"embed-z\",\"chatApiKey\":\"sk-c\","
                                 + "\"embedApiKey\":\"\",\"confirmReembed\":true}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.embedModel").value("embed-y"))
@@ -154,19 +156,24 @@ class LlmSettingsApiTest {
     }
 
     @Test
-    @DisplayName("POST test probes chat and embedding and reports per-side results")
-    void testReturnsBothProbes() throws Exception {
-        when(settingsService.testConnection(anyString(), anyString(), anyString(), isNull(), isNull()))
+    @DisplayName("POST test probes both chat roles and the embedding, reporting per-side results")
+    void testReturnsAllProbes() throws Exception {
+        when(settingsService.testConnection(anyString(), anyString(), anyString(), anyString(),
+                isNull(), isNull()))
                 .thenReturn(new MutableLlmSettingsService.ConnectionTestResult(
                         new MutableLlmSettingsService.ChatProbe(true, "Chat model 'c' answered."),
+                        new MutableLlmSettingsService.ChatProbe(false, "tool model refused"),
                         new MutableLlmSettingsService.EmbedProbe(false, "connection refused", null)));
 
         mockMvc.perform(post("/api/admin/llm-settings/test")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"baseUrl\":\"http://x/v1\",\"chatModel\":\"c\",\"embedModel\":\"e\"}"))
+                        .content("{\"baseUrl\":\"http://x/v1\",\"chatModel\":\"c\","
+                                + "\"toolModel\":\"t\",\"embedModel\":\"e\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.chat.ok").value(true))
                 .andExpect(jsonPath("$.chat.detail").exists())
+                .andExpect(jsonPath("$.tool.ok").value(false))
+                .andExpect(jsonPath("$.tool.detail").value("tool model refused"))
                 .andExpect(jsonPath("$.embed.ok").value(false))
                 .andExpect(jsonPath("$.embed.detail").value("connection refused"))
                 .andExpect(jsonPath("$.embed.dimension").doesNotExist());

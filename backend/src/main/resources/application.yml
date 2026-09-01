@@ -61,6 +61,12 @@ spring:
         schema-validation: false
 
 caa:
+  llm:
+    # The third model role: the tooling model drives the rule subagents' ReAct mini-loops (they only
+    # need reliable tool calling), while the chat model above stays the reasoning model (closing
+    # summary, rule judge, Enhance wand). It shares the chat endpoint and the chat API key - no third
+    # credential. Blank means "use the chat model", which is what every pre-V9 deployment did.
+    tool-model: ${LLM_TOOL_MODEL:}
   security:
     jwt:
       # SIGNING SECRET. Set the JWT_SECRET environment variable to a private value:

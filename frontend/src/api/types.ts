@@ -994,7 +994,10 @@ export type LlmSettingsSource = (typeof LLM_SETTINGS_SOURCES)[number]
 /** Normalised `GET /api/admin/llm-settings`. The API keys themselves never leave the server. */
 export interface LlmSettings {
   baseUrl: string
+  /** Reasoning model: orchestrator summary, rule judge, condition enhancer. */
   chatModel: string
+  /** Tooling model: the rule subagents' ReAct loops. Shares the chat API key. */
+  toolModel: string
   embedModel: string
   embedDimension: number | null
   /** True when a chat key is stored/configured; the value is never returned. */
@@ -1011,6 +1014,7 @@ export interface LlmSettings {
 export interface LlmSettingsWire {
   baseUrl?: string | null
   chatModel?: string | null
+  toolModel?: string | null
   embedModel?: string | null
   embedDimension?: number | string | null
   chatApiKeySet?: boolean | null
@@ -1028,6 +1032,7 @@ export interface LlmSettingsWire {
 export interface LlmSettingsInput {
   baseUrl: string
   chatModel: string
+  toolModel: string
   embedModel: string
   chatApiKey?: string
   embedApiKey?: string
@@ -1070,11 +1075,13 @@ export interface LlmEmbedProbeResultWire extends LlmProbeResultWire {
 /** `POST /api/admin/llm-settings/test`. */
 export interface LlmConnectionTest {
   chat: LlmProbeResult
+  tool: LlmProbeResult
   embed: LlmEmbedProbeResult
 }
 
 export interface LlmConnectionTestWire {
   chat?: LlmProbeResultWire | null
+  tool?: LlmProbeResultWire | null
   embed?: LlmEmbedProbeResultWire | null
 }
 

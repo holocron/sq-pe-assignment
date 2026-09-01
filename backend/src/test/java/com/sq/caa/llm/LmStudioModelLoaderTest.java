@@ -214,10 +214,11 @@ class LmStudioModelLoaderTest {
         try {
             LlmDefaults defaults = new LlmDefaults(
                     "http://127.0.0.1:" + lmStudio.getAddress().getPort() + "/v1", "",
-                    "some-model", "embed-model", 2560, Duration.ofMinutes(5), 0, 0.1, 100);
+                    "some-model", "some-model", "embed-model", 2560, Duration.ofMinutes(5), 0, 0.1,
+                    100);
             ChatModel model = new OpenAiLlmClientFactory(defaults).chatModel(
-                    new EffectiveLlmSettings(defaults.baseUrl(), "some-model", "embed-model", 2560,
-                            "", "", "test", null, null));
+                    new EffectiveLlmSettings(defaults.baseUrl(), "some-model", "some-model",
+                            "embed-model", 2560, "", "", "test", null, null));
             ChatResponse response = model.call(new Prompt("say ok"));
             assertThat(response.getResult().getOutput().getText()).isEqualTo("ok");
             assertThat(chatCalls).hasValue(2);

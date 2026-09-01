@@ -69,15 +69,15 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
     private volatile CacheEntry cache;
 
     private record CacheEntry(EffectiveLlmSettings settings, ChatModel chatModel,
-            EmbeddingModel embeddingModel) {
+            ChatModel toolingChatModel, EmbeddingModel embeddingModel) {
     }
 
     /**
      * What a PUT wants to save. Per key, {@code null} keeps the current key, an empty/blank string
      * is an explicit "no key" (local model servers), anything else sets the key.
      */
-    public record UpdateCommand(String baseUrl, String chatModel, String embedModel,
-            String chatApiKey, String embedApiKey, boolean confirmReembed) {
+    public record UpdateCommand(String baseUrl, String chatModel, String toolModel,
+            String embedModel, String chatApiKey, String embedApiKey, boolean confirmReembed) {
     }
 
     /** The saved settings and whether the embedding model (and therefore the corpus) changed. */
@@ -92,7 +92,7 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
     public record EmbedProbe(boolean ok, String detail, Integer dimension) {
     }
 
-    public record ConnectionTestResult(ChatProbe chat, EmbedProbe embed) {
+    public record ConnectionTestResult(ChatProbe chat, ChatProbe tool, EmbedProbe embed) {
     }
 
     public MutableLlmSettingsService(LlmSettingsRepository repository, LlmClientFactory clientFactory,
@@ -116,15 +116,21 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
 
     private EffectiveLlmSettings fromEnvironment() {
         // The environment has a single OPENAI_API_KEY; it is the boot credential for both models.
-        return new EffectiveLlmSettings(defaults.baseUrl(), defaults.chatModel(), defaults.embedModel(),
-                defaults.embedDimension(), defaults.apiKey(), defaults.apiKey(),
-                EffectiveLlmSettings.SOURCE_ENVIRONMENT, null, null);
+        // A blank LLM_TOOL_MODEL means "the chat model" - the subagents then reason on the same
+        // model as the orchestrator, which is what every deployment did before V9.
+        String toolModel = defaults.toolModel() == null || defaults.toolModel().isBlank()
+                ? defaults.chatModel()
+                : defaults.toolModel();
+        return new EffectiveLlmSettings(defaults.baseUrl(), defaults.chatModel(), toolModel,
+                defaults.embedModel(), defaults.embedDimension(), defaults.apiKey(),
+                defaults.apiKey(), EffectiveLlmSettings.SOURCE_ENVIRONMENT, null, null);
     }
 
     private static EffectiveLlmSettings fromRow(LlmSettings row) {
-        return new EffectiveLlmSettings(row.getBaseUrl(), row.getChatModel(), row.getEmbedModel(),
-                row.getEmbedDimension(), row.getChatApiKey(), row.getEmbedApiKey(),
-                EffectiveLlmSettings.SOURCE_DATABASE, row.getUpdatedAt(), row.getUpdatedBy());
+        return new EffectiveLlmSettings(row.getBaseUrl(), row.getChatModel(), row.getToolModel(),
+                row.getEmbedModel(), row.getEmbedDimension(), row.getChatApiKey(),
+                row.getEmbedApiKey(), EffectiveLlmSettings.SOURCE_DATABASE, row.getUpdatedAt(),
+                row.getUpdatedBy());
     }
 
     /* ------------------------------------------------------------------ */
@@ -134,6 +140,15 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
     /** The chat model for the configuration in effect right now. */
     public ChatModel chatModel() {
         return current().chatModel();
+    }
+
+    /**
+     * The tooling chat model for the configuration in effect right now: the model the rule
+     * subagents' ReAct mini-loops run on. It is a chat client over the tooling model id, on the
+     * same endpoint and with the same chat credential as the reasoning model.
+     */
+    public ChatModel toolingChatModel() {
+        return current().toolingChatModel();
     }
 
     /** The embedding model for the configuration in effect right now. */
@@ -153,6 +168,7 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
                 log.info("Building LLM clients for {} (source={}, embed dimension={})",
                         settings.baseUrl(), settings.source(), settings.embedDimension());
                 entry = new CacheEntry(settings, clientFactory.chatModel(settings),
+                        clientFactory.chatModel(settings.asTooling()),
                         clientFactory.embeddingModel(settings));
                 cache = entry;
             }
@@ -176,6 +192,7 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
         EffectiveLlmSettings current = effective();
         String baseUrl = requireText(command.baseUrl(), "baseUrl");
         String chatModel = requireText(command.chatModel(), "chatModel");
+        String toolModel = requireText(command.toolModel(), "toolModel");
         String embedModel = requireText(command.embedModel(), "embedModel");
 
         boolean embeddingModelChanged = !embedModel.equals(current.embedModel());
@@ -196,6 +213,7 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
         row.setId(LlmSettings.SINGLETON_ID);
         row.setBaseUrl(baseUrl);
         row.setChatModel(chatModel);
+        row.setToolModel(toolModel);
         row.setEmbedModel(embedModel);
         row.setEmbedDimension(embedDimension);
         row.setChatApiKey(chatApiKey);
@@ -203,8 +221,9 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
         row.setUpdatedAt(Instant.now());
         row.setUpdatedBy(updatedBy);
         LlmSettings saved = repository.saveAndFlush(row);
-        log.info("LLM settings updated by {}: baseUrl={} chatModel={} embedModel={} (dimension={})",
-                updatedBy, baseUrl, chatModel, embedModel, embedDimension);
+        log.info("LLM settings updated by {}: baseUrl={} chatModel={} toolModel={} embedModel={} "
+                        + "(dimension={})",
+                updatedBy, baseUrl, chatModel, toolModel, embedModel, embedDimension);
         return new UpdateOutcome(fromRow(saved), embeddingModelChanged);
     }
 
@@ -223,7 +242,7 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
 
     /** One embedding of a fixed probe string; the vector's length is the model's dimension. */
     int probeDimension(String baseUrl, String embedModel, String embedApiKey) {
-        EffectiveLlmSettings candidate = new EffectiveLlmSettings(baseUrl, null, embedModel, 0,
+        EffectiveLlmSettings candidate = new EffectiveLlmSettings(baseUrl, null, null, embedModel, 0,
                 null, embedApiKey, "candidate", null, null);
         EmbeddingModel probe = clientFactory.embeddingModel(candidate);
         float[] vector;
@@ -265,23 +284,28 @@ public class MutableLlmSettingsService implements LlmSettingsProvider {
     /* ------------------------------------------------------------------ */
 
     /**
-     * A live check of a candidate configuration: one minimal chat call, one embedding probe. Each
-     * probe uses its model's key; an omitted key falls back to the stored key for that model, an
-     * empty string probes with no key.
+     * A live check of a candidate configuration: one minimal chat call per chat role (reasoning and
+     * tooling - the tooling model shares the chat key), one embedding probe. An omitted key falls
+     * back to the stored key for that model, an empty string probes with no key.
      */
-    public ConnectionTestResult testConnection(String baseUrl, String chatModel, String embedModel,
-            String chatApiKey, String embedApiKey) {
+    public ConnectionTestResult testConnection(String baseUrl, String chatModel, String toolModel,
+            String embedModel, String chatApiKey, String embedApiKey) {
         String url = requireText(baseUrl, "baseUrl");
         EffectiveLlmSettings current = effective();
         EffectiveLlmSettings chatCandidate = new EffectiveLlmSettings(url,
-                requireText(chatModel, "chatModel"), null, 0,
+                requireText(chatModel, "chatModel"), null, null, 0,
                 chatApiKey == null ? current.chatApiKey() : chatApiKey, null,
                 "candidate", null, null);
-        EffectiveLlmSettings embedCandidate = new EffectiveLlmSettings(url, null,
+        EffectiveLlmSettings toolCandidate = new EffectiveLlmSettings(url,
+                requireText(toolModel, "toolModel"), null, null, 0,
+                chatApiKey == null ? current.chatApiKey() : chatApiKey, null,
+                "candidate", null, null);
+        EffectiveLlmSettings embedCandidate = new EffectiveLlmSettings(url, null, null,
                 requireText(embedModel, "embedModel"), 0, null,
                 embedApiKey == null ? current.embedApiKey() : embedApiKey,
                 "candidate", null, null);
-        return new ConnectionTestResult(probeChat(chatCandidate), probeEmbed(embedCandidate));
+        return new ConnectionTestResult(probeChat(chatCandidate), probeChat(toolCandidate),
+                probeEmbed(embedCandidate));
     }
 
     private ChatProbe probeChat(EffectiveLlmSettings candidate) {

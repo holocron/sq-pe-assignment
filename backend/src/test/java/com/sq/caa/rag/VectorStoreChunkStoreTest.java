@@ -192,7 +192,7 @@ class VectorStoreChunkStoreTest {
         VectorStoreChunkStore store = new VectorStoreChunkStore(vectorStore,
                 embeddingModel, properties(4),
                 () -> new com.sq.caa.llm.EffectiveLlmSettings("http://localhost", "chat-model",
-                        "embed-model", dimension.get(), "", "", "test", null, null));
+                        "chat-model", "embed-model", dimension.get(), "", "", "test", null, null));
 
         // First configuration expects 1536 but the model serves 2560: refused.
         assertThatThrownBy(() -> store.index(DOCUMENT_ID, "aml.docx", "AML Policy",
@@ -211,7 +211,7 @@ class VectorStoreChunkStoreTest {
 
     private static com.sq.caa.llm.LlmSettingsProvider settingsProvider(int dimensions) {
         return () -> new com.sq.caa.llm.EffectiveLlmSettings("http://localhost", "chat-model",
-                "embed-model", dimensions, "", "", "test", null, null);
+                "chat-model", "embed-model", dimensions, "", "", "test", null, null);
     }
 
     private static RagProperties properties(int batchSize) {

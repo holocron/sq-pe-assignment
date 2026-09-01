@@ -112,16 +112,26 @@ final class AgentTestFixtures {
     }
 
     /**
-     * Drives one full orchestrated run: the given model (usually {@link RoutedChatModel}), the
-     * given SQL answers, and no Spring context.
+     * Drives one full orchestrated run: the given model (usually {@link RoutedChatModel}) serves
+     * both roles (reasoning and tooling), with the given SQL answers, and no Spring context.
      */
     static AgentRunResult run(org.springframework.ai.chat.model.ChatModel model,
+            AgentRunContext context, com.sq.caa.sql.RuleSqlEvaluator sql, AgentProperties properties) {
+        return run(model, model, context, sql, properties);
+    }
+
+    /**
+     * The same, with a distinct tooling model - the rule subagents' mini-loops must call
+     * {@code toolingModel} while the closing summary conversation stays on {@code reasoningModel}.
+     */
+    static AgentRunResult run(org.springframework.ai.chat.model.ChatModel reasoningModel,
+            org.springframework.ai.chat.model.ChatModel toolingModel,
             AgentRunContext context, com.sq.caa.sql.RuleSqlEvaluator sql, AgentProperties properties) {
         tools.jackson.databind.json.JsonMapper mapper =
                 tools.jackson.databind.json.JsonMapper.builder().build();
         RiskAgentTools tools = new RiskAgentTools(context, null, null, sql, mapper, 25,
                 properties.maxRuleSqlAttempts());
-        RiskAgentLoop loop = new RiskAgentLoop(model,
+        RiskAgentLoop loop = new RiskAgentLoop(reasoningModel, toolingModel,
                 org.springframework.ai.model.tool.ToolCallingManager.builder().build(), mapper,
                 properties);
         return loop.execute(context, tools);

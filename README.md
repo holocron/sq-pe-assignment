@@ -478,7 +478,8 @@ design, every tool description, and the agent workflow used to build the project
 
 | Role | Model | Why |
 |---|---|---|
-| Chat / reasoning | **`gpt-oss-120b`** (Q4_K_M) | largest available model with **native tool calling**, which the ReAct loop requires; a reasoning model, so it plans multi-step investigations |
+| Chat / reasoning | **`gpt-oss-120b`** (Q4_K_M) | largest available model with **native tool calling**, which the ReAct loop requires; a reasoning model, so it plans multi-step investigations. Drives the orchestrator's closing summary, the rule judge and the Enhance wand |
+| Tooling (rule subagents) | same as reasoning by default | the subagents' ReAct mini-loops only need reliable tool calling, so a smaller/faster model can drive them — set `LLM_TOOL_MODEL` (or the `toolModel` admin setting); blank means "use the chat model". Shares the chat endpoint and API key — no third credential |
 | Embeddings | **`Qwen3-Embedding-4B`** (Q8_0, **2560-d**) | strong retrieval on policy prose; small relative to the chat model, as the brief asked |
 | Deliberately unused | `bge-reranker-v2-m3` | with a few dozen policy chunks, retrieval is already accurate — a rerank pass would add latency to a slow loop for no gain |
 

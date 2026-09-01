@@ -32,7 +32,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 class MutableLlmSettingsServiceTest {
 
     private static final LlmDefaults DEFAULTS = new LlmDefaults(
-            "http://env:13305/api/v1", "none", "env-chat", "env-embed", 2560,
+            "http://env:13305/api/v1", "none", "env-chat", "env-tool", "env-embed", 2560,
             Duration.ofMinutes(10), 1, 0.1, 4096);
 
     private LlmSettingsRepository repository;
@@ -65,6 +65,7 @@ class MutableLlmSettingsServiceTest {
                 .id(1L)
                 .baseUrl("http://db:9000/v1")
                 .chatModel("db-chat")
+                .toolModel("db-tool")
                 .embedModel(embedModel)
                 .embedDimension(dimension)
                 .chatApiKey(chatApiKey)
@@ -88,6 +89,7 @@ class MutableLlmSettingsServiceTest {
         assertThat(settings.source()).isEqualTo("environment");
         assertThat(settings.baseUrl()).isEqualTo("http://env:13305/api/v1");
         assertThat(settings.chatModel()).isEqualTo("env-chat");
+        assertThat(settings.toolModel()).isEqualTo("env-tool");
         assertThat(settings.embedModel()).isEqualTo("env-embed");
         assertThat(settings.embedDimension()).isEqualTo(2560);
         assertThat(settings.updatedAt()).isNull();
@@ -108,6 +110,7 @@ class MutableLlmSettingsServiceTest {
         assertThat(settings.source()).isEqualTo("database");
         assertThat(settings.baseUrl()).isEqualTo("http://db:9000/v1");
         assertThat(settings.chatModel()).isEqualTo("db-chat");
+        assertThat(settings.toolModel()).isEqualTo("db-tool");
         assertThat(settings.embedModel()).isEqualTo("db-embed");
         assertThat(settings.embedDimension()).isEqualTo(1024);
         assertThat(settings.chatApiKey()).isEqualTo("sk-chat");
@@ -134,6 +137,37 @@ class MutableLlmSettingsServiceTest {
     // ------------------------------------------------------------------
     // Delegate caching
     // ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("a blank environment tool model falls back to the chat model")
+    void blankToolModelFallsBackToTheChatModel() {
+        MutableLlmSettingsService blankTool = new MutableLlmSettingsService(repository, clientFactory,
+                jdbcTemplate, new LlmDefaults(DEFAULTS.baseUrl(), DEFAULTS.apiKey(), "env-chat", "  ",
+                DEFAULTS.embedModel(), DEFAULTS.embedDimension(), DEFAULTS.timeout(),
+                DEFAULTS.maxRetries(), DEFAULTS.temperature(), DEFAULTS.maxTokens()));
+        when(repository.findById(1L)).thenReturn(Optional.empty());
+
+        assertThat(blankTool.effective().toolModel()).isEqualTo("env-chat");
+    }
+
+    @Test
+    @DisplayName("the tooling delegate is a chat model built on the tool model id and the chat key")
+    void toolingDelegateUsesTheToolModel() {
+        when(repository.findById(1L))
+                .thenReturn(Optional.of(row("db-embed", 1024, "sk-chat", "sk-embed")));
+
+        ChatModel tooling = service.toolingChatModel();
+
+        org.mockito.ArgumentCaptor<EffectiveLlmSettings> captor =
+                org.mockito.ArgumentCaptor.forClass(EffectiveLlmSettings.class);
+        verify(clientFactory, org.mockito.Mockito.atLeastOnce()).chatModel(captor.capture());
+        assertThat(captor.getAllValues())
+                .anySatisfy(candidate -> {
+                    assertThat(candidate.chatModel()).isEqualTo("db-tool");
+                    assertThat(candidate.chatApiKey()).isEqualTo("sk-chat");
+                });
+        assertThat(service.toolingChatModel()).isSameAs(tooling);
+    }
 
     @Test
     @DisplayName("the delegate is cached while the configuration is unchanged, rebuilt when it is")
@@ -163,7 +197,7 @@ class MutableLlmSettingsServiceTest {
 
         MutableLlmSettingsService.UpdateOutcome outcome = service.update(
                 new MutableLlmSettingsService.UpdateCommand(
-                        "http://new:8000/v1", "new-chat", "env-embed", null, null, false),
+                        "http://new:8000/v1", "new-chat", "new-tool", "env-embed", null, null, false),
                 "admin");
 
         assertThat(outcome.embeddingModelChanged()).isFalse();
@@ -181,7 +215,7 @@ class MutableLlmSettingsServiceTest {
 
         MutableLlmSettingsService.UpdateOutcome kept = service.update(
                 new MutableLlmSettingsService.UpdateCommand(
-                        "http://db:9000/v1", "db-chat", "env-embed", null, null, false),
+                        "http://db:9000/v1", "db-chat", "db-tool", "env-embed", null, null, false),
                 "admin");
         assertThat(kept.settings().chatApiKey()).isEqualTo("sk-chat");
         assertThat(kept.settings().embedApiKey()).isEqualTo("sk-embed");
@@ -189,7 +223,8 @@ class MutableLlmSettingsServiceTest {
         // Each key is independent: clear the chat key, set a new embed key.
         MutableLlmSettingsService.UpdateOutcome cleared = service.update(
                 new MutableLlmSettingsService.UpdateCommand(
-                        "http://db:9000/v1", "db-chat", "env-embed", "  ", "sk-embed-2", false),
+                        "http://db:9000/v1", "db-chat", "db-tool", "env-embed", "  ", "sk-embed-2",
+                        false),
                 "admin");
         assertThat(cleared.settings().chatApiKey()).isEmpty();
         assertThat(cleared.settings().chatApiKeySet()).isFalse();
@@ -203,7 +238,8 @@ class MutableLlmSettingsServiceTest {
 
         assertThatThrownBy(() -> service.update(
                 new MutableLlmSettingsService.UpdateCommand(
-                        "http://env:13305/api/v1", "env-chat", "other-embed", null, null, false),
+                        "http://env:13305/api/v1", "env-chat", "env-tool", "other-embed", null, null,
+                        false),
                 "admin"))
                 .isInstanceOf(ReembedConfirmationRequiredException.class)
                 .hasMessageContaining("env-embed")
@@ -220,7 +256,8 @@ class MutableLlmSettingsServiceTest {
 
         MutableLlmSettingsService.UpdateOutcome outcome = service.update(
                 new MutableLlmSettingsService.UpdateCommand(
-                        "http://env:13305/api/v1", "env-chat", "other-embed", null, null, true),
+                        "http://env:13305/api/v1", "env-chat", "env-tool", "other-embed", null, null,
+                        true),
                 "admin");
 
         assertThat(outcome.embeddingModelChanged()).isTrue();
@@ -242,7 +279,8 @@ class MutableLlmSettingsServiceTest {
 
         assertThatThrownBy(() -> service.update(
                 new MutableLlmSettingsService.UpdateCommand(
-                        "http://env:13305/api/v1", "env-chat", "other-embed", null, null, true),
+                        "http://env:13305/api/v1", "env-chat", "env-tool", "other-embed", null, null,
+                        true),
                 "admin"))
                 .isInstanceOf(LlmEndpointException.class)
                 .hasMessageContaining("other-embed");
@@ -261,7 +299,8 @@ class MutableLlmSettingsServiceTest {
 
         assertThatThrownBy(() -> service.update(
                 new MutableLlmSettingsService.UpdateCommand(
-                        "http://env:13305/api/v1", "env-chat", "other-embed", null, null, true),
+                        "http://env:13305/api/v1", "env-chat", "env-tool", "other-embed", null, null,
+                        true),
                 "admin"))
                 .isInstanceOf(LlmSettingsException.class)
                 .hasMessageContaining("vector(1024)")

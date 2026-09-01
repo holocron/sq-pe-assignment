@@ -30,6 +30,7 @@ const mockPut = vi.mocked(putJson)
 const SETTINGS: LlmSettingsWire = {
   baseUrl: 'http://localhost:11434/v1',
   chatModel: 'gpt-oss-120b',
+  toolModel: 'qwen3-32b',
   embedModel: 'text-embedding-3-small',
   embedDimension: 1536,
   chatApiKeySet: true,
@@ -90,12 +91,12 @@ describe('LlmSettingsPage', () => {
     renderPage()
 
     expect(await screen.findByLabelText(/Base URL/)).toHaveValue('http://localhost:11434/v1')
-    expect(screen.getByLabelText(/^Chat model \*$/)).toHaveValue('gpt-oss-120b')
+    expect(screen.getByLabelText(/^Reasoning model \*$/)).toHaveValue('gpt-oss-120b')
     expect(screen.getByLabelText(/^Embedding model \*$/)).toHaveValue('text-embedding-3-small')
     expect(screen.getByText('Database override')).toBeInTheDocument()
     expect(screen.getByText('Embedding dimension 1536')).toBeInTheDocument()
     /* The stored keys are never shown — only acknowledged as placeholders. */
-    expect(screen.getByLabelText('Chat model API key')).toHaveAttribute(
+    expect(screen.getByLabelText('Chat models API key')).toHaveAttribute(
       'placeholder',
       '•••• configured',
     )
@@ -144,7 +145,7 @@ describe('model list', () => {
       })
     })
 
-    const chatSelect = (await screen.findByLabelText(/^Chat model$/)) as HTMLSelectElement
+    const chatSelect = (await screen.findByLabelText(/^Reasoning model$/)) as HTMLSelectElement
     expect(chatSelect.tagName).toBe('SELECT')
     expect(chatSelect).toHaveValue('gpt-oss-120b')
     expect(screen.getAllByRole('option', { name: 'qwen3-32b' }).length).toBeGreaterThan(0)
@@ -173,7 +174,7 @@ describe('model list', () => {
 
     expect(await screen.findByText('Model list unavailable')).toBeInTheDocument()
     expect(screen.getByText('The endpoint did not answer.')).toBeInTheDocument()
-    const chatInput = screen.getByLabelText(/^Chat model \*$/)
+    const chatInput = screen.getByLabelText(/^Reasoning model \*$/)
     expect(chatInput.tagName).toBe('INPUT')
     expect(chatInput).toHaveValue('gpt-oss-120b')
     expect(screen.getByLabelText(/^Embedding model \*$/)).toHaveValue('text-embedding-3-small')
@@ -196,6 +197,7 @@ describe('saving', () => {
       expect(mockPut).toHaveBeenCalledWith('/admin/llm-settings', {
         baseUrl: 'http://localhost:11434/v1',
         chatModel: 'gpt-oss-120b',
+        toolModel: 'qwen3-32b',
         embedModel: 'text-embedding-3-small',
       })
     })
@@ -208,7 +210,7 @@ describe('saving', () => {
     renderPage()
     await screen.findByLabelText(/Base URL/)
 
-    fireEvent.change(screen.getByLabelText('Chat model API key'), {
+    fireEvent.change(screen.getByLabelText('Chat models API key'), {
       target: { value: 'sk-chat-new' },
     })
     fireEvent.click(screen.getByRole('button', { name: 'Save settings' }))
@@ -217,6 +219,7 @@ describe('saving', () => {
       expect(mockPut).toHaveBeenCalledWith('/admin/llm-settings', {
         baseUrl: 'http://localhost:11434/v1',
         chatModel: 'gpt-oss-120b',
+        toolModel: 'qwen3-32b',
         embedModel: 'text-embedding-3-small',
         chatApiKey: 'sk-chat-new',
       })
@@ -230,7 +233,7 @@ describe('saving', () => {
     mockPut.mockResolvedValue({ ...SETTINGS, chatApiKeySet: false, reembedStarted: false } as never)
     renderPage()
     await screen.findByLabelText(/Base URL/)
-    const chatKey = screen.getByLabelText('Chat model API key')
+    const chatKey = screen.getByLabelText('Chat models API key')
 
     fireEvent.change(chatKey, { target: { value: 'sk-temp' } })
     fireEvent.change(chatKey, { target: { value: '' } })
@@ -267,6 +270,7 @@ describe('saving', () => {
       expect(mockPut).toHaveBeenCalledWith('/admin/llm-settings', {
         baseUrl: 'http://localhost:11434/v1',
         chatModel: 'gpt-oss-120b',
+        toolModel: 'qwen3-32b',
         embedModel: 'bge-m3',
         confirmReembed: true,
       })
@@ -319,6 +323,7 @@ describe('connection test', () => {
   it('sends the dirty per-model keys and omits untouched ones', async () => {
     mockPost.mockResolvedValue({
       chat: { ok: true, detail: null },
+      tool: { ok: true, detail: null },
       embed: { ok: true, detail: null, dimension: 1536 },
     } as never)
     renderPage()
@@ -333,6 +338,7 @@ describe('connection test', () => {
       expect(mockPost).toHaveBeenCalledWith('/admin/llm-settings/test', {
         baseUrl: 'http://localhost:11434/v1',
         chatModel: 'gpt-oss-120b',
+        toolModel: 'qwen3-32b',
         embedModel: 'text-embedding-3-small',
         embedApiKey: 'sk-embed-new',
       })
@@ -343,6 +349,7 @@ describe('connection test', () => {
   it('renders per-model results with the embedding dimension', async () => {
     mockPost.mockResolvedValue({
       chat: { ok: true, detail: 'Answered in 240 ms.' },
+      tool: { ok: true, detail: 'Answered in 95 ms.' },
       embed: { ok: false, detail: 'Model not found on the endpoint.', dimension: null },
     } as never)
     renderPage()
@@ -354,13 +361,15 @@ describe('connection test', () => {
       expect(mockPost).toHaveBeenCalledWith('/admin/llm-settings/test', {
         baseUrl: 'http://localhost:11434/v1',
         chatModel: 'gpt-oss-120b',
+        toolModel: 'qwen3-32b',
         embedModel: 'text-embedding-3-small',
       })
     })
 
     const results = await screen.findByLabelText('Connection test results')
-    expect(results).toHaveTextContent('Chat model — OK')
+    expect(results).toHaveTextContent('Reasoning model — OK')
     expect(results).toHaveTextContent('Answered in 240 ms.')
+    expect(results).toHaveTextContent('Tooling model — OK')
     expect(results).toHaveTextContent('Embedding model — failed')
     expect(results).toHaveTextContent('Model not found on the endpoint.')
   })
@@ -368,6 +377,7 @@ describe('connection test', () => {
   it('shows the embedding dimension when the probe reports it', async () => {
     mockPost.mockResolvedValue({
       chat: { ok: true, detail: null },
+      tool: { ok: true, detail: null },
       embed: { ok: true, detail: 'Embedded a probe sentence.', dimension: 1024 },
     } as never)
     renderPage()

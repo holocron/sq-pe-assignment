@@ -57,9 +57,13 @@ function toSource(wire: string | null | undefined): LlmSettingsSource {
 }
 
 export function normalizeLlmSettings(wire: LlmSettingsWire | null | undefined): LlmSettings {
+  const chatModel = typeof wire?.chatModel === 'string' ? wire.chatModel : ''
   return {
     baseUrl: typeof wire?.baseUrl === 'string' ? wire.baseUrl : '',
-    chatModel: typeof wire?.chatModel === 'string' ? wire.chatModel : '',
+    chatModel,
+    /* A backend predating the tooling role sends no toolModel — subagents then
+       run on the chat model, so that is the honest fallback. */
+    toolModel: typeof wire?.toolModel === 'string' && wire.toolModel ? wire.toolModel : chatModel,
     embedModel: typeof wire?.embedModel === 'string' ? wire.embedModel : '',
     embedDimension: toFiniteNumber(wire?.embedDimension),
     chatApiKeySet: wire?.chatApiKeySet === true,
@@ -96,6 +100,7 @@ function llmSettingsBody(input: LlmSettingsInput): LlmSettingsInput {
   const body: LlmSettingsInput = {
     baseUrl: input.baseUrl.trim(),
     chatModel: input.chatModel.trim(),
+    toolModel: input.toolModel.trim(),
     embedModel: input.embedModel.trim(),
   }
   if (input.chatApiKey !== undefined) body.chatApiKey = input.chatApiKey.trim()
@@ -139,6 +144,12 @@ export async function testLlmConnection(input: LlmSettingsInput): Promise<LlmCon
     chat: {
       ok: wire?.chat?.ok === true,
       detail: trimmedOrNull(wire?.chat?.detail),
+    },
+    /* The tooling probe appeared with the tool-model role; an older backend
+       answers without it, and then it simply was not probed. */
+    tool: {
+      ok: wire?.tool?.ok === true,
+      detail: trimmedOrNull(wire?.tool?.detail),
     },
     embed: {
       ok: wire?.embed?.ok === true,

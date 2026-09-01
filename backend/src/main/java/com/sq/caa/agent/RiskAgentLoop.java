@@ -57,6 +57,11 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * {@code evaluate_rule}; a subagent that exhausts its step budget without one reports failure, and
  * the orchestrator retries it once on a fresh conversation.
  *
+ * <p>The two workloads run on two model roles: the subagents' mini-loops only need reliable tool
+ * calling, so they are driven by the <b>tooling model</b> ({@code toolingChatModel}), while this
+ * loop's closing conversation - and the rule judge and the Enhance wand elsewhere - stay on the
+ * <b>reasoning model</b> (the primary {@code ChatModel}). Both are recorded in the run header.
+ *
  * <p>Spring AI 2.x does not execute tools inside {@code ChatModel.call} - tool execution moved to a
  * ChatClient advisor - so calling the model directly hands the tool calls back unexecuted and the
  * loops here drive them. That is what makes the gate possible: nothing between the model and the
@@ -125,34 +130,55 @@ public class RiskAgentLoop {
             RiskAgentTools.EVALUATE_RULE);
 
     private final ChatModel chatModel;
+    private final ChatModel toolingChatModel;
     private final ToolCallingManager toolCallingManager;
     private final JsonMapper jsonMapper;
     private final AgentProperties properties;
     private final AgentTracer tracer;
 
     /** Without the verbose file trace; for tests that do not exercise {@link AgentTracer}. */
-    public RiskAgentLoop(ChatModel chatModel, ToolCallingManager toolCallingManager,
-            JsonMapper jsonMapper, AgentProperties properties) {
-        this(chatModel, toolCallingManager, jsonMapper, properties, AgentTracer.noop());
+    public RiskAgentLoop(ChatModel chatModel, ChatModel toolingChatModel,
+            ToolCallingManager toolCallingManager, JsonMapper jsonMapper, AgentProperties properties) {
+        this(chatModel, toolingChatModel, toolCallingManager, jsonMapper, properties,
+                AgentTracer.noop());
     }
 
+    /**
+     * @param chatModel        the reasoning model: the orchestrator's closing summary runs on it
+     * @param toolingChatModel the tooling model: every rule subagent's ReAct mini-loop runs on it.
+     *                         Typically {@code @Qualifier("toolingChatModel")}; it may be a smaller
+     *                         tool-calling model than the reasoning one
+     */
     @org.springframework.beans.factory.annotation.Autowired
-    public RiskAgentLoop(ChatModel chatModel, ToolCallingManager toolCallingManager,
+    public RiskAgentLoop(ChatModel chatModel,
+            @org.springframework.beans.factory.annotation.Qualifier("toolingChatModel")
+            ChatModel toolingChatModel,
+            ToolCallingManager toolCallingManager,
             JsonMapper jsonMapper, AgentProperties properties, AgentTracer tracer) {
         this.chatModel = chatModel;
+        this.toolingChatModel = toolingChatModel;
         this.toolCallingManager = toolCallingManager;
         this.jsonMapper = jsonMapper;
         this.properties = properties;
         this.tracer = tracer == null ? AgentTracer.noop() : tracer;
     }
 
-    /** Model id this loop will drive, recorded on the run before it starts. */
+    /** Reasoning model id this loop will drive, recorded on the run before it starts. */
     public String modelId() {
-        ChatOptions options = chatModel.getOptions();
+        return modelIdOf(chatModel);
+    }
+
+    /** Tooling model id the rule subagents will run on. */
+    public String toolingModelId() {
+        return modelIdOf(toolingChatModel);
+    }
+
+    private String modelIdOf(ChatModel model) {
+        ChatOptions options = model.getOptions();
         if (options == null || options.getModel() == null || options.getModel().isBlank()) {
             // getOptions() is a default interface method some wrappers leave unimplemented;
             // getDefaultOptions() is the one OpenAiChatModel reliably fills.
-            options = chatModel.getDefaultOptions();
+            options = model.getDefaultOptions();
         }
         String configured = options == null ? null : options.getModel();
         return properties.modelOr(configured == null || configured.isBlank() ? FALLBACK_MODEL : configured);
@@ -171,11 +197,16 @@ public class RiskAgentLoop {
     public AgentRunResult execute(AgentRunContext context, RiskAgentTools tools) {
         long startedAt = System.currentTimeMillis();
         String model = modelId();
-        context.trace().started(model, context.customer().getFullName(), context.ruleCount());
-        tracer.runStarted(context.assessmentId(), context.customer().getFullName(), model,
+        String toolingModel = toolingModelId();
+        // Both roles are named in the run header: when they differ, a reviewer of the trace must
+        // know which id reasoned over the verdict table and which id drove the subagents.
+        String modelText = toolingModel.equals(model) ? model
+                : model + " (reasoning) / " + toolingModel + " (tooling)";
+        context.trace().started(modelText, context.customer().getFullName(), context.ruleCount());
+        tracer.runStarted(context.assessmentId(), context.customer().getFullName(), modelText,
                 context.ruleCount());
         try {
-            fanOut(context, tools, model);
+            fanOut(context, tools, toolingModel);
             if (context.coverageComplete()) {
                 // The summary conversation runs only over a full verdict table; a run with unjudged
                 // rules skips it and fails below, exactly as the old loop did.
@@ -379,7 +410,9 @@ public class RiskAgentLoop {
             context.recordStep();
             ChatResponse response;
             try {
-                response = chatModel.call(prompt);
+                // The tooling model drives the subagent; the reasoning model is reserved for the
+                // closing summary (and, elsewhere, the rule judge and the Enhance wand).
+                response = toolingChatModel.call(prompt);
             } catch (RuntimeException e) {
                 // A context overflow is recoverable: the transcript is the only thing that grew, so
                 // tighten the estimator and replay the turn instead of failing the subagent.

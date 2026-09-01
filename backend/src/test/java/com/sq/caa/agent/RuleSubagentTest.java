@@ -45,6 +45,39 @@ class RuleSubagentTest {
             "{\"risk_level\":\"HIGH\",\"summary\":\"Findings.\",\"recommendations\":\"Escalate.\"}");
 
     @Test
+    @DisplayName("the subagent mini-loop calls the tooling model, the summary the reasoning model")
+    void subagentsRunOnTheToolingModel() {
+        UUID runId = UUID.randomUUID();
+        AnalysisTrace trace = AgentTestFixtures.trace(runId);
+        AgentRunContext context = AgentTestFixtures.context(runId, trace, List.of(sanctioned));
+        StubRuleSqlEvaluator sql = new StubRuleSqlEvaluator()
+                .matching("receiver_bank_country", AgentTestFixtures.sanctionedWireEvidence(context));
+
+        // Two distinct models: the tooling model knows the subagent's route, the reasoning model
+        // knows only the closing summary. If a call went to the wrong model it would fall through
+        // to the default prose turn and the run would never receive its verdict.
+        RoutedChatModel reasoning = new RoutedChatModel().summary(List.of(SUBMIT_HIGH));
+        RoutedChatModel tooling = new RoutedChatModel()
+                .route(sanctioned.getRuleId().toString(), List.of(
+                        calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(sanctioned,
+                                "Payments over 10,000 to a sanctioned jurisdiction."))));
+
+        AgentRunResult result = AgentTestFixtures.run(reasoning, tooling, context, sql,
+                AgentTestFixtures.properties(12, 1));
+
+        assertTrue(result.coverageComplete());
+        assertEquals(RiskLevel.MEDIUM, result.riskLevel());
+        assertEquals(1, tooling.calls(sanctioned.getRuleId().toString()),
+                "the subagent's turns must all go to the tooling model");
+        assertEquals(0, reasoning.calls(sanctioned.getRuleId().toString()),
+                "no subagent turn may reach the reasoning model");
+        assertTrue(reasoning.calls(RoutedChatModel.SUMMARY_MARKER) >= 1,
+                "the closing summary stays on the reasoning model");
+        assertEquals(0, tooling.calls(RoutedChatModel.SUMMARY_MARKER),
+                "the tooling model never sees the closing conversation");
+    }
+
+    @Test
     @DisplayName("the happy path: investigate, one query, verdict recorded, subagent span traced")
     void verdictHappyPath() {
         UUID runId = UUID.randomUUID();

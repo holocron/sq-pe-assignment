@@ -94,11 +94,11 @@ public class LlmSettingsController {
         return new ModelsResponse(models);
     }
 
-    /** Live-probes a candidate configuration - one chat call, one embedding call. Saves nothing. */
+    /** Live-probes a candidate configuration - the two chat roles and the embedding. Saves nothing. */
     @PostMapping("/test")
     public LlmTestResponse test(@Valid @RequestBody LlmTestRequest request) {
         return LlmTestResponse.from(settingsService.testConnection(
-                request.baseUrl(), request.chatModel(), request.embedModel(),
+                request.baseUrl(), request.chatModel(), request.toolModel(), request.embedModel(),
                 request.chatApiKey(), request.embedApiKey()));
     }
 

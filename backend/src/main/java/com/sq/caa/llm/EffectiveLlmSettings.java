@@ -8,19 +8,30 @@ import java.time.Instant;
  * {@code LLM_EMBED_MODEL} / {@code OPENAI_API_KEY}) the application booted with.
  *
  * @param baseUrl        OpenAI-compatible endpoint, including {@code /v1}
- * @param chatModel      model id used for chat completions
+ * @param chatModel      model id used for reasoning chat completions (closing summary, rule judge,
+ *                       Enhance wand)
+ * @param toolModel      model id the rule subagents' ReAct mini-loops run on; never blank (a blank
+ *                       environment value resolves to the chat model)
  * @param embedModel     model id used for embeddings
  * @param embedDimension the vector length {@code document_chunks.embedding} currently holds
- * @param chatApiKey     the credential sent for chat calls; never leaves the server
+ * @param chatApiKey     the credential sent for chat calls - reasoning AND tooling; never leaves
+ *                       the server
  * @param embedApiKey    the credential sent for embedding calls; never leaves the server
  * @param source         {@code "database"} when an admin row drives this, {@code "environment"}
  *                       when the boot configuration does
  * @param updatedAt      when the database row was saved; null for the environment source
  * @param updatedBy      who saved the database row; null for the environment source
  */
-public record EffectiveLlmSettings(String baseUrl, String chatModel, String embedModel,
-        int embedDimension, String chatApiKey, String embedApiKey, String source,
+public record EffectiveLlmSettings(String baseUrl, String chatModel, String toolModel,
+        String embedModel, int embedDimension, String chatApiKey, String embedApiKey, String source,
         Instant updatedAt, String updatedBy) {
+
+    /** These settings with the tooling model standing in as the chat model - the same endpoint and
+     * the same chat credential, a different model id. */
+    public EffectiveLlmSettings asTooling() {
+        return new EffectiveLlmSettings(baseUrl, toolModel, toolModel, embedModel, embedDimension,
+                chatApiKey, embedApiKey, source, updatedAt, updatedBy);
+    }
 
     public static final String SOURCE_DATABASE = "database";
     public static final String SOURCE_ENVIRONMENT = "environment";

@@ -47,6 +47,10 @@ public class LlmSettings {
     @Column(name = "chat_model", nullable = false)
     private String chatModel;
 
+    /** The model the rule subagents' ReAct mini-loops run on; shares the chat credential. */
+    @Column(name = "tool_model", nullable = false)
+    private String toolModel;
+
     @Column(name = "embed_model", nullable = false)
     private String embedModel;
 

@@ -13,8 +13,11 @@ import org.springframework.context.annotation.Primary;
  *
  * <p>The {@code chatModel} and {@code embeddingModel} beans are the delegating shells - marked
  * {@code @Primary} so the Spring AI auto-configurations (which may also build an OpenAI model from
- * the boot properties) never win an injection point. Every consumer - the ReAct loop, the rule
- * judge, the pgvector store - therefore transparently follows the admin-editable settings.
+ * the boot properties) never win an injection point. Every consumer - the orchestrator's closing
+ * summary, the rule judge, the Enhance wand, the pgvector store - therefore transparently follows
+ * the admin-editable settings. The {@code toolingChatModel} bean is the second chat shell, NOT
+ * primary: only the rule subagents' ReAct mini-loops inject it (by qualifier), and it follows the
+ * settings' {@code toolModel}.
  */
 @Configuration
 public class LlmConfiguration {
@@ -25,20 +28,30 @@ public class LlmConfiguration {
             @Value("${spring.ai.openai.base-url}") String baseUrl,
             @Value("${spring.ai.openai.api-key:}") String apiKey,
             @Value("${spring.ai.openai.chat.options.model}") String chatModel,
+            @Value("${caa.llm.tool-model:}") String toolModel,
             @Value("${spring.ai.openai.embedding.options.model}") String embedModel,
             @Value("${spring.ai.vectorstore.pgvector.dimensions:1536}") int embedDimension,
             @Value("${spring.ai.openai.timeout:10m}") Duration timeout,
             @Value("${spring.ai.openai.max-retries:1}") int maxRetries,
             @Value("${spring.ai.openai.chat.options.temperature:0.1}") double temperature,
             @Value("${spring.ai.openai.chat.options.max-tokens:4096}") int maxTokens) {
-        return new LlmDefaults(baseUrl, apiKey, chatModel, embedModel, embedDimension, timeout,
-                maxRetries, temperature, maxTokens);
+        return new LlmDefaults(baseUrl, apiKey, chatModel, toolModel, embedModel, embedDimension,
+                timeout, maxRetries, temperature, maxTokens);
     }
 
     @Bean
     @Primary
     public ChatModel chatModel(MutableLlmSettingsService settingsService) {
         return new DelegatingChatModel(settingsService);
+    }
+
+    /**
+     * The tooling chat shell - the model the rule subagents' tool-driving mini-loops run on. Not
+     * {@code @Primary}: nothing may pick it up by accident; consumers qualify for it explicitly.
+     */
+    @Bean
+    public ChatModel toolingChatModel(MutableLlmSettingsService settingsService) {
+        return new DelegatingToolingChatModel(settingsService);
     }
 
     @Bean

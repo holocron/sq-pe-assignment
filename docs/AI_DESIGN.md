@@ -18,7 +18,8 @@ backends itself.
 
 | Role | Model | Why |
 |---|---|---|
-| **Chat / reasoning** | `gpt-oss-120b` (Q4_K_M GGUF) | The largest available model with **native tool calling**, which the ReAct loop is built on. It is a reasoning model, so it plans multi-step investigations rather than answering in one shot. |
+| **Chat / reasoning** | `gpt-oss-120b` (Q4_K_M GGUF) | The largest available model with **native tool calling**, which the ReAct loop is built on. It is a reasoning model, so it plans multi-step investigations rather than answering in one shot. Drives the orchestrator's closing summary, the rule judge and the Enhance wand. |
+| **Tooling (rule subagents)** | `gpt-oss-120b` by default | The rule subagents' ReAct mini-loops only need reliable tool calling, not deep reasoning — so they run on a separate, configurable **tooling model** (`LLM_TOOL_MODEL` / the `toolModel` admin setting; blank falls back to the chat model). It shares the chat endpoint and the chat API key, so a smaller tool-calling model (`Qwen3.6-35B-A3B`, `gpt-oss-20b`) can take over the subagents' many small turns without a third credential. |
 | **Embeddings** | `Qwen3-Embedding-4B` (Q8_0 GGUF), **2560 dimensions** | Strong retrieval quality for policy prose; the assignment asked for a "small model" for embedding, and a 4B embedder is small relative to the chat model while well above the quality of MiniLM-class encoders. |
 | *(not used)* | `bge-reranker-v2-m3` | A reranker was available and deliberately left out: with a knowledge base of a few dozen policy chunks, bi-encoder retrieval is already accurate, and a rerank pass would add latency to an already slow loop for no measurable gain. |
 
@@ -54,9 +55,9 @@ LLM_CHAT_MODEL=Qwen3.6-35B-A3B-GGUF   # roughly 3x faster, noticeably weaker rea
 
 ### Provider independence
 
-Chat and embeddings resolve through one `spring.ai.openai.base-url` and are selected by model id, so
-the same build runs against OpenAI proper, any OpenAI-compatible gateway, or a local router. No
-provider-specific code exists outside configuration.
+Chat, tooling and embeddings resolve through one `spring.ai.openai.base-url` and are selected by
+model id, so the same build runs against OpenAI proper, any OpenAI-compatible gateway, or a local
+router. No provider-specific code exists outside configuration.
 
 > One trap worth recording: Spring AI 2.x uses the **official OpenAI Java SDK**, which expects `/v1`
 > to be part of the base URL. `…/api` returns `404`; `…/api/v1` works.

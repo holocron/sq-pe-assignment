@@ -18,14 +18,15 @@ public final class LlmSettingsDtos {
     }
 
     /** The effective settings. {@code updatedAt}/{@code updatedBy} are null for source=environment. */
-    public record LlmSettingsDto(String baseUrl, String chatModel, String embedModel,
-            int embedDimension, boolean chatApiKeySet, boolean embedApiKeySet, String source,
-            Instant updatedAt, String updatedBy) {
+    public record LlmSettingsDto(String baseUrl, String chatModel, String toolModel,
+            String embedModel, int embedDimension, boolean chatApiKeySet, boolean embedApiKeySet,
+            String source, Instant updatedAt, String updatedBy) {
 
         public static LlmSettingsDto from(EffectiveLlmSettings settings) {
-            return new LlmSettingsDto(settings.baseUrl(), settings.chatModel(), settings.embedModel(),
-                    settings.embedDimension(), settings.chatApiKeySet(), settings.embedApiKeySet(),
-                    settings.source(), settings.updatedAt(), settings.updatedBy());
+            return new LlmSettingsDto(settings.baseUrl(), settings.chatModel(), settings.toolModel(),
+                    settings.embedModel(), settings.embedDimension(), settings.chatApiKeySet(),
+                    settings.embedApiKeySet(), settings.source(), settings.updatedAt(),
+                    settings.updatedBy());
         }
     }
 
@@ -33,31 +34,33 @@ public final class LlmSettingsDtos {
      * A PUT body. Per key ({@code chatApiKey} / {@code embedApiKey}): omitted or null keeps the
      * current key; an empty string is an explicit "no key" (local model servers); any other value
      * sets the key. {@code confirmReembed} must be true to save an embedding-model change.
+     * {@code toolModel} drives the rule subagents and shares the chat key.
      */
     public record LlmSettingsUpdateRequest(
             @NotBlank(message = "must not be blank") String baseUrl,
             @NotBlank(message = "must not be blank") String chatModel,
+            @NotBlank(message = "must not be blank") String toolModel,
             @NotBlank(message = "must not be blank") String embedModel,
             String chatApiKey,
             String embedApiKey,
             Boolean confirmReembed) {
 
         public MutableLlmSettingsService.UpdateCommand toCommand() {
-            return new MutableLlmSettingsService.UpdateCommand(baseUrl, chatModel, embedModel,
-                    chatApiKey, embedApiKey, Boolean.TRUE.equals(confirmReembed));
+            return new MutableLlmSettingsService.UpdateCommand(baseUrl, chatModel, toolModel,
+                    embedModel, chatApiKey, embedApiKey, Boolean.TRUE.equals(confirmReembed));
         }
     }
 
     /** The PUT answer: the saved settings plus whether the re-embed job was started. */
-    public record LlmSettingsSavedDto(String baseUrl, String chatModel, String embedModel,
-            int embedDimension, boolean chatApiKeySet, boolean embedApiKeySet, String source,
-            Instant updatedAt, String updatedBy, boolean reembedStarted) {
+    public record LlmSettingsSavedDto(String baseUrl, String chatModel, String toolModel,
+            String embedModel, int embedDimension, boolean chatApiKeySet, boolean embedApiKeySet,
+            String source, Instant updatedAt, String updatedBy, boolean reembedStarted) {
 
         public static LlmSettingsSavedDto from(EffectiveLlmSettings settings, boolean reembedStarted) {
             return new LlmSettingsSavedDto(settings.baseUrl(), settings.chatModel(),
-                    settings.embedModel(), settings.embedDimension(), settings.chatApiKeySet(),
-                    settings.embedApiKeySet(), settings.source(), settings.updatedAt(),
-                    settings.updatedBy(), reembedStarted);
+                    settings.toolModel(), settings.embedModel(), settings.embedDimension(),
+                    settings.chatApiKeySet(), settings.embedApiKeySet(), settings.source(),
+                    settings.updatedAt(), settings.updatedBy(), reembedStarted);
         }
     }
 
@@ -67,11 +70,13 @@ public final class LlmSettingsDtos {
 
     /**
      * A {@code POST .../test} body. Per key, an omitted field means "the currently stored key for
-     * that model"; the chat probe uses {@code chatApiKey}, the embed probe {@code embedApiKey}.
+     * that model"; the chat and tool probes both use {@code chatApiKey} (the tooling model shares
+     * the chat credential), the embed probe {@code embedApiKey}.
      */
     public record LlmTestRequest(
             @NotBlank(message = "must not be blank") String baseUrl,
             @NotBlank(message = "must not be blank") String chatModel,
+            @NotBlank(message = "must not be blank") String toolModel,
             @NotBlank(message = "must not be blank") String embedModel,
             String chatApiKey,
             String embedApiKey) {
@@ -83,11 +88,12 @@ public final class LlmSettingsDtos {
     public record EmbedProbeDto(boolean ok, String detail, Integer dimension) {
     }
 
-    public record LlmTestResponse(ChatProbeDto chat, EmbedProbeDto embed) {
+    public record LlmTestResponse(ChatProbeDto chat, ChatProbeDto tool, EmbedProbeDto embed) {
 
         public static LlmTestResponse from(MutableLlmSettingsService.ConnectionTestResult result) {
             return new LlmTestResponse(
                     new ChatProbeDto(result.chat().ok(), result.chat().detail()),
+                    new ChatProbeDto(result.tool().ok(), result.tool().detail()),
                     new EmbedProbeDto(result.embed().ok(), result.embed().detail(),
                             result.embed().dimension()));
         }

@@ -24,14 +24,14 @@ import org.springframework.ai.openai.OpenAiChatOptions;
 class OpenAiLlmClientFactoryTest {
 
     private static final LlmDefaults DEFAULTS = new LlmDefaults(
-            "http://localhost:13305/api/v1", "", "chat-model", "embed-model", 2560,
+            "http://localhost:13305/api/v1", "", "chat-model", "tool-model", "embed-model", 2560,
             Duration.ofMinutes(10), 1, 0.1, 4096);
 
     private final OpenAiLlmClientFactory factory = new OpenAiLlmClientFactory(DEFAULTS);
 
     private static EffectiveLlmSettings settings(String chatApiKey, String embedApiKey) {
         return new EffectiveLlmSettings("http://localhost:13305/api/v1", "chat-model",
-                "embed-model", 2560, chatApiKey, embedApiKey, "test", null, null);
+                "tool-model", "embed-model", 2560, chatApiKey, embedApiKey, "test", null, null);
     }
 
     @ParameterizedTest(name = "blank key [{0}] builds chat and embedding models keyless")

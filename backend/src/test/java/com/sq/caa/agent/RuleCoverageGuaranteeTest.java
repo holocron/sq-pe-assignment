@@ -225,6 +225,7 @@ class RuleCoverageGuaranteeTest {
         // settle() is what RiskAgentLoop calls when a run dies before it could finish. With no
         // verdicts to settle it must produce an empty, honest result - not four zero-score rows.
         AgentRunResult result = new RiskAgentLoop(new ScriptedChatModel(List.of()),
+                new ScriptedChatModel(List.of()),
                 ToolCallingManager.builder().build(), jsonMapper, properties).settle(context, 0, 0L);
 
         assertTrue(result.ruleOutcomes().isEmpty());
