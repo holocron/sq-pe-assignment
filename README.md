@@ -182,7 +182,9 @@ These are seeded with real BCrypt hashes and are also shown on the login screen 
    the query returned. If the agent raised the risk band above the score, a banner above the verdict
    shows both bands and its written justification.
 5. **Sign in as `admin`** → **Risk Rules**. Open a rule and edit its condition in plain English; the
-   editor's checklist explains how the wording becomes a query. "Test rule" runs one model judgement
+   **Enhance** wand rewrites the draft into wording the agent can translate into one query, and the
+   notes below the box explain how the wording becomes that query. "Test rule" runs one model
+   judgement
    of the draft against real seeded data — a preview of the wording, not of the run (see
    [Rule conditions](#rule-conditions-and-the-rule-editor)).
 6. **Knowledge Base** → upload another `.docx`/`.pdf`, then use **Knowledge Search** to query it.
@@ -566,11 +568,15 @@ example values and nullability, and clicking a field inserts its path into the p
 catalog fetch therefore no longer blocks saving.
 
 The admin editor is an authoring surface: an auto-growing condition textarea with a live character
-counter, six worked example conditions, a *Writing for the SQL translation* checklist (one threshold
-per sentence, name the fields, write the numbers and windows out), a weight control that states the
-score is now mechanical — *"a rule whose query returns rows contributes exactly this weight; one
-whose query returns none contributes 0.00"* — and a **Test rule** action that sends the draft to the
-model for one customer.
+counter, six worked example conditions, an **Enhance** wand (`POST /api/rules/enhance`, admin only)
+that asks the model to rewrite the draft into translatable prose — one threshold per sentence, exact
+catalog field names, explicit numbers and windows, with the catalog rendered into its prompt from
+`FieldCatalog` itself so the expectations cannot drift — a *Writing for the SQL translation* notes
+panel, a weight control that states the score is now mechanical — *"a rule whose query returns rows
+contributes exactly this weight; one whose query returns none contributes 0.00"* — and a **Test
+rule** action that sends the draft to the model for one customer. The wand's call is bounded exactly
+like the judge's: its own executor, timeout (`caa.rules.enhance.timeout-seconds`, default 120) and
+completion budget, and its failures come back as the same RFC-7807 problems.
 
 > **Read `Test rule` for what it is.** It is a *preview*: one direct model judgement of the draft
 > condition, and it does **not** go through `evaluate_rule`, the sandbox or PostgreSQL. Its verdict
