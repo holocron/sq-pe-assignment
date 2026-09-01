@@ -323,6 +323,7 @@ describe('role gating', () => {
       '/admin/knowledge',
       '/admin/users',
       '/admin/llm-settings',
+      '/admin/agent-trace',
     ])
   })
 })

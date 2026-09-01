@@ -30,6 +30,9 @@ import {
   type RiskRule,
   type RiskRuleInput,
   type RiskRuleWire,
+  type RuleEnhanceRequest,
+  type RuleEnhanceResult,
+  type RuleEnhanceResultWire,
   type RuleScope,
   type RuleTestMatch,
   type RuleTestMatchWire,
@@ -255,6 +258,32 @@ export async function testRule(request: RuleTestRequest): Promise<RuleTestResult
 }
 
 /* -------------------------------------------------------------------------- */
+/* Condition enhance                                                           */
+/* -------------------------------------------------------------------------- */
+
+function normalizeRuleEnhanceResult(wire: RuleEnhanceResultWire): RuleEnhanceResult {
+  return {
+    condition: wire.condition ?? '',
+    model: trimmedOrNull(wire.model),
+    durationMs: toFiniteNumber(wire.durationMs),
+  }
+}
+
+/**
+ * `POST /api/rules/enhance` (ADMIN) — the "magic wand": one model call that
+ * rewrites the draft condition into prose the agent can judge. Same slow-call
+ * budget as a rule test.
+ */
+export async function enhanceCondition(request: RuleEnhanceRequest): Promise<RuleEnhanceResult> {
+  const wire = await postJson<RuleEnhanceResultWire, RuleEnhanceRequest>(
+    '/rules/enhance',
+    request,
+    { timeout: RULE_TEST_TIMEOUT_MS },
+  )
+  return normalizeRuleEnhanceResult(wire ?? {})
+}
+
+/* -------------------------------------------------------------------------- */
 /* Hooks                                                                       */
 /* -------------------------------------------------------------------------- */
 
@@ -331,6 +360,16 @@ export function useTestRule(
 ): UseMutationResult<RuleTestResult, ApiError, RuleTestRequest> {
   return useMutation<RuleTestResult, ApiError, RuleTestRequest>({
     mutationFn: testRule,
+    ...options,
+  })
+}
+
+/** "Enhance" wand on the condition editor — rewrites the draft via the model. */
+export function useEnhanceCondition(
+  options?: MutationOpts<RuleEnhanceResult, RuleEnhanceRequest>,
+): UseMutationResult<RuleEnhanceResult, ApiError, RuleEnhanceRequest> {
+  return useMutation<RuleEnhanceResult, ApiError, RuleEnhanceRequest>({
+    mutationFn: enhanceCondition,
     ...options,
   })
 }

@@ -275,7 +275,7 @@ export function RuleEditor({ mode, rule, onClose }: RuleEditorProps) {
             value={condition}
             onChange={setCondition}
             textareaRef={conditionRef}
-            catalog={catalog}
+            appliesTo={appliesTo}
             disabled={saving}
             error={
               (showConditionError ? conditionError : null) ??

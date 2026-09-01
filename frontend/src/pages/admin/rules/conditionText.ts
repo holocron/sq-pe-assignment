@@ -4,13 +4,13 @@
  * The condition is a prompt: the agent reads it, investigates with its tools and
  * writes one SQL query from it; Postgres answers the query and the answer is the
  * verdict. Nothing here parses it — these functions only measure, excerpt and
- * coach, so a rule that reads badly is caught by the author rather than by a run
- * that quietly translates it into the wrong question.
+ * insert, so a rule that reads badly is caught by the author (or rewritten by the
+ * Enhance wand) rather than by a run that quietly translates it into the wrong
+ * question.
  */
 import {
   RULE_CONDITION_MAX_LENGTH,
   RULE_CONDITION_MIN_LENGTH,
-  type FieldCatalogEntry,
   type RuleScope,
 } from '../../../api/types'
 
@@ -53,62 +53,6 @@ export function validateCondition(text: string): string | null {
     return `${text.length - RULE_CONDITION_MAX_LENGTH} character(s) over the ${RULE_CONDITION_MAX_LENGTH} limit.`
   }
   return null
-}
-
-export interface ConditionCheck {
-  id: 'threshold' | 'window' | 'fields'
-  label: string
-  hint: string
-  met: boolean
-}
-
-const NUMBER_PATTERN = /\d/
-const WINDOW_PATTERN =
-  /\b(?:\d+\s*(?:h|hr|hrs|hour|hours|d|day|days|week|weeks|month|months|min|minute|minutes)|24h|30d|7d|rolling|within|same day|per day|overnight|consecutive)\b/i
-
-/** Field paths and labels the text mentions, used by the guidance checklist. */
-function referencedFields(
-  text: string,
-  catalog: readonly FieldCatalogEntry[],
-): FieldCatalogEntry[] {
-  const haystack = text.toLowerCase()
-  if (haystack.trim().length === 0) return []
-  return catalog.filter((entry) => {
-    if (haystack.includes(entry.field.toLowerCase())) return true
-    const label = entry.label.toLowerCase()
-    return label.length >= 4 && haystack.includes(label)
-  })
-}
-
-/**
- * Advisory quality checks. They never block saving — an author who knows what
- * they are doing can write a condition that fails all three — but a blank
- * checklist is the clearest possible signal that the agent will be guessing.
- */
-export function conditionChecks(
-  text: string,
-  catalog: readonly FieldCatalogEntry[],
-): ConditionCheck[] {
-  return [
-    {
-      id: 'threshold',
-      label: 'Names a concrete threshold',
-      hint: 'e.g. “above 10 000”, “three or more payments”',
-      met: NUMBER_PATTERN.test(text),
-    },
-    {
-      id: 'window',
-      label: 'States a time window',
-      hint: 'e.g. “within any rolling 24 hours”, “over 30 days”',
-      met: WINDOW_PATTERN.test(text),
-    },
-    {
-      id: 'fields',
-      label: 'Refers to data the agent can fetch',
-      hint: 'Use a name from the available-data panel',
-      met: referencedFields(text, catalog).length > 0,
-    },
-  ]
 }
 
 /** Inserts `snippet` at the caret, keeping single spaces around it. */

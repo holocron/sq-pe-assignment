@@ -8,6 +8,7 @@
  */
 import {
   BookOpen,
+  Bot,
   Brain,
   ChartColumn,
   CircleAlert,
@@ -182,6 +183,24 @@ export function traceStepMeta(step: TraceStep): TraceStepMeta {
         tone: TOOL_KIND_TONES[meta.kind],
       }
     }
+    case 'subagent':
+      /* One worker of the orchestrator judging one rule; a failed end means the
+         rule was left undecided by that worker, like a query that never ran. */
+      return step.phase === 'end' && step.verdict === 'failed'
+        ? {
+            label: 'Rule subagent',
+            description:
+              'A per-rule subagent of the orchestrator finished without a verdict — the rule stayed undecided on this attempt.',
+            icon: TriangleAlert,
+            tone: 'danger',
+          }
+        : {
+            label: 'Rule subagent',
+            description:
+              'A per-rule subagent of the orchestrator judging one rule with its own tool calls.',
+            icon: Bot,
+            tone: 'info',
+          }
     case 'assistant':
       return {
         label: 'Agent reasoning',
@@ -271,6 +290,16 @@ export function traceStepSummary(step: TraceStep | null | undefined): string {
       const subject = traceStepIdentity(step).subject
       return `Calling ${toolMeta(step.tool).label}${subject ? ` — ${subject}` : ''}`
     }
+    case 'subagent':
+      return step.phase === 'start'
+        ? `Rule subagent started — ${step.ruleName} (worker ${step.worker})`
+        : `Rule subagent finished — ${step.ruleName}, ${
+            step.verdict === 'triggered'
+              ? `triggered${typeof step.score === 'number' ? ` +${formatAmount(step.score)}` : ''}`
+              : step.verdict === 'failed'
+                ? 'failed'
+                : 'not triggered'
+          }`
     case 'assistant':
       return 'Reasoning about the evidence so far'
     case 'coverage_reprompt':
@@ -667,7 +696,9 @@ export function traceStepIdentity(
   const derived =
     step.type === 'tool_call'
       ? toolCallIdentity(step, context)
-      : step.type === 'coverage_reprompt'
+      : step.type === 'subagent'
+        ? { ...EMPTY_IDENTITY, subject: step.ruleName || null }
+        : step.type === 'coverage_reprompt'
         ? { ...EMPTY_IDENTITY, outcome: `${countLabel(step.missing.length, 'rule')} still unjudged` }
         : step.type === 'coverage_failed'
           ? {
@@ -738,19 +769,30 @@ export function traceStepSql(step: TraceStep): SqlEvaluation | null {
  * Twelve rules judged back to back are twelve rows either way, but as one block
  * they read as one phase of the run — "the agent worked through the checklist"
  * — instead of twelve unrelated markers down the timeline.
+ *
+ * Under the orchestrator, verdicts carry the `ruleName` of the subagent that
+ * made them, and parallel workers interleave their calls — so only verdicts
+ * from the SAME subagent fold together. A `subagent` boundary step between two
+ * verdicts of one worker still breaks the run, keeping each worker's calls
+ * between its own start and end rows.
  */
 export function groupTraceSteps(steps: readonly TraceStep[]): TraceBlock[] {
   const blocks: TraceBlock[] = []
+  /* The subagent whose verdicts the open block collects; '' = orchestrator level. */
+  let openVerdictRule: string | null = null
   for (const step of steps) {
     const last = blocks[blocks.length - 1]
     if (isVerdictStep(step)) {
-      if (last?.kind === 'verdicts') {
+      const rule = step.type === 'tool_call' ? (step.ruleName ?? '') : ''
+      if (last?.kind === 'verdicts' && openVerdictRule === rule) {
         last.steps.push(step)
         continue
       }
       blocks.push({ kind: 'verdicts', steps: [step] })
+      openVerdictRule = rule
       continue
     }
+    openVerdictRule = null
     blocks.push({ kind: 'step', step })
   }
   // A lone verdict is not a phase; it stays an ordinary row.

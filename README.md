@@ -213,7 +213,7 @@ customers are deliberately clean so LOW/MEDIUM outcomes are reachable.
 │   web/         controllers + DTO records + RFC-7807 errors                   │
 │   security/    stateless JWT, ADMIN/OPERATOR, method-level @PreAuthorize     │
 │   service/     customer, transaction, activity summary, risk analysis        │
-│   agent/       ReAct loop · tools · coverage gate · trace · compaction       │
+│   agent/       orchestrator · rule subagents · tools · trace · compaction    │
 │   rules/       rule validation · aggregates · field catalog · rule judge     │
 │   rag/         DOCX/PDF section chunking · embedding · vector search         │
 │   domain/      JPA entities        repository/   Spring Data JPA             │
@@ -234,14 +234,20 @@ customers are deliberately clean so LOW/MEDIUM outcomes are reachable.
 ```
 POST /api/customers/{id}/analyses
   → 202 { assessmentId, status: RUNNING }        (returns immediately; the model is slow)
-  → bounded executor runs the ReAct loop
-       ├─ tools read customers / transactions / rules / aggregates
-       ├─ search_policy_knowledge → pgvector similarity search
-       ├─ evaluate_rule → the agent's SQL for ONE rule, run in the read-only sandbox;
-       │                  the row count is the verdict, the weight is the score
+  → bounded executor runs the orchestrator
+       ├─ one rule subagent per applicable rule (bounded parallelism, own step budget):
+       │     fresh ReAct mini-loop with the full read-only tool set plus a rule-scoped
+       │     evaluate_rule verdict tool; must end by submitting its rule's verdict
+       │        ├─ tools read customers / transactions / aggregates
+       │        ├─ search_policy_knowledge → pgvector similarity search
+       │        └─ evaluate_rule → the subagent's SQL for ITS rule, run in the read-only
+       │                           sandbox; the row count is the verdict, the weight the score
+       ├─ a failed subagent is retried once, on a fresh conversation
        └─ each step appended to the trace and pushed over SSE
-  → coverage gate: cannot finish while any applicable rule is unjudged
-  → still unjudged when the steps run out? the run is persisted FAILED, naming them
+  → coverage gate: a rule whose subagent failed twice has no verdict; there is no backfill
+  → any rule still unjudged after the retry? the run is persisted FAILED, naming them
+  → otherwise ONE closing model conversation writes summary/recommendations/band over the
+    full verdict table and submits the final assessment
   → persist: one risk_assessments row per (in-scope transaction, rule) + the analysis_runs record
 
 GET  /api/analyses/{id}          poll for status/result
@@ -254,22 +260,37 @@ GET  /api/analyses/{id}/stream   SSE, live trace while RUNNING
 
 The centrepiece, in `backend/src/main/java/com/sq/caa/agent/`.
 
-It is a **hand-written ReAct loop**, not a framework auto-loop. Spring AI supplies the transport
-(`ChatModel`, `ToolCallingManager`, `@Tool` definitions), but the loop is ours so every step is
-observable, recordable and — crucially — **gateable**.
+It is a **hand-written orchestrator + per-rule subagents** design, not a framework auto-loop.
+Spring AI supplies the transport (`ChatModel`, `ToolCallingManager`, `@Tool` definitions), but the
+loops are ours so every step is observable, recordable and — crucially — **gateable**.
+
+`RiskAgentLoop.execute` is the orchestrator: it fixes the coverage set up front, then runs **one
+rule subagent per applicable rule** on a bounded pool (`caa.agent.subagent-parallelism`, default 3 —
+a local model server serialises requests anyway). Each subagent is a fresh ReAct mini-loop with its
+own step budget (`caa.agent.subagent-max-steps`, default 12), its own tool instance and the full
+read-only tool set **plus a verdict tool scoped to its one rule**:
 
 ```java
-while (steps++ < maxSteps) {
+// one subagent per rule, in parallel up to the bound
+while (steps++ < subagentMaxSteps && !context.isEvaluated(myRule)) {
     ChatResponse resp = chatModel.call(new Prompt(history, options));
     if (resp.hasToolCalls()) {
         history = toolCallingManager.executeToolCalls(prompt, resp).conversationHistory();
-    } else if (coverageIncomplete()) {
-        history.add(namingTheMissingRules());     // <- the gate: cannot conclude yet
     } else {
-        break;
+        history.add(submitYourVerdict());         // it must end through evaluate_rule
     }
 }
 ```
+
+A subagent that ends without a verdict has **failed**; the orchestrator retries it once on a fresh
+conversation, and a rule still unjudged after that fails the whole run (the coverage guarantee
+below). Only when every rule has a verdict does the orchestrator make **one closing conversation**:
+it hands the model the full verdict table and has it write the summary, the recommendations and the
+band, then submits `submit_final_assessment` — the mechanical score and the escalation rules are
+unchanged.
+
+Cancellation rides the per-run trace flag: every subagent polls it between steps, the orchestrator
+polls it while waiting on the fan-out, and the subagent pool is shut down before the run returns.
 
 > In Spring AI **2.x**, `internalToolExecutionEnabled` no longer exists — tool execution moved into
 > a `ChatClient` advisor. A direct `ChatModel.call()` therefore returns tool calls *unexecuted*,
@@ -341,11 +362,11 @@ enforced structurally, not merely requested in the prompt:
 1. The **coverage set** is computed up front from `risk_rules` and fixed before turn one.
 2. `evaluate_rule` is the only way a rule becomes covered, and only a query that actually ran
    covers it.
-3. If the model tries to conclude with rules outstanding — by calling `submit_final_assessment` or
-   by simply writing prose — the loop **does not exit**. It appends a message naming the exact
-   missing rules, by name and id, and continues, recording a `coverage_reprompt` trace step.
-4. There is **no backfill**. Nothing behind the agent can close a gap, so if the loop exhausts its
-   steps with rules still unjudged the run is persisted **`FAILED`**, keeping the verdicts it did
+3. Each rule is judged by **its own subagent**, which exists solely to submit that rule's verdict
+   through `evaluate_rule`. A subagent that exhausts its step budget without one fails and is
+   retried once; a rule with no verdict after the retry stays **UNJUDGED**.
+4. There is **no backfill**. Nothing behind the subagents can close a gap, so if any rule is still
+   unjudged when the fan-out settles the run is persisted **`FAILED`**, keeping the verdicts it did
    reach and naming the rules that were never judged, in `analysis_runs.error` and in a
    `coverage_failed` trace step. A partial review is never reported as a complete one.
 5. `AgentRunResult.coverageComplete()` is *derived* (`unjudged.isEmpty() && outcomes >= rulesTotal`),
@@ -401,13 +422,37 @@ The brief asks to minimise missed risk while keeping false positives reasonable.
 
 
 `gpt-oss-120b` advertises a 131k context window, but the serving backend was actually started with
-`ctx_size: 32768` — the real limit. A 30-turn ReAct transcript replays every tool result each turn
-and overflowed it, killing runs at ~turn 31. `ConversationCompactor` keeps the transcript within
-budget by **replacing old tool *results* with placeholders** rather than removing messages (removal
-would break `tool_call_id` pairing and get the request rejected), protecting the system prompt, the
-rule checklist and the most recent exchange. Its token estimate is **calibrated every turn from the
+`ctx_size: 32768` — the real limit. Every subagent transcript is short now (a 12-step mini-loop
+instead of one 40-turn conversation), which was half the point of the fan-out; the compactor remains
+as the guard rail. `ConversationCompactor` keeps a transcript within budget by **replacing old tool
+*results* with placeholders** rather than removing messages (removal would break `tool_call_id`
+pairing and get the request rejected). Its token estimate is **calibrated every turn from the
 server's reported `usage.promptTokens`**, because a fixed chars-per-token heuristic proved unsafe on
 UUID-heavy JSON.
+
+### The verbose agent trace (admin debugging)
+
+The per-run transcript stored in `analysis_runs.trace` is built for the UI — previews are truncated
+and condensed. When the normal log is not enough, an admin can switch on the **verbose agent trace**
+(`AgentTracer`), which writes an unabridged, human-readable log to
+`logs/agent-trace-<yyyyMMdd-HHmmss>.log` (directory configurable via `caa.agent.trace.dir`): a
+header per analysis run, every assistant message in full, every tool call with pretty-printed
+arguments and its **full, untruncated result** (this is where the SQL behind every `evaluate_rule`
+verdict lives), coverage reprompts, and the final assessment with score, summary and
+recommendations.
+
+Admin API:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/admin/agent-trace` | `{enabled, fileName, startedAt, sizeBytes}` |
+| `POST /api/admin/agent-trace` `{enabled}` | enabling — even when already on — **starts a fresh file**; disabling stops writing but keeps the file |
+| `GET /api/admin/agent-trace/content?offset=N` | incremental read from byte `N`; resets to 0 when the file was restarted and shrank, caps one response at 256 KB (tail) |
+| `GET /api/admin/agent-trace/download` | the file as a `text/plain` attachment |
+
+The switch is in-memory and off after a restart — it is a debugging session, not configuration —
+and a failed write is logged and swallowed, so tracing can never break an analysis. Old timestamped
+files are kept as history; re-enabling never appends to a previous session.
 
 ---
 
@@ -462,8 +507,10 @@ something the runtime will refuse.
   `evaluate_rule` opens with *"YOU DO NOT DECIDE WHETHER THE RULE TRIGGERED"* and says plainly that
   the row count is the verdict. The gate is therefore cooperative: the model usually satisfies it
   without being re-prompted.
-- **Re-prompts are specific** — the coverage gate names the exact outstanding rules, because "you
-  missed some rules" is not actionable.
+- **Subagent prompts are single-purpose** — a rule subagent is briefed with exactly its rule (name,
+  condition, weight, scope) and the verdict protocol ("you are done only when `evaluate_rule` has
+  accepted the verdict"), so there is no checklist to lose track of; the closing summary prompt never
+  judges rules at all, it only writes over the verdict table.
 
 ### Agents used to build this
 
@@ -640,11 +687,12 @@ filter reloads the user per request so *disabling* an account takes effect immed
 
 ## Main design decisions
 
-**1. An explicit ReAct loop instead of the framework's auto tool-execution.**
+**1. An explicit orchestrator + per-rule subagents instead of the framework's auto tool-execution.**
 Spring AI can run the tool loop for you, but then the loop is not yours to inspect or interrupt. We
-needed to record every step for the audit trail *and* to refuse termination while rules were
-outstanding. Owning the loop made both trivial. Spring AI still provides transport, tool schema
-generation and the vector store.
+needed to record every step for the audit trail *and* to guarantee coverage while rules were
+outstanding. Owning the loops made both trivial — and splitting the run into one subagent per rule
+gave each rule a fresh, short transcript instead of one ever-growing 40-turn conversation. Spring AI
+still provides transport, tool schema generation and the vector store.
 
 **2. The agent chooses the question; PostgreSQL gives the answer. This is the central decision.**
 `threshold_logic` is a rule *condition* written by a compliance officer in their own words, and there
@@ -667,9 +715,10 @@ The remaining risk is that the query does not faithfully express the condition �
 [Known limitations](#known-limitations), where it is described rather than minimised.
 
 **3. Rule coverage enforced structurally, not by prompting.**
-"Please check every rule" is not a guarantee. A gate that refuses to let the loop end — and a run
-that is stored `FAILED`, naming the rules it never judged, when the gate cannot be satisfied — is.
-This is why `coverage_complete` is `true` on every `COMPLETED` run.
+"Please check every rule" is not a guarantee. One subagent per rule whose only exit is that rule's
+verdict, one retry for a failed subagent — and a run that is stored `FAILED`, naming the rules it
+never judged, when any rule still has no verdict — is. This is why `coverage_complete` is `true` on
+every `COMPLETED` run.
 
 **4. Asynchronous analyses with a live trace.**
 A local 120B model takes minutes per run. A synchronous endpoint would time out and make the product

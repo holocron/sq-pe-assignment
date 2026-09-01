@@ -2,6 +2,7 @@ import {
   BookOpen,
   Cpu,
   LayoutDashboard,
+  ScrollText,
   Search,
   SlidersHorizontal,
   Sparkles,
@@ -50,6 +51,7 @@ export const NAV_SECTIONS: NavSection[] = [
       { to: '/admin/knowledge', label: 'Knowledge Base', icon: BookOpen },
       { to: '/admin/users', label: 'Users', icon: Users },
       { to: '/admin/llm-settings', label: 'LLM Settings', icon: Cpu },
+      { to: '/admin/agent-trace', label: 'Agent trace', icon: ScrollText },
     ],
   },
 ]

@@ -127,8 +127,10 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.GET, "/api/knowledge/documents", "/api/knowledge/documents/**")
                         .hasAnyRole(ADMIN, OPERATOR)
 
-                        // User administration.
+                        // User administration and every other admin console endpoint
+                        // (LLM settings, the verbose agent trace, ...).
                         .requestMatchers("/api/users", "/api/users/**").hasRole(ADMIN)
+                        .requestMatchers("/api/admin/**").hasRole(ADMIN)
 
                         .anyRequest().authenticated())
                 .addFilterBefore(new JwtAuthenticationFilter(jwtService, userDetailsService),

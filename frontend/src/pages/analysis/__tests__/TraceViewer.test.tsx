@@ -11,7 +11,7 @@
  * rows can be told apart by what a person actually sees, before anything is
  * expanded. That is the assertion the defect would have failed.
  */
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { normalizeTraceStep } from '../../../api/analyses'
 import type { TraceStep, UUID } from '../../../api/types'
@@ -311,5 +311,188 @@ describe('groupTraceSteps', () => {
   it('reads the size of the coverage set off the run itself', () => {
     expect(coverageSetSize(TRACE)).toBe(12)
     expect(coverageSetSize([])).toBeNull()
+  })
+
+  it('folds only verdicts from the same subagent when workers interleave', () => {
+    /* Under the orchestrator each verdict carries the ruleName of the subagent
+       that made it, and parallel workers interleave their steps — a verdict of
+       worker 2 between two of worker 1 must not fold into worker 1's block. */
+    const verdict = (n: number, ruleName: string): TraceStep =>
+      normalizeTraceStep({ n, type: 'tool_call', tool: 'evaluate_rule', args: {}, ruleName })
+    const boundary = (n: number): TraceStep =>
+      normalizeTraceStep({
+        n,
+        type: 'subagent',
+        phase: 'start',
+        ruleId: DORMANT,
+        ruleName: DORMANT_NAME,
+        worker: 2,
+      })
+
+    const a1 = verdict(2, STRUCTURING_NAME)
+    const a2 = verdict(3, STRUCTURING_NAME)
+    const b1 = verdict(4, DORMANT_NAME)
+    const start = boundary(5)
+    const a3 = verdict(6, STRUCTURING_NAME)
+
+    expect(groupTraceSteps([a1, a2, b1, start, a3])).toEqual([
+      { kind: 'verdicts', steps: [a1, a2] },
+      { kind: 'step', step: b1 },
+      { kind: 'step', step: start },
+      { kind: 'step', step: a3 },
+    ])
+  })
+})
+
+describe('TraceViewer — orchestrator subagent steps', () => {
+  const START = normalizeTraceStep({
+    n: 1,
+    type: 'subagent',
+    phase: 'start',
+    ruleId: STRUCTURING,
+    ruleName: STRUCTURING_NAME,
+    worker: 2,
+  })
+  const SUBAGENT_LOOKUP = normalizeTraceStep({
+    n: 2,
+    type: 'tool_call',
+    tool: 'search_policy_knowledge',
+    args: { query: 'structuring reporting threshold' },
+    result_preview: '{"query":"structuring reporting threshold","returned":2,"passages":[{"cit',
+    ms: 640,
+    ruleName: STRUCTURING_NAME,
+  })
+  const END = normalizeTraceStep({
+    n: 3,
+    type: 'subagent',
+    phase: 'end',
+    ruleId: STRUCTURING,
+    ruleName: STRUCTURING_NAME,
+    worker: 2,
+    verdict: 'triggered',
+    score: 30,
+    stepsUsed: 5,
+    durationMs: 4200,
+  })
+  const FAILED_END = normalizeTraceStep({
+    n: 4,
+    type: 'subagent',
+    phase: 'end',
+    ruleId: DORMANT,
+    ruleName: DORMANT_NAME,
+    worker: 3,
+    attempt: 2,
+    verdict: 'failed',
+    stepsUsed: 9,
+    durationMs: 61000,
+  })
+
+  it('renders a start boundary with the rule name and worker', () => {
+    render(<TraceViewer steps={[START]} />)
+
+    expect(screen.getByText('Rule subagent started:')).toBeInTheDocument()
+    // On the collapsed header and on the boundary block itself.
+    expect(screen.getAllByText(STRUCTURING_NAME).length).toBeGreaterThan(0)
+    expect(screen.getByText('worker 2')).toBeInTheDocument()
+  })
+
+  it('renders an end boundary with the verdict badge, score, steps and duration', () => {
+    render(<TraceViewer steps={[END]} />)
+
+    expect(screen.getByText('Rule subagent finished:')).toBeInTheDocument()
+    expect(screen.getByText('triggered +30.00')).toBeInTheDocument()
+    expect(screen.getByText('5 steps')).toBeInTheDocument()
+    expect(screen.getByText('4.2s')).toBeInTheDocument()
+  })
+
+  it('renders a failed end as a failure, never as a cleared rule', () => {
+    render(<TraceViewer steps={[FAILED_END]} />)
+
+    const failed = screen.getByText('failed')
+    expect(failed.className).toMatch(/danger/)
+    expect(screen.getByText('attempt 2')).toBeInTheDocument()
+    expect(screen.getByText('9 steps')).toBeInTheDocument()
+    expect(screen.getByText('1m 01s')).toBeInTheDocument()
+    expect(screen.queryByText('not triggered')).not.toBeInTheDocument()
+  })
+
+  it('tags an orchestrator-level call with no chip, and a subagent call with its rule', () => {
+    const orchestratorLookup = normalizeTraceStep({
+      n: 5,
+      type: 'tool_call',
+      tool: 'search_policy_knowledge',
+      args: { query: 'sanctions list refresh cadence' },
+      result_preview: '{"query":"sanctions list refresh cadence","returned":1,"passages":[{"ci',
+      ms: 500,
+    })
+
+    render(<TraceViewer steps={[orchestratorLookup, SUBAGENT_LOOKUP]} />)
+
+    expect(
+      screen.getByTitle(`Made by the rule subagent for ${STRUCTURING_NAME}`),
+    ).toBeInTheDocument()
+    // The orchestrator-level call carries no ruleName, so nothing to tag.
+    expect(screen.getAllByTitle(/Made by the rule subagent/)).toHaveLength(1)
+  })
+
+  it('offers a subagent filter chip with its count, and hides the boundary rows', () => {
+    render(<TraceViewer steps={[START, SUBAGENT_LOOKUP, END]} />)
+
+    const chip = screen.getByRole('button', { name: /Rule subagents/ })
+    expect(chip).toHaveTextContent('2')
+
+    fireEvent.click(chip)
+
+    expect(screen.getByText('2 hidden')).toBeInTheDocument()
+    expect(screen.queryByText('Rule subagent started:')).not.toBeInTheDocument()
+    expect(screen.queryByText('Rule subagent finished:')).not.toBeInTheDocument()
+    // The tool call between the boundaries is not a subagent step; it stays.
+    expect(screen.getByText('Policy knowledge search')).toBeInTheDocument()
+  })
+
+  it('groups a subagent’s interleaved verdicts under their own boundary', () => {
+    const verdict = (n: number, ruleName: string, submitted: number): TraceStep =>
+      normalizeTraceStep({
+        n,
+        type: 'tool_call',
+        tool: 'submit_rule_evaluation',
+        args: { rule_id: STRUCTURING, triggered: true, score: 30 },
+        result_preview: verdictPreview({
+          ruleId: STRUCTURING,
+          ruleName: STRUCTURING_NAME,
+          triggered: true,
+          score: 30,
+          submitted,
+        }),
+        ruleName,
+      })
+
+    render(
+      <TraceViewer
+        steps={[
+          START,
+          verdict(2, STRUCTURING_NAME, 1),
+          verdict(3, STRUCTURING_NAME, 2),
+          normalizeTraceStep({
+            n: 4,
+            type: 'subagent',
+            phase: 'start',
+            ruleId: DORMANT,
+            ruleName: DORMANT_NAME,
+            worker: 3,
+          }),
+          verdict(5, DORMANT_NAME, 3),
+          END,
+        ]}
+        ruleNames={RULE_NAMES}
+      />,
+    )
+
+    // Worker 2's two verdicts fold into one block; worker 3's lone verdict
+    // stays an ordinary row beside its own boundary.
+    expect(screen.getByText('Rule verdicts')).toBeInTheDocument()
+    expect(screen.getByText('2 rules answered')).toBeInTheDocument()
+    expect(screen.getAllByText('Rule subagent started:')).toHaveLength(2)
+    expect(screen.getAllByRole('button', { name: /Submit rule verdict/ })).toHaveLength(3)
   })
 })

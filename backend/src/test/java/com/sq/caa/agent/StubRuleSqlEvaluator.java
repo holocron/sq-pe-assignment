@@ -69,7 +69,7 @@ final class StubRuleSqlEvaluator implements RuleSqlEvaluator {
     }
 
     @Override
-    public SqlRuleResult evaluate(UUID customerId, String agentSql) {
+    public synchronized SqlRuleResult evaluate(UUID customerId, String agentSql) {
         calls.add(new Call(customerId, agentSql));
         String sql = agentSql == null ? "" : agentSql;
         for (int index = answers.size() - 1; index >= 0; index--) {
@@ -82,12 +82,12 @@ final class StubRuleSqlEvaluator implements RuleSqlEvaluator {
     }
 
     /** Every query fragment this evaluator was asked to run, in order. */
-    List<String> executed() {
+    synchronized List<String> executed() {
         return calls.stream().map(Call::sql).toList();
     }
 
     /** The customer each query was scoped to; the tools must never widen it. */
-    List<UUID> scopes() {
+    synchronized List<UUID> scopes() {
         return calls.stream().map(Call::customerId).toList();
     }
 

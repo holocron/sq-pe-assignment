@@ -142,6 +142,32 @@ public final class RuleDtos {
     }
 
     /**
+     * One enhancement of a draft condition.
+     *
+     * @param thresholdLogic the draft condition in plain English; the same text an author typed
+     * @param appliesTo      rule scope the rewrite is written against; {@code null} means ALL
+     */
+    public record RuleEnhanceRequest(
+            @NotBlank String thresholdLogic,
+            RuleScope appliesTo) {
+    }
+
+    /**
+     * The model's rewrite of a draft condition. Nothing was stored - keeping the rewrite is the
+     * author's decision, through the ordinary save path.
+     */
+    public record RuleEnhanceResponse(
+            String condition,
+            String model,
+            Long durationMs) {
+
+        public static RuleEnhanceResponse from(com.sq.caa.rules.ConditionEnhancer.Enhancement enhancement) {
+            return new RuleEnhanceResponse(enhancement.condition(), enhancement.model(),
+                    enhancement.durationMs());
+        }
+    }
+
+    /**
      * One field the agent can see, as the rule editor's reference panel renders it.
      *
      * @param category grouping of the panel, lower case: {@code transaction}, {@code customer},

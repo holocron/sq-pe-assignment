@@ -5,24 +5,29 @@
  * the product where the text *is* the behaviour. It gets a generous auto-growing
  * area, a live budget against the server's limit, blocking validation for the
  * two ways a condition is unusable (empty, or pasted JSON from the old DSL) and
- * an advisory checklist that teaches what a judgeable condition looks like.
+ * an "Enhance" wand that asks the model to rewrite the draft into prose it can
+ * translate into exactly one SQL query.
  *
  * What the agent does with the text changed, and so does what "written well"
  * means. It no longer answers the condition from the tool output — it translates
  * the condition into SQL and Postgres answers it. The comparison is therefore
  * exact, and the remaining way to get a wrong verdict is a sentence that
- * translates ambiguously. Hence the translation notes below the checklist: they
+ * translates ambiguously. Hence the translation notes below the textarea: they
  * name the failure that was actually observed rather than offering style advice.
  */
-import { Check, Database, Lightbulb, Minus } from 'lucide-react'
+import { Database, Lightbulb, WandSparkles } from 'lucide-react'
 import { useEffect, useId, type RefObject } from 'react'
-import { RULE_CONDITION_MAX_LENGTH, type FieldCatalogEntry } from '../../../api/types'
-import { Badge } from '../../../components/ui/Badge'
+import { errorMessage } from '../../../api/errors'
+import { useEnhanceCondition } from '../../../api/rules'
+import {
+  RULE_CONDITION_MAX_LENGTH,
+  RULE_CONDITION_MIN_LENGTH,
+  type RuleScope,
+} from '../../../api/types'
 import { Button } from '../../../components/ui/Button'
 import { INPUT_BASE, INPUT_TONE, INPUT_TONE_INVALID } from '../../../components/ui/Input'
+import { useToast } from '../../../components/ui/Toast'
 import { cn } from '../../../lib/cn'
-import { conditionChecks } from './conditionText'
-import { detectConditionTokens } from './conditionTokens'
 import { RULE_TEMPLATES, type RuleTemplate } from './templates'
 
 export interface ConditionEditorProps {
@@ -30,7 +35,8 @@ export interface ConditionEditorProps {
   onChange: (value: string) => void
   /** Owned by the editor so the field reference can insert at the caret. */
   textareaRef: RefObject<HTMLTextAreaElement | null>
-  catalog: readonly FieldCatalogEntry[]
+  /** Scope of the rule being edited — the wand rewrites against these fields. */
+  appliesTo: RuleScope
   error?: string | null
   disabled?: boolean
   /** Replaces name / scope / weight / condition — offered on a blank page. */
@@ -80,12 +86,14 @@ export function ConditionEditor({
   value,
   onChange,
   textareaRef,
-  catalog,
+  appliesTo,
   error,
   disabled = false,
   onUseTemplate,
   onAppendTemplate,
 }: ConditionEditorProps) {
+  const toast = useToast()
+  const enhance = useEnhanceCondition()
   const fieldId = useId()
   const counterId = `${fieldId}-counter`
   const hintId = `${fieldId}-hint`
@@ -96,11 +104,30 @@ export function ConditionEditor({
   const remaining = RULE_CONDITION_MAX_LENGTH - length
   const over = remaining < 0
   const nearLimit = !over && remaining <= RULE_CONDITION_MAX_LENGTH * 0.1
-  const checks = conditionChecks(value, catalog)
   const blank = value.trim().length === 0
-  /* The fields and thresholds the condition names, echoed as chips below the
-     box. A reading aid only — a field the scan misses is still judged. */
-  const tokens = detectConditionTokens(value, catalog)
+  /* The wand needs something to improve, and improving what fails the blocking
+     validation would only produce better-formatted invalid text. */
+  const canEnhance =
+    !disabled && !enhance.isPending && value.trim().length >= RULE_CONDITION_MIN_LENGTH && !over
+
+  const runEnhance = (): void => {
+    enhance.mutate(
+      { thresholdLogic: value.trim(), appliesTo },
+      {
+        onSuccess: (result) => {
+          if (result.condition.length === 0) {
+            toast.error('Enhancement returned nothing', 'The model gave no rewritten condition.')
+            return
+          }
+          onChange(result.condition)
+          toast.success('Condition rewritten', 'Review the wording before saving.')
+        },
+        onError: (enhanceError) => {
+          toast.error('Enhancement failed', errorMessage(enhanceError))
+        },
+      },
+    )
+  }
 
   /* Auto-grow: the height follows the content up to a cap, after which the box
      scrolls. Guarded because jsdom reports a scrollHeight of 0. */
@@ -122,16 +149,31 @@ export function ConditionEditor({
         >
           Rule condition<span className="text-danger-fg"> *</span>
         </label>
-        <p
-          id={counterId}
-          aria-live="polite"
-          className={cn(
-            'numeric text-2xs',
-            over ? 'font-semibold text-danger-fg' : nearLimit ? 'text-warning-fg' : 'text-subtle',
-          )}
-        >
-          {length} / {RULE_CONDITION_MAX_LENGTH} characters
-        </p>
+        <div className="flex items-center gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="h-6 px-1.5 text-2xs"
+            disabled={!canEnhance}
+            loading={enhance.isPending}
+            iconLeft={<WandSparkles className="size-3.5" aria-hidden="true" />}
+            title="Ask the model to rewrite this condition into prose it can translate into one SQL query"
+            onClick={runEnhance}
+          >
+            Enhance
+          </Button>
+          <p
+            id={counterId}
+            aria-live="polite"
+            className={cn(
+              'numeric text-2xs',
+              over ? 'font-semibold text-danger-fg' : nearLimit ? 'text-warning-fg' : 'text-subtle',
+            )}
+          >
+            {length} / {RULE_CONDITION_MAX_LENGTH} characters
+          </p>
+        </div>
       </div>
 
       <textarea
@@ -163,50 +205,6 @@ export function ConditionEditor({
           condition is worded decides how it is measured.
         </p>
       )}
-
-      {tokens.length > 0 ? (
-        <div aria-label="Fields and thresholds named in the condition" className="flex flex-wrap items-center gap-1.5">
-          <span className="text-2xs font-semibold tracking-caption text-subtle uppercase">
-            Detected
-          </span>
-          {tokens.map((token) =>
-            token.kind === 'field' ? (
-              <Badge key={token.id} tone="info" title={`Matches “${token.matched}” in the text`}>
-                {token.label}
-              </Badge>
-            ) : (
-              <Badge
-                key={token.id}
-                tone="outline"
-                className="numeric"
-                title="Threshold named in the condition"
-              >
-                {token.label}
-              </Badge>
-            ),
-          )}
-        </div>
-      ) : null}
-
-      <ul className="flex flex-col gap-1 rounded-md border border-border bg-surface-2/40 px-3 py-2">
-        <li className="text-2xs font-semibold tracking-caption text-muted uppercase">
-          A condition the agent can judge
-        </li>
-        {checks.map((check) => (
-          <li key={check.id} className="flex items-start gap-1.5 text-2xs leading-relaxed">
-            {check.met ? (
-              <Check aria-hidden="true" className="mt-0.5 size-3 shrink-0 text-success" />
-            ) : (
-              <Minus aria-hidden="true" className="mt-0.5 size-3 shrink-0 text-subtle" />
-            )}
-            <span className={check.met ? 'text-fg' : 'text-muted'}>
-              {check.label}
-              <span className="sr-only">{check.met ? ' — done' : ' — not yet'}</span>
-              <span className="ml-1 text-subtle">{check.hint}</span>
-            </span>
-          </li>
-        ))}
-      </ul>
 
       <section
         aria-labelledby={translationId}

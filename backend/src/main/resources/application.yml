@@ -84,7 +84,19 @@ caa:
       lock-duration: 5m
       max-tracked-pairs: 10000
   agent:
+    # Ceiling on model turns of the orchestrator's closing summary conversation (which also doubles
+    # as the historical bound of the old single-conversation loop). The per-rule work is bounded per
+    # subagent by subagent-max-steps below.
     max-steps: 40
+    # The run fans out into one rule subagent per applicable rule, each a fresh ReAct mini-loop that
+    # must end by submitting its rule's verdict through evaluate_rule. subagent-max-steps bounds one
+    # subagent's turns; a subagent that exhausts it without a verdict fails and is retried once on a
+    # fresh conversation.
+    subagent-max-steps: 12
+    # How many rule subagents run at the same time. A local model server serialises requests anyway,
+    # so this bounds the fan-out's shape (threads, transcripts, trace interleaving), not load on the
+    # model backend - raise it only if the backend actually serves requests concurrently.
+    subagent-parallelism: 3
     max-coverage-reprompts: 3
     # How many times one rule's condition may be re-expressed as SQL after a query was refused or
     # errored. Only failures count - a query that ran costs nothing here - so this bounds how long
@@ -94,9 +106,9 @@ caa:
     max-rule-sql-attempts: 3
     # gpt-oss-120b advertises a 131072-token window, but the lemonade backend serving it was
     # started with ctx_size=32768 - that is the limit actually enforced, and exceeding it fails
-    # the whole request with "500: Context size has been exceeded". A full analysis is ~30 turns
-    # of accumulating tool output, so the transcript is compacted to fit this number. Raise it
-    # only if the model backend is restarted with a larger window.
+    # the whole request with "500: Context size has been exceeded". Each subagent conversation is
+    # compacted to fit this number. Raise it only if the model backend is restarted with a larger
+    # window.
     context-tokens: 32768
     context-reserve-tokens: 1536
     keep-recent-messages: 10
@@ -104,6 +116,11 @@ caa:
     # single call: a turn that needs three minutes is normal here, and cutting it off costs the whole
     # run. See AgentProperties#requestTimeout for why this cannot be left to spring.ai.openai.timeout.
     request-timeout: 10m
+    trace:
+      # Directory the admin-enabled verbose agent trace (agent-trace-<timestamp>.log) is written to;
+      # ../logs is where the run scripts already put the backend log. Tracing itself is toggled at
+      # runtime via /api/admin/agent-trace and stays off until an admin enables it.
+      dir: ${AGENT_TRACE_DIR:../logs}
   rules:
     judge:
       # "Test rule" in the admin editor: one model call that judges one draft condition against one

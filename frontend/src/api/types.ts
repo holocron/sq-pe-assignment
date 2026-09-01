@@ -642,6 +642,28 @@ export interface RuleTestResult {
   notes: string[]
 }
 
+/**
+ * A request to rewrite a draft condition into prose the agent can translate
+ * into exactly one SQL query. One model call, slow like a rule test.
+ */
+export interface RuleEnhanceRequest {
+  thresholdLogic: string
+  appliesTo: RuleScope
+}
+
+/** `RuleDtos.RuleEnhanceResponse`. */
+export interface RuleEnhanceResultWire {
+  condition?: string | null
+  model?: string | null
+  durationMs?: number | null
+}
+
+export interface RuleEnhanceResult {
+  condition: string
+  model: string | null
+  durationMs: number | null
+}
+
 /* -------------------------------------------------------------------------- */
 /* Analyses (BUILD_SPEC section 4)                                             */
 /* -------------------------------------------------------------------------- */
@@ -756,6 +778,37 @@ export interface ToolCallTraceStep {
    * before the change normalises to exactly the shape it always had.
    */
   sql?: SqlEvaluation
+  /**
+   * Set when the call was made inside a rule subagent (orchestrator
+   * architecture). The key is omitted on orchestrator-level calls, so a trace
+   * stored before the change normalises to exactly the shape it always had.
+   */
+  ruleName?: string
+}
+
+/**
+ * One boundary of a per-rule subagent under the orchestrator architecture.
+ *
+ * `start` opens the subagent's span of the trace (its tool calls follow,
+ * tagged with the same `ruleName`); `end` closes it with the verdict the
+ * subagent returned. Coverage semantics are unchanged — the run still
+ * completes only when every rule has a verdict; this step only says which
+ * worker produced it.
+ */
+export interface SubagentTraceStep {
+  type: 'subagent'
+  n: number
+  phase: 'start' | 'end'
+  ruleId: string
+  ruleName: string
+  worker: number
+  /** Retry counter; absent on the first attempt. */
+  attempt?: number
+  verdict?: 'triggered' | 'not_triggered' | 'failed'
+  score?: number
+  stepsUsed?: number
+  durationMs?: number
+  ms?: number | null
 }
 
 export interface AssistantTraceStep {
@@ -812,6 +865,7 @@ export interface UnknownTraceStep {
 
 export type TraceStep =
   | ToolCallTraceStep
+  | SubagentTraceStep
   | AssistantTraceStep
   | CoverageRepromptTraceStep
   | CoverageFailedTraceStep
@@ -1039,6 +1093,54 @@ export interface ReembedStatusWire {
   completedDocuments?: number | string | null
   failedDocuments?: number | string | null
   lastError?: string | null
+}
+
+/* -------------------------------------------------------------------------- */
+/* Agent trace (admin)                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Normalised `GET/POST /api/admin/agent-trace`. While `enabled`, the server
+ * writes verbose agent tracing (reasoning, full tool calls and results) to
+ * `fileName`; `startedAt` marks when the current file was started. `fileName`
+ * is null when tracing was never enabled.
+ */
+export interface AgentTraceState {
+  enabled: boolean
+  fileName: string | null
+  startedAt: IsoDateTime | null
+  sizeBytes: number
+}
+
+/** Raw wire payload; every field is tolerant to absence. */
+export interface AgentTraceStateWire {
+  enabled?: boolean | null
+  fileName?: string | null
+  startedAt?: string | null
+  sizeBytes?: number | string | null
+}
+
+/** `POST /api/admin/agent-trace` body. Enabling (or re-enabling) starts a fresh file. */
+export interface AgentTraceToggleInput {
+  enabled: boolean
+}
+
+/**
+ * Normalised `GET /api/admin/agent-trace/content?offset=N` — an incremental
+ * read. `fromOffset` echoes the offset the content was actually read from; a
+ * value of 0 while the caller asked for more means the file shrank (the trace
+ * restarted) and `content` is the new file in full.
+ */
+export interface AgentTraceContent {
+  content: string
+  sizeBytes: number
+  fromOffset: number
+}
+
+export interface AgentTraceContentWire {
+  content?: string | null
+  sizeBytes?: number | string | null
+  fromOffset?: number | string | null
 }
 
 /* -------------------------------------------------------------------------- */

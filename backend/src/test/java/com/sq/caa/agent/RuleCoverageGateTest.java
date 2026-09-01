@@ -16,7 +16,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.sq.caa.domain.RiskLevel;
 import com.sq.caa.domain.RiskRule;
 import java.math.BigDecimal;
-import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -24,65 +23,62 @@ import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.springframework.ai.model.tool.ToolCallingManager;
-import tools.jackson.databind.json.JsonMapper;
 
 /**
- * The rule-coverage gate: the loop must not be able to finish while a rule is unjudged, and a run
- * that cannot judge them all must end as a failure rather than as a tidy report.
+ * The rule-coverage gate, re-armed for the orchestrator architecture.
  *
- * <p>This is the guarantee re-armed for an agent that answers every rule with a query. There is no
- * engine to close a rule the model skipped, so "coverage is always 100%" would now be a lie; what
- * holds instead is stricter and is what these tests pin: a run is either complete - every applicable
- * rule answered by a query that ran, {@code coverage_complete} true - or it is failed, with the
- * rules it never judged named in the exception and in the trace, and with every verdict it did
- * produce kept.
+ * <p>Coverage is no longer a conversation the model can have with the gate; it is the fan-out's
+ * shape: one subagent per applicable rule, each existing solely to submit that rule's verdict. What
+ * these tests pin is the guarantee's outward form, which is unchanged: a run either has a verdict
+ * for every applicable rule - {@code coverage_complete} true - or it is persisted FAILED, naming the
+ * rules never judged and keeping the verdicts it did obtain.
  *
- * <p>Everything here runs against a scripted {@link ScriptedChatModel} that deliberately misbehaves,
- * so the gate is exercised as control flow rather than hoped for. No Spring context, no database and
- * no language model are involved.
+ * <p>No Spring context, no database and no language model: the model is {@link RoutedChatModel},
+ * PostgreSQL is {@link StubRuleSqlEvaluator} and the evidence is {@link AgentTestFixtures}, whose
+ * planted activity answers SANCTIONED_WIRE 30 + STRUCTURING 20 + UNATTRIBUTED_CRYPTO 15 = 65 (HIGH),
+ * with DECLINE_BURST not triggered.
  */
 class RuleCoverageGateTest {
 
-    private static final int MAX_COVERAGE_REPROMPTS = 3;
-
-    private final JsonMapper jsonMapper = JsonMapper.builder().build();
     private final List<RiskRule> rules = AgentTestFixtures.rules();
 
+    private static final ScriptedChatModel.Turn SUBMIT_HIGH = calls(
+            RiskAgentTools.SUBMIT_FINAL_ASSESSMENT,
+            "{\"risk_level\":\"HIGH\",\"summary\":\"Sanctioned wire and structuring.\","
+                    + "\"recommendations\":\"Escalate.\"}");
+
     @Test
-    @DisplayName("a model that tries to finish early is re-prompted, and a run it never finishes ends "
-            + "FAILED with the unjudged rules named and its own verdicts kept")
-    void gateBlocksAnEarlyFinishAndAnUnfinishedRunFails() {
+    @DisplayName("rules whose subagents never produce a verdict fail the run, are named in the "
+            + "exception and the trace, and the verdicts that did land are kept")
+    void unjudgedRulesFailTheRunAndAreNamed() {
         RiskRule sanctioned = AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE);
         RiskRule structuring = AgentTestFixtures.ruleNamed(rules, STRUCTURING);
         RiskRule crypto = AgentTestFixtures.ruleNamed(rules, UNATTRIBUTED_CRYPTO);
         RiskRule declines = AgentTestFixtures.ruleNamed(rules, DECLINE_BURST);
 
-        AnalysisTrace trace = AgentTestFixtures.trace(UUID.randomUUID());
-        AgentRunContext context = AgentTestFixtures.context(UUID.randomUUID(), trace, rules);
+        UUID runId = UUID.randomUUID();
+        AnalysisTrace trace = AgentTestFixtures.trace(runId);
+        AgentRunContext context = AgentTestFixtures.context(runId, trace, rules);
 
-        ScriptedChatModel model = new ScriptedChatModel(List.of(
-                // 1. look at the checklist
-                calls(RiskAgentTools.LIST_RISK_RULES, "{}"),
-                // 2. judge one rule out of four
-                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(sanctioned,
-                        "Payments over 10,000 to a sanctioned jurisdiction.")),
-                // 3. try to conclude with three rules still open - the gate must reject this
-                calls(RiskAgentTools.SUBMIT_FINAL_ASSESSMENT,
-                        """
-                        {"risk_level":"HIGH","summary":"Sanctioned-jurisdiction wire found.",\
-                        "recommendations":"File a report."}"""),
-                // 4. give up and answer in prose instead - the gate must reject this too
-                says("My analysis is complete; the customer is high risk."),
-                // 5. grudgingly judge one more
-                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(structuring,
-                        "Three payments of 9,000-9,999 inside a rolling day.")),
-                // 6. and 7. stop answering, burning the reprompt budget
-                says("Nothing else to add."),
-                says("Truly done.")));
+        RoutedChatModel model = new RoutedChatModel()
+                .route(sanctioned.getRuleId().toString(), List.of(
+                        calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(sanctioned,
+                                "Payments over 10,000 to a sanctioned jurisdiction."))))
+                .route(structuring.getRuleId().toString(), List.of(
+                        calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(structuring,
+                                "Three payments of 9,000-9,999 inside a rolling day."))))
+                // The other two subagents just talk, on both their attempt and their retry.
+                .route(crypto.getRuleId().toString(), List.of(
+                        says("Looking."), says("Looking more."), says("Done looking."),
+                        says("Retry: looking."), says("Retry: more."), says("Retry: done.")))
+                .route(declines.getRuleId().toString(), List.of(
+                        says("Pondering."), says("Pondering more."), says("Done pondering."),
+                        says("Retry: pondering."), says("Retry: more."), says("Retry: done.")))
+                .summary(List.of(SUBMIT_HIGH));
 
-        AgentRunFailedException failure =
-                assertThrows(AgentRunFailedException.class, () -> run(model, context));
+        AgentRunFailedException failure = assertThrows(AgentRunFailedException.class,
+                () -> AgentTestFixtures.run(model, context,
+                        AgentTestFixtures.evaluator(context), AgentTestFixtures.properties(3, 2)));
 
         // --- the run is a failure, and says why ----------------------------
         IncompleteRuleCoverageException cause = assertInstanceOf(IncompleteRuleCoverageException.class,
@@ -92,7 +88,7 @@ class RuleCoverageGateTest {
                 "the failure must name the rules that were never judged: " + cause.getMessage());
         assertTrue(cause.getMessage().contains(DECLINE_BURST));
 
-        // --- and it keeps everything the agent did establish ----------------
+        // --- and it keeps everything the subagents did establish -----------
         AgentRunResult result = failure.result();
         assertEquals(4, result.rulesTotal());
         assertEquals(2, result.rulesJudged());
@@ -100,113 +96,62 @@ class RuleCoverageGateTest {
         assertFalse(result.coverageComplete());
         assertEquals(List.of(UNATTRIBUTED_CRYPTO, DECLINE_BURST),
                 result.unjudgedRules().stream().map(UnjudgedRule::ruleName).toList());
-        assertTrue(result.unjudgedRuleNames().contains(crypto.getRuleId().toString()));
-        assertTrue(result.unjudgedRuleNames().contains(declines.getRuleId().toString()));
 
-        Map<String, RuleOutcome> byName = outcomes(result);
+        Map<String, RuleOutcome> byName = result.ruleOutcomes().stream()
+                .collect(Collectors.toMap(RuleOutcome::ruleName, outcome -> outcome));
         assertEquals(RuleVerdictSource.SQL_DERIVED, byName.get(SANCTIONED_WIRE).source());
         assertEquals("Payments over 10,000 to a sanctioned jurisdiction.",
                 byName.get(SANCTIONED_WIRE).rationale());
         assertTrue(byName.get(SANCTIONED_WIRE).sql().contains("receiver_bank_country"),
                 "a kept verdict keeps the query that produced it");
-        assertEquals(RuleVerdictSource.SQL_DERIVED, byName.get(STRUCTURING).source());
         assertFalse(byName.containsKey(UNATTRIBUTED_CRYPTO),
                 "a rule nobody judged must not appear as an outcome - that would write a 0.00 row "
                         + "indistinguishable from a rule that was checked and cleared");
 
-        // --- the gate actually fired ---------------------------------------
-        assertEquals(4, countSteps(trace, TraceStep.Type.COVERAGE_REPROMPT),
-                "the gate must record a coverage_reprompt every time the model tried to stop early");
+        // --- the failure is visible in the trace ---------------------------
         assertEquals(1, countSteps(trace, TraceStep.Type.COVERAGE_FAILED));
         String coverageFailure = stepTexts(trace, TraceStep.Type.COVERAGE_FAILED);
         assertTrue(coverageFailure.contains(UNATTRIBUTED_CRYPTO));
         assertTrue(coverageFailure.contains(DECLINE_BURST));
         assertTrue(coverageFailure.contains("recorded as FAILED"));
-        assertNull(result.agentRiskLevel(),
-                "submit_final_assessment was rejected, so the agent never concluded");
+        assertNull(result.agentRiskLevel(), "a partial run gets no closing conversation");
+        assertEquals(0, model.calls(RoutedChatModel.SUMMARY_MARKER));
 
-        // --- and the reprompt named the rules that were actually missing ----
-        String reprompts = String.join("\n", model.userMessages());
-        assertTrue(reprompts.contains(UNATTRIBUTED_CRYPTO), "the reprompt must name the missing rule");
-        assertTrue(reprompts.contains(crypto.getRuleId().toString()),
-                "the reprompt must give the missing rule's id so the model can act on it");
-        assertTrue(reprompts.contains(DECLINE_BURST));
-
-        // --- what was judged is still scored, at the weights of the rules whose queries matched -
+        // --- what was judged is still scored -------------------------------
         assertEquals(0, new BigDecimal("50.00").compareTo(result.totalScore()));
         assertEquals(RiskLevel.HIGH, result.riskLevel());
         assertEquals(1, countSteps(trace, TraceStep.Type.FINAL));
         assertTrue(result.summary().contains("INCOMPLETE ANALYSIS"),
                 "the generated summary must not read like a finished review");
 
-        // sanity: the loop really did keep going instead of exiting at turn 3
-        assertTrue(model.turns() >= 7, "the loop must not have exited when the model first tried to");
+        // Each failed rule shows both subagent attempts on the transcript.
+        List<TraceStep.SubagentSpan> failedEnds = trace.steps().stream()
+                .map(TraceStep::subagent)
+                .filter(span -> span != null && "end".equals(span.phase()))
+                .filter(span -> "failed".equals(span.verdict()))
+                .toList();
+        assertEquals(4, failedEnds.size(), "two rules, two attempts each");
+        assertEquals(List.of(DECLINE_BURST, DECLINE_BURST, UNATTRIBUTED_CRYPTO, UNATTRIBUTED_CRYPTO),
+                failedEnds.stream().map(TraceStep.SubagentSpan::ruleName).sorted().toList());
     }
 
     @Test
-    @DisplayName("a model that judges every rule and concludes is let through untouched, with "
-            + "coverage_complete true")
-    void agentThatCoversEverythingIsNotReprompted() {
-        AnalysisTrace trace = AgentTestFixtures.trace(UUID.randomUUID());
-        AgentRunContext context = AgentTestFixtures.context(UUID.randomUUID(), trace, rules);
+    @DisplayName("subagents that judge nothing at all produce a failed run, not a clean review")
+    void subagentsThatJudgeNothingFailInsteadOfReportingAnEmptyReview() {
+        UUID runId = UUID.randomUUID();
+        AnalysisTrace trace = AgentTestFixtures.trace(runId);
+        AgentRunContext context = AgentTestFixtures.context(runId, trace, rules);
 
-        ScriptedChatModel model = new ScriptedChatModel(List.of(
-                calls(RiskAgentTools.LIST_RISK_RULES, "{}"),
-                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
-                        AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE),
-                        "Payments over 10,000 to a sanctioned jurisdiction.")),
-                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
-                        AgentTestFixtures.ruleNamed(rules, STRUCTURING),
-                        "Three payments of 9,000-9,999 inside a rolling day.")),
-                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
-                        AgentTestFixtures.ruleNamed(rules, UNATTRIBUTED_CRYPTO),
-                        "Crypto over 1,000 with no exchange attribution.")),
-                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
-                        AgentTestFixtures.ruleNamed(rules, DECLINE_BURST),
-                        "Five declined authorisations inside a rolling day.")),
-                calls(RiskAgentTools.SUBMIT_FINAL_ASSESSMENT, """
-                        {"risk_level":"HIGH","summary":"Sanctioned wire, structuring and an \
-                        unattributed privacy-coin transfer.","recommendations":"Escalate to the MLRO."}""")));
+        RoutedChatModel model = new RoutedChatModel();
+        for (RiskRule rule : rules) {
+            model.route(rule.getRuleId().toString(), List.of(
+                    says("This customer looks fine to me."), says("I said it looks fine."),
+                    says("Retry: still fine.")));
+        }
 
-        AgentRunResult result = run(model, context);
-
-        assertTrue(result.coverageComplete(), "the agent judged every rule, so the run may complete");
-        assertEquals(4, result.rulesJudged());
-        assertTrue(result.unjudgedRules().isEmpty());
-        assertEquals(0, countSteps(trace, TraceStep.Type.COVERAGE_REPROMPT));
-        assertEquals(0, countSteps(trace, TraceStep.Type.COVERAGE_FAILED));
-        assertEquals(6, model.turns(), "the loop must stop as soon as the assessment is accepted");
-
-        assertEquals(RiskLevel.HIGH, result.agentRiskLevel());
-        // Three queries returned rows and one did not, so the total is the sum of three weights and
-        // the band is that total banded - no part of it is an estimate.
-        assertEquals(0, new BigDecimal("65.00").compareTo(result.totalScore()));
-        assertEquals(RiskLevel.HIGH, result.mechanicalRiskLevel());
-        assertEquals(RiskLevel.HIGH, result.riskLevel());
-        assertFalse(result.escalated());
-        assertNull(result.escalationJustification());
-        assertTrue(result.summary().contains("Sanctioned wire"));
-        assertTrue(result.recommendations().contains("MLRO"));
-        assertTrue(result.ruleOutcomes().stream()
-                .allMatch(outcome -> outcome.source() == RuleVerdictSource.SQL_DERIVED));
-        assertTrue(result.ruleOutcomes().stream().allMatch(outcome -> outcome.sql() != null),
-                "every recorded verdict names the query that produced it");
-    }
-
-    @Test
-    @DisplayName("a model that never uses a tool produces a failed run, not a clean one")
-    void modelThatJudgesNothingFailsInsteadOfReportingAnEmptyReview() {
-        ScriptedChatModel model = new ScriptedChatModel(List.of(
-                says("This customer looks fine to me."),
-                says("I said it looks fine."),
-                says("Still fine."),
-                says("Fine.")));
-
-        AnalysisTrace trace = AgentTestFixtures.trace(UUID.randomUUID());
-        AgentRunContext context = AgentTestFixtures.context(UUID.randomUUID(), trace, rules);
-
-        AgentRunFailedException failure =
-                assertThrows(AgentRunFailedException.class, () -> run(model, context));
+        AgentRunFailedException failure = assertThrows(AgentRunFailedException.class,
+                () -> AgentTestFixtures.run(model, context,
+                        AgentTestFixtures.evaluator(context), AgentTestFixtures.properties(2, 2)));
         AgentRunResult result = failure.result();
 
         assertTrue(result.ruleOutcomes().isEmpty(), "nothing was judged, so nothing may be recorded");
@@ -214,9 +159,11 @@ class RuleCoverageGateTest {
         assertFalse(result.coverageComplete());
         assertInstanceOf(IncompleteRuleCoverageException.class, failure.getCause());
 
-        // The gate fires on every turn and the budget bounds how long it keeps trying.
-        assertEquals(MAX_COVERAGE_REPROMPTS + 1, countSteps(trace, TraceStep.Type.COVERAGE_REPROMPT));
-        assertEquals(MAX_COVERAGE_REPROMPTS + 1, model.turns());
+        // Every rule burned both its subagent attempts (two steps each) and was then given up.
+        for (RiskRule rule : rules) {
+            assertEquals(4, model.calls(rule.getRuleId().toString()),
+                    "two attempts of two steps for " + rule.getRuleName());
+        }
 
         // "Looks fine to me" scores nothing, because nothing was judged.
         assertEquals(0, BigDecimal.ZERO.compareTo(result.totalScore()));
@@ -228,14 +175,18 @@ class RuleCoverageGateTest {
     }
 
     @Test
-    @DisplayName("the trace renders in the published shape, failed runs included")
+    @DisplayName("the trace renders in the published shape, subagent spans and failed runs included")
     void traceMatchesThePublishedShape() {
-        ScriptedChatModel model = new ScriptedChatModel(List.of(
-                calls(RiskAgentTools.LIST_RISK_RULES, "{}"),
-                says("Done.")));
-        AnalysisTrace trace = AgentTestFixtures.trace(UUID.randomUUID());
-        AgentRunContext context = AgentTestFixtures.context(UUID.randomUUID(), trace, rules);
-        assertThrows(AgentRunFailedException.class, () -> run(model, context));
+        RiskRule declines = AgentTestFixtures.ruleNamed(rules, DECLINE_BURST);
+        UUID runId = UUID.randomUUID();
+        AnalysisTrace trace = AgentTestFixtures.trace(runId);
+        AgentRunContext context = AgentTestFixtures.context(runId, trace, List.of(declines));
+        RoutedChatModel model = new RoutedChatModel()
+                .route(declines.getRuleId().toString(), List.of(says("Nothing to say.")));
+
+        assertThrows(AgentRunFailedException.class,
+                () -> AgentTestFixtures.run(model, context,
+                        new StubRuleSqlEvaluator(), AgentTestFixtures.properties(2, 1)));
 
         var document = trace.toJson();
         assertTrue(document.has("steps"));
@@ -244,20 +195,26 @@ class RuleCoverageGateTest {
         assertEquals(1, steps.get(0).get("n").asInt());
         assertEquals(TraceStep.Type.STARTED, steps.get(0).get("type").stringValue());
 
-        var toolStep = firstStepOfType(document, TraceStep.Type.TOOL_CALL);
-        assertEquals(RiskAgentTools.LIST_RISK_RULES, toolStep.get("tool").stringValue());
-        assertTrue(toolStep.has("args"));
-        assertTrue(toolStep.has("result_preview"));
-        assertTrue(toolStep.has("ms"));
+        // The new subagent step, in exactly the shape the frontend codes against.
+        var subagentStart = firstStepOfType(document, TraceStep.Type.SUBAGENT);
+        assertEquals("start", subagentStart.get("phase").stringValue());
+        assertEquals(declines.getRuleId().toString(), subagentStart.get("ruleId").stringValue());
+        assertEquals(DECLINE_BURST, subagentStart.get("ruleName").stringValue());
+        assertEquals(1, subagentStart.get("worker").asInt());
+        assertEquals(1, subagentStart.get("attempt").asInt());
 
-        var coverageStep = firstStepOfType(document, TraceStep.Type.COVERAGE_REPROMPT);
-        assertTrue(coverageStep.get("missing").isArray());
-        assertEquals(4, coverageStep.get("missing").size());
+        var subagentEnd = lastStepOfType(document, TraceStep.Type.SUBAGENT);
+        assertEquals("end", subagentEnd.get("phase").stringValue());
+        assertEquals("failed", subagentEnd.get("verdict").stringValue());
+        assertEquals(2, subagentEnd.get("attempt").asInt());
+        assertTrue(subagentEnd.get("stepsUsed").asInt() >= 1);
+        assertTrue(subagentEnd.has("durationMs"));
 
         var failedStep = firstStepOfType(document, TraceStep.Type.COVERAGE_FAILED);
-        assertEquals(4, failedStep.get("missing").size(), "the unjudged rule ids are machine-readable");
-        assertEquals(4, failedStep.get("detail").get("rules_unjudged").asInt());
-        assertEquals(4, failedStep.get("detail").get("unjudged_rule_names").size());
+        assertEquals(1, failedStep.get("missing").size(), "the unjudged rule ids are machine-readable");
+        assertEquals(1, failedStep.get("detail").get("rules_unjudged").asInt());
+        assertEquals(DECLINE_BURST,
+                failedStep.get("detail").get("unjudged_rule_names").get(0).stringValue());
 
         var finalStep = firstStepOfType(document, TraceStep.Type.FINAL);
         assertEquals(RiskLevel.LOW.name(), finalStep.get("risk_level").stringValue());
@@ -265,21 +222,6 @@ class RuleCoverageGateTest {
     }
 
     // ------------------------------------------------------------------
-
-    private AgentRunResult run(ScriptedChatModel model, AgentRunContext context) {
-        AgentProperties properties = new AgentProperties(40, MAX_COVERAGE_REPROMPTS, 3, 4096, 0.1,
-                32768, 1536, 10, "test-model", 2, 16, Duration.ofMinutes(5), Duration.ofMinutes(10), 25);
-        RiskAgentTools tools = new RiskAgentTools(context, null, null,
-                AgentTestFixtures.evaluator(context), jsonMapper, 25, 3);
-        RiskAgentLoop loop = new RiskAgentLoop(model, ToolCallingManager.builder().build(), jsonMapper,
-                properties);
-        return loop.execute(context, tools);
-    }
-
-    private static Map<String, RuleOutcome> outcomes(AgentRunResult result) {
-        return result.ruleOutcomes().stream()
-                .collect(Collectors.toMap(RuleOutcome::ruleName, outcome -> outcome));
-    }
 
     private static long countSteps(AnalysisTrace trace, String type) {
         return trace.steps().stream().filter(byType(type)).count();
@@ -304,5 +246,19 @@ class RuleCoverageGateTest {
             }
         }
         throw new AssertionError("no step of type " + type + " in " + document);
+    }
+
+    private static tools.jackson.databind.JsonNode lastStepOfType(
+            tools.jackson.databind.node.ObjectNode document, String type) {
+        tools.jackson.databind.JsonNode found = null;
+        for (tools.jackson.databind.JsonNode step : document.get("steps")) {
+            if (type.equals(step.get("type").stringValue())) {
+                found = step;
+            }
+        }
+        if (found == null) {
+            throw new AssertionError("no step of type " + type + " in " + document);
+        }
+        return found;
     }
 }

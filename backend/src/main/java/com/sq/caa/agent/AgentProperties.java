@@ -7,9 +7,17 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 /**
  * Tuning of the ReAct risk agent, bound from {@code caa.agent.*}.
  *
- * @param maxSteps             hard ceiling on model turns in one run. The loop counts one step per
- *                             {@code ChatModel.call}, so this bounds both latency and spend even if
- *                             the model never converges.
+ * @param maxSteps             hard ceiling on model turns of the closing summary conversation (and
+ *                             the historical ceiling of the old single-conversation loop). The loop
+ *                             counts one step per {@code ChatModel.call}, so this bounds both
+ *                             latency and spend even if the model never converges.
+ * @param subagentMaxSteps     hard ceiling on model turns of ONE rule subagent's ReAct mini-loop.
+ *                             Each applicable rule is judged by its own subagent on a fresh
+ *                             conversation; a subagent that reaches this ceiling without a recorded
+ *                             verdict reports failure and is retried once by the orchestrator.
+ * @param subagentParallelism  how many rule subagents may run at the same time. Local model
+ *                             servers serialize requests anyway - the bound exists so the fan-out
+ *                             is explicit and testable, not because the backend would melt.
  * @param maxCoverageReprompts how often the loop may refuse to let the model conclude while rules
  *                             remain unjudged. Once exhausted the loop stops; if rules are still
  *                             unjudged at that point the run is recorded as FAILED rather than
@@ -51,6 +59,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 @ConfigurationProperties(prefix = "caa.agent")
 public record AgentProperties(
         @DefaultValue("40") int maxSteps,
+        @DefaultValue("12") int subagentMaxSteps,
+        @DefaultValue("3") int subagentParallelism,
         @DefaultValue("3") int maxCoverageReprompts,
         @DefaultValue("3") int maxRuleSqlAttempts,
         @DefaultValue("4096") int maxTokens,
@@ -67,6 +77,8 @@ public record AgentProperties(
 
     public AgentProperties {
         maxSteps = clamp(maxSteps, 1, 400);
+        subagentMaxSteps = clamp(subagentMaxSteps, 2, 100);
+        subagentParallelism = clamp(subagentParallelism, 1, 8);
         maxCoverageReprompts = clamp(maxCoverageReprompts, 0, 50);
         maxRuleSqlAttempts = clamp(maxRuleSqlAttempts, 1, 20);
         maxTokens = clamp(maxTokens, 512, 131072);

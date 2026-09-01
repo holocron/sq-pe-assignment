@@ -30,6 +30,7 @@ import {
   type RuleEvaluation,
   type RuleEvaluationWire,
   type SqlEvaluation,
+  type SubagentTraceStep,
   type ToolCallTraceStep,
   type TraceStep,
   type UUID,
@@ -163,11 +164,39 @@ export function normalizeTraceStep(raw: unknown, fallbackIndex = 0): TraceStep {
         subject: str(step.subject),
         outcome: str(step.outcome),
       }
+      /* Which rule subagent made the call; orchestrator-level calls carry none,
+         and the key is omitted so they keep the shape they always had. */
+      const ruleName = str(step.ruleName) ?? str(step.rule_name)
+      if (ruleName) toolCall.ruleName = ruleName
       /* Set only when the step actually ran a query, so a trace stored before
          rules were answered in SQL normalises to the shape it always had. */
       const sql = normalizeSqlEvaluation(step.sql, step.detail, step.args)
       if (sql) toolCall.sql = sql
       return toolCall
+    }
+    case 'subagent': {
+      const subagent: SubagentTraceStep = {
+        type: 'subagent',
+        n,
+        ms,
+        phase: str(step.phase) === 'end' ? 'end' : 'start',
+        ruleId: str(step.ruleId) ?? str(step.rule_id) ?? '',
+        ruleName: str(step.ruleName) ?? str(step.rule_name) ?? '',
+        worker: num(step.worker) ?? 0,
+      }
+      const attempt = num(step.attempt)
+      if (attempt !== null) subagent.attempt = attempt
+      const verdict = str(step.verdict)
+      if (verdict === 'triggered' || verdict === 'not_triggered' || verdict === 'failed') {
+        subagent.verdict = verdict
+      }
+      const score = num(step.score)
+      if (score !== null) subagent.score = score
+      const stepsUsed = num(step.stepsUsed) ?? num(step.steps_used)
+      if (stepsUsed !== null) subagent.stepsUsed = stepsUsed
+      const durationMs = num(step.durationMs) ?? num(step.duration_ms)
+      if (durationMs !== null) subagent.durationMs = durationMs
+      return subagent
     }
     case 'assistant':
       return { type: 'assistant', n, ms, text: str(step.text) ?? '' }

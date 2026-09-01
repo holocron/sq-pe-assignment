@@ -1,9 +1,5 @@
 package com.sq.caa.agent;
 
-import static com.sq.caa.agent.AgentTestFixtures.DECLINE_BURST;
-import static com.sq.caa.agent.AgentTestFixtures.SANCTIONED_WIRE;
-import static com.sq.caa.agent.AgentTestFixtures.STRUCTURING;
-import static com.sq.caa.agent.AgentTestFixtures.UNATTRIBUTED_CRYPTO;
 import static com.sq.caa.agent.ScriptedChatModel.calls;
 import static com.sq.caa.agent.ScriptedChatModel.says;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -14,14 +10,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.sq.caa.domain.RiskLevel;
 import com.sq.caa.domain.RiskRule;
-import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.springframework.ai.model.tool.ToolCallingManager;
-import tools.jackson.databind.json.JsonMapper;
 
 /**
  * The conclusion the model writes out instead of calling {@code submit_final_assessment}.
@@ -31,25 +24,27 @@ import tools.jackson.databind.json.JsonMapper;
  * conclusion", re-prompted twice ("Every rule has a verdict but no assessment was submitted") and
  * spent two more round trips getting an answer it already had.
  *
- * <p>These tests fix the boundary of the fix: the written assessment is accepted only once coverage
- * is complete, only when it really parses, and it is always visible in the trace as having arrived
- * as prose. The "coverage is still open" half of the boundary is asserted in
- * {@link RuleCoverageGuaranteeTest}.
+ * <p>Under the orchestrator this lives in the closing summary conversation, which is the only
+ * conversation that may conclude at all: the written assessment is accepted there when it really
+ * parses, the band rule applies to it exactly as to a tool call, and it is always visible in the
+ * trace as having arrived as prose. The coverage half of the boundary is now structural - a run
+ * with an unjudged rule never reaches the summary conversation (see {@link RuleCoverageGateTest}).
  */
 class ProseFinalAssessmentTest {
 
-    private final JsonMapper jsonMapper = JsonMapper.builder().build();
+    private final tools.jackson.databind.json.JsonMapper jsonMapper =
+            tools.jackson.databind.json.JsonMapper.builder().build();
     private final List<RiskRule> rules = AgentTestFixtures.rules();
 
     @Test
-    @DisplayName("a parseable assessment written as prose is accepted once every rule has a verdict, "
+    @DisplayName("a parseable assessment written as prose is accepted by the closing conversation "
             + "without another round trip")
     void aWrittenAssessmentIsAcceptedWhenCoverageIsComplete() {
         AnalysisTrace trace = AgentTestFixtures.trace(UUID.randomUUID());
         AgentRunContext context = AgentTestFixtures.context(UUID.randomUUID(), trace, rules);
-        ScriptedChatModel model = new ScriptedChatModel(coverEverything(context,
+        RoutedChatModel model = AgentTestFixtures.coveringModel(rules,
                 says("""
-                        All twelve checks are done. Here is my final assessment:
+                        All checks are done. Here is my final assessment:
 
                         ```json
                         {
@@ -60,11 +55,13 @@ class ProseFinalAssessmentTest {
                         "Request source-of-funds evidence."]
                         }
                         ```
-                        """)));
+                        """));
 
-        AgentRunResult result = run(model, context);
+        AgentRunResult result = AgentTestFixtures.run(model, context,
+                AgentTestFixtures.evaluator(context), AgentTestFixtures.properties(12, 2));
 
-        assertEquals(5, model.turns(), "the written assessment must end the run, not cost more turns");
+        assertEquals(1, model.calls(RoutedChatModel.SUMMARY_MARKER),
+                "the written assessment must end the conversation, not cost more turns");
         assertEquals(0, countSteps(trace, TraceStep.Type.REPROMPT),
                 "the loop must not ask for an assessment it has already been given");
         assertEquals(1, countSteps(trace, TraceStep.Type.PROSE_FINAL),
@@ -96,19 +93,26 @@ class ProseFinalAssessmentTest {
     void proseWithoutAnAssessmentIsStillReprompted() {
         AnalysisTrace trace = AgentTestFixtures.trace(UUID.randomUUID());
         AgentRunContext context = AgentTestFixtures.context(UUID.randomUUID(), trace, rules);
-        ScriptedChatModel model = new ScriptedChatModel(coverEverything(context,
+        RoutedChatModel model = new RoutedChatModel();
+        for (RiskRule rule : rules) {
+            model.route(rule.getRuleId().toString(), List.of(
+                    calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(rule,
+                            "The activity this rule's condition names."))));
+        }
+        model.summary(List.of(
                 says("I have now finished reviewing every rule for this customer. The risk is high."),
-                calls(RiskAgentTools.SUBMIT_FINAL_ASSESSMENT, """
-                        {"risk_level":"HIGH","summary":"Sanctioned wire and structuring.",\
-                        "recommendations":"Escalate."}""")));
+                calls(RiskAgentTools.SUBMIT_FINAL_ASSESSMENT,
+                        "{\"risk_level\":\"HIGH\",\"summary\":\"Sanctioned wire and structuring.\","
+                                + "\"recommendations\":\"Escalate.\"}")));
 
-        AgentRunResult result = run(model, context);
+        AgentRunResult result = AgentTestFixtures.run(model, context,
+                AgentTestFixtures.evaluator(context), AgentTestFixtures.properties(12, 2));
 
         assertEquals(0, countSteps(trace, TraceStep.Type.PROSE_FINAL),
                 "a sentence mentioning risk is not a submitted assessment");
         assertEquals(1, countSteps(trace, TraceStep.Type.REPROMPT));
-        assertTrue(stepTexts(trace, TraceStep.Type.REPROMPT).contains("no assessment was submitted"));
-        assertEquals(6, model.turns());
+        assertTrue(stepTexts(trace, TraceStep.Type.REPROMPT).contains("No assessment was submitted"));
+        assertEquals(2, model.calls(RoutedChatModel.SUMMARY_MARKER));
         assertEquals(RiskLevel.HIGH, result.agentRiskLevel());
     }
 
@@ -148,36 +152,6 @@ class ProseFinalAssessmentTest {
     }
 
     // ------------------------------------------------------------------
-
-    /** The four fixture rules judged one per turn, followed by whatever the test appends. */
-    private List<ScriptedChatModel.Turn> coverEverything(AgentRunContext context,
-            ScriptedChatModel.Turn... then) {
-        List<ScriptedChatModel.Turn> script = new java.util.ArrayList<>(List.of(
-                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
-                        AgentTestFixtures.ruleNamed(rules, SANCTIONED_WIRE),
-                        "Payments over 10,000 to a sanctioned jurisdiction.")),
-                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
-                        AgentTestFixtures.ruleNamed(rules, STRUCTURING),
-                        "Three payments of 9,000-9,999 inside a rolling day.")),
-                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
-                        AgentTestFixtures.ruleNamed(rules, UNATTRIBUTED_CRYPTO),
-                        "Crypto over 1,000 with no exchange attribution.")),
-                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(
-                        AgentTestFixtures.ruleNamed(rules, DECLINE_BURST),
-                        "Five declined authorisations inside a rolling day."))));
-        script.addAll(List.of(then));
-        return script;
-    }
-
-    private AgentRunResult run(ScriptedChatModel model, AgentRunContext context) {
-        AgentProperties properties = new AgentProperties(40, 3, 3, 4096, 0.1, 32768, 1536, 10,
-                "test-model", 2, 16, Duration.ofMinutes(5), Duration.ofMinutes(10), 25);
-        RiskAgentTools tools = new RiskAgentTools(context, null, null,
-                AgentTestFixtures.evaluator(context), jsonMapper, 25, 3);
-        RiskAgentLoop loop = new RiskAgentLoop(model, ToolCallingManager.builder().build(), jsonMapper,
-                properties);
-        return loop.execute(context, tools);
-    }
 
     private static long countSteps(AnalysisTrace trace, String type) {
         return trace.steps().stream().filter(step -> type.equals(step.type())).count();

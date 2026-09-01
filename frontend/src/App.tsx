@@ -43,6 +43,9 @@ const UsersPage = lazy(() => import('./pages/admin/UsersPage').then((m) => ({ de
 const LlmSettingsPage = lazy(() =>
   import('./pages/admin/LlmSettingsPage').then((m) => ({ default: m.LlmSettingsPage })),
 )
+const AgentTracePage = lazy(() =>
+  import('./pages/admin/AgentTracePage').then((m) => ({ default: m.AgentTracePage })),
+)
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -135,6 +138,14 @@ export default function App() {
                           element={
                             <AdminRoute resource="LLM settings">
                               <LlmSettingsPage />
+                            </AdminRoute>
+                          }
+                        />
+                        <Route
+                          path="admin/agent-trace"
+                          element={
+                            <AdminRoute resource="the agent trace">
+                              <AgentTracePage />
                             </AdminRoute>
                           }
                         />

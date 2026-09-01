@@ -50,4 +50,8 @@ export const queryKeys = {
     settings: () => ['llm-settings', 'settings'] as const,
     reembedStatus: () => ['llm-settings', 'reembed-status'] as const,
   },
+  agentTrace: {
+    root: ['agent-trace'] as const,
+    state: () => ['agent-trace', 'state'] as const,
+  },
 } as const

@@ -48,6 +48,9 @@ import tools.jackson.databind.node.ObjectNode;
  *                      not scoped to one thing
  * @param outcome       the one-line result of the step - "triggered +30.00 (rule 3 of 12)",
  *                      "12 rules in scope", "3 passages"; null when there is nothing to say
+ * @param ruleName      the rule a {@code tool_call} was made for, set when the call happened inside
+ *                      a rule subagent; null for orchestrator-level calls
+ * @param subagent      the span payload of a {@code subagent} step; null for every other type
  */
 public record TraceStep(
         int n,
@@ -62,7 +65,9 @@ public record TraceStep(
         String riskLevel,
         JsonNode detail,
         String subject,
-        String outcome) {
+        String outcome,
+        String ruleName,
+        SubagentSpan subagent) {
 
     /** Longest tool result kept in the transcript; the full result still went to the model. */
     public static final int PREVIEW_LIMIT = 600;
@@ -103,7 +108,6 @@ public record TraceStep(
      * expanded detail of the step, not on the collapsed row.
      */
     public record Note(String subject, String outcome, String sql) {
-
         public Note {
             subject = clip(subject, SUBJECT_LIMIT);
             outcome = clip(outcome, OUTCOME_LIMIT);
@@ -124,6 +128,29 @@ public record TraceStep(
         public static Note of(String subject, String outcome, String sql) {
             Note note = new Note(subject, outcome, sql);
             return note.isEmpty() ? null : note;
+        }
+    }
+
+    /**
+     * The payload of a {@code subagent} step: one rule subagent starting or ending.
+     *
+     * <p>Serialised as top-level keys of the step (camelCase, as published to the frontend):
+     * {@code phase} ("start" or "end"), {@code ruleId}, {@code ruleName}, {@code worker} and
+     * {@code attempt} on both phases; {@code verdict} ("triggered", "not_triggered" or "failed"),
+     * {@code score}, {@code stepsUsed} and {@code durationMs} on "end" only.
+     */
+    public record SubagentSpan(String phase, String ruleId, String ruleName, int worker, int attempt,
+            String verdict, java.math.BigDecimal score, Integer stepsUsed, Long durationMs) {
+
+        public static SubagentSpan start(String ruleId, String ruleName, int worker, int attempt) {
+            return new SubagentSpan("start", ruleId, clip(ruleName, SUBJECT_LIMIT), worker, attempt,
+                    null, null, null, null);
+        }
+
+        public static SubagentSpan end(String ruleId, String ruleName, int worker, int attempt,
+                String verdict, java.math.BigDecimal score, int stepsUsed, long durationMs) {
+            return new SubagentSpan("end", ruleId, clip(ruleName, SUBJECT_LIMIT), worker, attempt,
+                    verdict, score, stepsUsed, durationMs);
         }
     }
 
@@ -153,6 +180,11 @@ public record TraceStep(
         public static final String ERROR = "error";
         /** The run was cancelled at the user's request. */
         public static final String CANCELLED = "cancelled";
+        /**
+         * A rule subagent started or finished (phase "start"/"end", with worker, attempt and - on
+         * end - verdict, score, stepsUsed and durationMs).
+         */
+        public static final String SUBAGENT = "subagent";
 
         private Type() {
         }
@@ -196,6 +228,30 @@ public record TraceStep(
         }
         if (outcome != null) {
             node.put("outcome", outcome);
+        }
+        if (ruleName != null) {
+            node.put("ruleName", ruleName);
+        }
+        if (subagent != null) {
+            node.put("phase", subagent.phase());
+            node.put("ruleId", subagent.ruleId());
+            if (subagent.ruleName() != null) {
+                node.put("ruleName", subagent.ruleName());
+            }
+            node.put("worker", subagent.worker());
+            node.put("attempt", subagent.attempt());
+            if (subagent.verdict() != null) {
+                node.put("verdict", subagent.verdict());
+            }
+            if (subagent.score() != null) {
+                node.put("score", subagent.score());
+            }
+            if (subagent.stepsUsed() != null) {
+                node.put("stepsUsed", subagent.stepsUsed());
+            }
+            if (subagent.durationMs() != null) {
+                node.put("durationMs", subagent.durationMs());
+            }
         }
         return node;
     }

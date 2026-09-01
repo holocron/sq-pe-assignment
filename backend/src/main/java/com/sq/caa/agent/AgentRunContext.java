@@ -12,11 +12,9 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -62,7 +60,6 @@ public final class AgentRunContext {
     private final Map<UUID, Scope> scopes = new ConcurrentHashMap<>();
     private final Map<UUID, AgentRuleVerdict> verdicts = new ConcurrentHashMap<>();
     private final Map<UUID, AtomicInteger> sqlAttempts = new ConcurrentHashMap<>();
-    private final Queue<ToolTiming> timings = new ConcurrentLinkedQueue<>();
     private final AtomicReference<FinalAssessment> finalAssessment = new AtomicReference<>();
     private final AtomicBoolean finalRejected = new AtomicBoolean();
     private final AtomicBoolean compactionAnnounced = new AtomicBoolean();
@@ -311,28 +308,11 @@ public final class AgentRunContext {
     // ------------------------------------------------------------------
     // Tool timings
     // ------------------------------------------------------------------
-
-    public void recordTiming(String tool, long ms) {
-        timings.add(new ToolTiming(tool, ms));
-    }
-
-    /** Takes the next recorded timing, matching by tool name when the queue is in step. */
-    public Long takeTiming(String tool) {
-        ToolTiming head = timings.peek();
-        if (head == null) {
-            return null;
-        }
-        if (!head.tool().equals(tool)) {
-            // Should not happen - tools are executed in the order the model requested them - but a
-            // mismatch must not corrupt every later step, so the queue is resynchronised.
-            timings.poll();
-            return null;
-        }
-        return timings.poll().ms();
-    }
-
-    private record ToolTiming(String tool, long ms) {
-    }
+    //
+    // Tool-call timings live on the per-subagent RiskAgentTools instance now: with subagents running
+    // concurrently, a shared queue on this context could hand one subagent's timing to another's
+    // trace step.
+    // ------------------------------------------------------------------
 
     /** One rule's scope, kept as both a list (for row writing) and a set (for the id check). */
     private record Scope(List<UUID> ids, Set<UUID> set) {

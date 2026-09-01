@@ -68,9 +68,22 @@ provider-specific code exists outside configuration.
 Source: `backend/src/main/java/com/sq/caa/agent/AgentPrompts.java` and `RiskAgentTools.java`.
 
 The instruction design rests on one principle: **the prompt and the enforcement must agree.** The
-loop hard-gates rule coverage and the database — not the model — decides every rule verdict, so the
-prompt states both in the same terms the runtime uses. The model is never pushed toward something
-the runtime will refuse, and never invited to do something the runtime will ignore.
+runtime guarantees rule coverage structurally and the database — not the model — decides every rule
+verdict, so the prompts state both in the same terms the runtime uses. The model is never pushed
+toward something the runtime will refuse, and never invited to do something the runtime will ignore.
+
+> **Architecture update — orchestrator + rule subagents.** The run is no longer one 40-turn
+> conversation. `RiskAgentLoop` is now an orchestrator: it fixes the coverage set, then spawns **one
+> rule subagent per applicable rule** (bounded parallelism, `caa.agent.subagent-parallelism`, default
+> 3), each a fresh ReAct mini-loop with its own step budget (`caa.agent.subagent-max-steps`, default
+> 12) and the full read-only tool set plus an `evaluate_rule` verdict tool scoped to its one rule.
+> A subagent must end by submitting its rule's verdict; one that exhausts its budget without one
+> fails and is retried once on a fresh conversation, and a rule still unjudged after that fails the
+> run exactly as before. After all subagents report, the orchestrator runs **one closing
+> conversation** that is handed the full verdict table and only writes the summary, recommendations
+> and risk band. The prompts below therefore come in two voices — `subagentSystem`/`subagentTask`
+> per rule, and `summarySystem`/`summaryTask` for the close — but the procedure and the posture they
+> state are unchanged, and everything said about them below still applies voice by voice.
 
 > **What changed, and why it is the centre of the prompt design.** The agent used to state each
 > rule's verdict and estimate its score. A live run then read tool output for *"eight or more
@@ -132,16 +145,19 @@ privacy-chain transfers, sanctioned-jurisdiction wires are each named); a rule t
 trigger is still worth one sentence, because it tells the reviewer what was checked and ruled out;
 and be short, because a busy compliance officer has to act on it.
 
-### The three system-driven messages
+### The system-driven messages
 
 | Message | When | What it does |
 |---|---|---|
-| **Task** | opens the run | Names the customer and states that *N* rules apply, with the checklist fenced as untrusted data. |
-| **Coverage re-prompt** | model tries to conclude with rules outstanding | *"STOP — the analysis is not finished. N rule(s) still have no verdict"*, **naming them**, because "you missed some rules" is not actionable. Explicitly forbids summarising until they are submitted. |
-| **Conclusion re-prompt** | every rule has a verdict but nothing was submitted | *"Call the tool — an assessment written as prose is not a submission."* |
+| **Subagent task** | opens a rule subagent | Names the customer and the subagent's ONE rule (name, condition, weight, scope), with the condition fenced as untrusted data, and states the verdict protocol: *"You are finished only when evaluate_rule has accepted the verdict."* |
+| **Verdict re-prompt** | a subagent answers without submitting | *"You have not submitted a verdict yet and your conversation ends when you do"* — a bounded number of times, after which the subagent fails and the orchestrator retries it once. |
+| **Summary task** | all subagents have reported | Hands the closing conversation the full verdict table (one line per rule: verdict, score, the subagent's note) and the mechanical band as the floor, and asks for `submit_final_assessment`. |
+| **Conclusion re-prompt** | the closing conversation did not submit | *"Call the tool — an assessment written as prose is not a submission."* |
 
 There is also an `emptyTurnReprompt` for a turn that produces neither text nor a tool call, so a
-degenerate response cannot silently end a run.
+degenerate response cannot silently end a conversation. A subagent prompt deliberately never shows
+the coverage checklist: there is no checklist to lose track of, because coverage is now the
+orchestrator's structural property — one subagent per rule, one verdict per subagent.
 
 ### Tool descriptions
 

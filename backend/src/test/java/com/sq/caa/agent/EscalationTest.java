@@ -1,9 +1,5 @@
 package com.sq.caa.agent;
 
-import static com.sq.caa.agent.AgentTestFixtures.DECLINE_BURST;
-import static com.sq.caa.agent.AgentTestFixtures.SANCTIONED_WIRE;
-import static com.sq.caa.agent.AgentTestFixtures.STRUCTURING;
-import static com.sq.caa.agent.AgentTestFixtures.UNATTRIBUTED_CRYPTO;
 import static com.sq.caa.agent.ScriptedChatModel.calls;
 import static com.sq.caa.agent.ScriptedChatModel.says;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -16,13 +12,10 @@ import com.sq.caa.agent.ToolPayloads.FinalAck;
 import com.sq.caa.domain.RiskLevel;
 import com.sq.caa.domain.RiskRule;
 import java.math.BigDecimal;
-import java.time.Duration;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.springframework.ai.model.tool.ToolCallingManager;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -36,13 +29,14 @@ import tools.jackson.databind.json.JsonMapper;
  * reason goes on the record beside it, because an override nobody can read is indistinguishable from
  * a mistake.
  *
- * <p>What must never work is the other direction. A narrative that talks a scored breach down into a
- * clean review is precisely the failure this design was built to remove, so a lower band is refused
+ * <p>What must never work is the other direction. A narrative that talks a scored breach down into
+ * a clean review is precisely the failure this design was built to remove, so a lower band is refused
  * by the tool, and refused again by {@link RiskAgentLoop#settle} for the path where the model writes
  * its conclusion as prose and there is no tool call to refuse.
  *
- * <p>The fixture's four rules answer 30 + 20 + 15 + 0 = 65, which bands as HIGH; CRITICAL is
- * therefore the escalation and MEDIUM the attempted downgrade.
+ * <p>Under the orchestrator the discretionary move belongs to the closing summary conversation alone
+ * - a rule subagent has no band to propose. The fixture's four rules answer 30 + 20 + 15 + 0 = 65,
+ * which bands as HIGH; CRITICAL is therefore the escalation and MEDIUM the attempted downgrade.
  */
 class EscalationTest {
 
@@ -110,13 +104,13 @@ class EscalationTest {
     @Test
     @DisplayName("an escalated run records both bands and the reason, and is still 100% covered")
     void anEscalatedRunPersistsBothBandsAndKeepsFullCoverage() {
-        ScriptedChatModel model = new ScriptedChatModel(script(calls(
+        RoutedChatModel model = AgentTestFixtures.coveringModel(rules, calls(
                 RiskAgentTools.SUBMIT_FINAL_ASSESSMENT,
                 """
                 {"risk_level":"CRITICAL","summary":"Sanctioned wire, structuring and an \
                 unattributed transfer.","recommendations":"Escalate to the MLRO.",\
                 "escalation_justification":"Three rules fired inside one week on one account, \
-                which is the layering pattern rather than three coincidences."}""")));
+                which is the layering pattern rather than three coincidences."}"""));
 
         AgentRunResult result = run(model);
 
@@ -150,11 +144,11 @@ class EscalationTest {
     @Test
     @DisplayName("a run that is not escalated records the mechanical band with no justification")
     void anUnescalatedRunRecordsTheMechanicalBand() {
-        ScriptedChatModel model = new ScriptedChatModel(script(calls(
+        RoutedChatModel model = AgentTestFixtures.coveringModel(rules, calls(
                 RiskAgentTools.SUBMIT_FINAL_ASSESSMENT,
                 """
                 {"risk_level":"HIGH","summary":"Sanctioned wire and structuring.",\
-                "recommendations":"Open an investigation."}""")));
+                "recommendations":"Open an investigation."}"""));
 
         AgentRunResult result = run(model);
 
@@ -170,11 +164,11 @@ class EscalationTest {
     @DisplayName("a conclusion written as prose may escalate on the same terms - with a reason, and "
             + "never downwards")
     void theProsePathObeysTheSameBandRule() {
-        ScriptedChatModel model = new ScriptedChatModel(script(says("""
+        RoutedChatModel model = AgentTestFixtures.coveringModel(rules, says("""
                 Every rule has a verdict. My conclusion:
                 {"risk_level":"CRITICAL","summary":"Sanctioned wire, structuring and an \
                 unattributed transfer, all within a week.","recommendations":"Escalate to the MLRO.",\
-                "escalation_justification":"Taken together these are one layering pattern."}""")));
+                "escalation_justification":"Taken together these are one layering pattern."}"""));
 
         AgentRunResult escalated = run(model);
         assertEquals(RiskLevel.CRITICAL, escalated.riskLevel());
@@ -185,9 +179,9 @@ class EscalationTest {
         // the model's own proposal is kept only so a reviewer can see where it differed.
         AnalysisTrace ownTrace = AgentTestFixtures.trace(UUID.randomUUID());
         AgentRunContext ownContext = AgentTestFixtures.context(UUID.randomUUID(), ownTrace, rules);
-        ScriptedChatModel lowering = new ScriptedChatModel(script(says("""
+        RoutedChatModel lowering = AgentTestFixtures.coveringModel(rules, says("""
                 {"risk_level":"LOW","summary":"Nothing here concerns me.",\
-                "recommendations":"None.","escalation_justification":"I am confident."}""")));
+                "recommendations":"None.","escalation_justification":"I am confident."}"""));
 
         AgentRunResult result = run(lowering, ownContext, ownTrace);
         assertEquals(RiskLevel.HIGH, result.riskLevel(), "a written LOW cannot clear a scored HIGH");
@@ -200,18 +194,6 @@ class EscalationTest {
 
     // ------------------------------------------------------------------
 
-    /** The four rules judged one per turn, then whatever conclusion the test scripts. */
-    private List<ScriptedChatModel.Turn> script(ScriptedChatModel.Turn conclusion) {
-        List<ScriptedChatModel.Turn> turns = new ArrayList<>();
-        for (String name : List.of(SANCTIONED_WIRE, STRUCTURING, UNATTRIBUTED_CRYPTO, DECLINE_BURST)) {
-            RiskRule rule = AgentTestFixtures.ruleNamed(rules, name);
-            turns.add(calls(RiskAgentTools.EVALUATE_RULE,
-                    AgentTestFixtures.evaluateRule(rule, "The activity this rule's condition names.")));
-        }
-        turns.add(conclusion);
-        return turns;
-    }
-
     private void judgeEveryRule() {
         for (RiskRule rule : rules) {
             tools.evaluateRule(rule.getRuleId().toString(), AgentTestFixtures.sqlFor(rule),
@@ -220,19 +202,14 @@ class EscalationTest {
         assertEquals(4, context.evaluatedCount());
     }
 
-    private AgentRunResult run(ScriptedChatModel model) {
+    private AgentRunResult run(RoutedChatModel model) {
         return run(model, context, trace);
     }
 
-    private AgentRunResult run(ScriptedChatModel model, AgentRunContext runContext,
+    private AgentRunResult run(RoutedChatModel model, AgentRunContext runContext,
             AnalysisTrace runTrace) {
-        AgentProperties properties = new AgentProperties(40, 3, 3, 4096, 0.1, 32768, 1536, 10,
-                "test-model", 2, 16, Duration.ofMinutes(5), Duration.ofMinutes(10), 25);
-        RiskAgentTools runTools = new RiskAgentTools(runContext, null, null,
-                AgentTestFixtures.evaluator(runContext), jsonMapper, 25, 3);
-        RiskAgentLoop loop = new RiskAgentLoop(model, ToolCallingManager.builder().build(), jsonMapper,
-                properties);
-        AgentRunResult result = loop.execute(runContext, runTools);
+        AgentRunResult result = AgentTestFixtures.run(model, runContext,
+                AgentTestFixtures.evaluator(runContext), AgentTestFixtures.properties(12, 2));
         assertTrue(runTrace.steps().stream().anyMatch(step -> TraceStep.Type.FINAL.equals(step.type())));
         return result;
     }

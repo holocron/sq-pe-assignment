@@ -33,6 +33,13 @@ public class ModelLoadRetryingChatModel implements ChatModel {
     }
 
     @Override
+    public ChatOptions getOptions() {
+        // ChatModel.getOptions() is a default method returning null unless overridden;
+        // RiskAgentLoop.modelId() reads it to record which model served a run.
+        return delegate.getOptions();
+    }
+
+    @Override
     public ChatOptions getDefaultOptions() {
         return delegate.getDefaultOptions();
     }

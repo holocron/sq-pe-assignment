@@ -143,14 +143,58 @@ public final class AnalysisTrace {
      */
     public TraceStep toolCall(String tool, JsonNode args, String resultPreview, long ms,
             TraceStep.Note note) {
+        return toolCall(tool, args, resultPreview, ms, note, null);
+    }
+
+    /**
+     * The same, attributed to the rule whose subagent made the call ({@code ruleName} on the
+     * step); null when the orchestrator itself called the tool.
+     */
+    public TraceStep toolCall(String tool, JsonNode args, String resultPreview, long ms,
+            TraceStep.Note note, String ruleName) {
         return add(builder(TraceStep.Type.TOOL_CALL)
                 .tool(tool)
                 .args(args)
                 .resultPreview(TraceStep.truncate(resultPreview, TraceStep.PREVIEW_LIMIT))
                 .ms(ms)
+                .ruleName(ruleName)
                 .detail(note == null || note.sql() == null ? null : nodes.objectNode()
                         .put("sql", note.sql()))
                 .note(note));
+    }
+
+    /**
+     * A rule subagent started: its own ReAct mini-loop, on worker {@code worker}, attempt
+     * {@code attempt} (2 when the orchestrator is retrying a failed first attempt).
+     */
+    public TraceStep subagentStart(java.util.UUID ruleId, String ruleName, int worker, int attempt) {
+        return add(builder(TraceStep.Type.SUBAGENT)
+                .subagent(TraceStep.SubagentSpan.start(
+                        ruleId == null ? null : ruleId.toString(), ruleName, worker, attempt))
+                .text("Rule subagent started on worker " + worker + (attempt > 1
+                        ? " (attempt " + attempt + ", a retry after the first subagent failed)"
+                        : "") + ": \"" + ruleName + "\". It must submit a verdict for this rule "
+                        + "through evaluate_rule before its step budget runs out."));
+    }
+
+    /**
+     * A rule subagent finished. {@code verdict} is "triggered", "not_triggered" or "failed" (the
+     * subagent exhausted its budget without a recorded verdict); {@code score} is null on failure.
+     */
+    public TraceStep subagentEnd(java.util.UUID ruleId, String ruleName, int worker, int attempt,
+            String verdict, java.math.BigDecimal score, int stepsUsed, long durationMs) {
+        return add(builder(TraceStep.Type.SUBAGENT)
+                .subagent(TraceStep.SubagentSpan.end(
+                        ruleId == null ? null : ruleId.toString(), ruleName, worker, attempt,
+                        verdict, score, stepsUsed, durationMs))
+                .outcome("failed".equals(verdict)
+                        ? "subagent failed after " + stepsUsed + " step(s)"
+                        : verdict + " in " + stepsUsed + " step(s)")
+                .text("failed".equals(verdict)
+                        ? "Rule subagent for \"" + ruleName + "\" exhausted its step budget without "
+                                + "a recorded verdict; the rule is still unjudged."
+                        : "Rule subagent for \"" + ruleName + "\" submitted its verdict (" + verdict
+                                + ") after " + stepsUsed + " step(s) in " + durationMs + " ms."));
     }
 
     /** The gate fired: the model tried to conclude while these rules had no verdict. */
@@ -508,6 +552,8 @@ public final class AnalysisTrace {
         private JsonNode detail;
         private String subject;
         private String outcome;
+        private String ruleName;
+        private TraceStep.SubagentSpan subagent;
 
         private StepBuilder(String type) {
             this.type = type;
@@ -563,6 +609,16 @@ public final class AnalysisTrace {
             return this;
         }
 
+        private StepBuilder ruleName(String value) {
+            this.ruleName = value;
+            return this;
+        }
+
+        private StepBuilder subagent(TraceStep.SubagentSpan value) {
+            this.subagent = value;
+            return this;
+        }
+
         /** Applies a tool's note, if it produced one; a null note leaves the step as it was. */
         private StepBuilder note(TraceStep.Note value) {
             if (value == null) {
@@ -573,7 +629,7 @@ public final class AnalysisTrace {
 
         private TraceStep build(int n) {
             return new TraceStep(n, type, Instant.now(), tool, args, resultPreview, ms, text, missing,
-                    riskLevel, detail, subject, outcome);
+                    riskLevel, detail, subject, outcome, ruleName, subagent);
         }
     }
 }

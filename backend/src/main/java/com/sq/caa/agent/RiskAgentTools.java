@@ -180,6 +180,11 @@ public class RiskAgentTools {
     private final JsonMapper jsonMapper;
     private final int defaultTransactionPageSize;
     private final int maxSqlAttemptsPerRule;
+    /**
+     * Set on a rule subagent's instance: the one rule its {@code evaluate_rule} may judge. Null on
+     * the orchestrator's instance, which may evaluate any rule of the coverage set.
+     */
+    private final UUID onlyRuleId;
 
     /**
      * What each executed call did, in human terms, waiting to be attached to its trace step.
@@ -197,8 +202,19 @@ public class RiskAgentTools {
      * bounds failures at the <em>database</em>, and a threshold prompt never reaches the database;
      * charging one to the other let a rule run out of repair attempts because it had been asked
      * twice about its numbers, which is how a run ended with an unjudged rule.
+     *
+     * <p>Kept per tool instance: a rule subagent gets its own copy (keyed, in effect, by its own
+     * rule), so two concurrent subagents can never spend each other's budget.
      */
     private final Map<UUID, Integer> thresholdPrompts = new ConcurrentHashMap<>();
+
+    /**
+     * Per-call wall-clock timings, in call order on THIS instance. Moved here from
+     * {@link AgentRunContext} when the run fanned out into concurrent subagents: a shared queue
+     * could hand one subagent's timing to another's trace step, while each instance is only ever
+     * driven from its own subagent thread.
+     */
+    private final Queue<ToolTiming> timings = new ConcurrentLinkedQueue<>();
 
     public RiskAgentTools(AgentRunContext context,
             ActivitySummaryService activitySummaryService,
@@ -207,6 +223,18 @@ public class RiskAgentTools {
             JsonMapper jsonMapper,
             int defaultTransactionPageSize,
             int maxSqlAttemptsPerRule) {
+        this(context, activitySummaryService, ragService, sqlEvaluator, jsonMapper,
+                defaultTransactionPageSize, maxSqlAttemptsPerRule, null);
+    }
+
+    private RiskAgentTools(AgentRunContext context,
+            ActivitySummaryService activitySummaryService,
+            RagService ragService,
+            RuleSqlEvaluator sqlEvaluator,
+            JsonMapper jsonMapper,
+            int defaultTransactionPageSize,
+            int maxSqlAttemptsPerRule,
+            UUID onlyRuleId) {
         this.context = context;
         this.activitySummaryService = activitySummaryService;
         this.ragService = ragService;
@@ -214,6 +242,21 @@ public class RiskAgentTools {
         this.jsonMapper = jsonMapper;
         this.defaultTransactionPageSize = defaultTransactionPageSize;
         this.maxSqlAttemptsPerRule = Math.max(1, maxSqlAttemptsPerRule);
+        this.onlyRuleId = onlyRuleId;
+    }
+
+    /**
+     * The tool instance one rule subagent drives: everything this instance can do, with
+     * {@code evaluate_rule} scoped to the subagent's own rule.
+     *
+     * <p>The child shares the run's {@link AgentRunContext} - verdicts, scopes, the attempt budgets
+     * - because those are per-rule-keyed and safe for concurrent subagents, but carries its own
+     * note/timing queues and threshold-prompt counters, which are per-conversation state that two
+     * subagents must never interleave.
+     */
+    public RiskAgentTools forRule(RiskRule rule) {
+        return new RiskAgentTools(context, activitySummaryService, ragService, sqlEvaluator,
+                jsonMapper, defaultTransactionPageSize, maxSqlAttemptsPerRule, rule.getRuleId());
     }
 
     // ==================================================================
@@ -548,6 +591,15 @@ public class RiskAgentTools {
                     if (rule == null) {
                         return unknownRule(rule_id);
                     }
+                    if (onlyRuleId != null && !onlyRuleId.equals(id)) {
+                        // A rule subagent's verdict tool answers its own rule only; anything else is
+                        // a routing mistake the model can fix immediately.
+                        RiskRule own = context.rule(onlyRuleId);
+                        return new ToolError("This conversation judges exactly one rule, '"
+                                + ruleName(own) + "' (" + onlyRuleId + "); '" + rule_id
+                                + "' belongs to another subagent. Nothing was recorded.",
+                                "Call evaluate_rule again with rule_id " + onlyRuleId + ".");
+                    }
                     String query = blankToNull(sql);
                     if (query == null) {
                         return new ToolError("No SQL was given for rule '" + ruleName(rule)
@@ -825,10 +877,35 @@ public class RiskAgentTools {
             String message = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
             result = new ToolError(tool + " failed: " + message, hint);
         } finally {
-            context.recordTiming(tool, Math.max(1L, (System.nanoTime() - startedAt) / 1_000_000L));
+            recordTiming(tool, Math.max(1L, (System.nanoTime() - startedAt) / 1_000_000L));
         }
         notes.add(new PendingNote(tool, describe(result)));
         return result;
+    }
+
+    private void recordTiming(String tool, long ms) {
+        timings.add(new ToolTiming(tool, ms));
+    }
+
+    /**
+     * Takes the next recorded timing, matching by tool name when the queue is in step. Called by the
+     * loop driving this instance - per instance, so concurrent subagents never take each other's.
+     */
+    public Long takeTiming(String tool) {
+        ToolTiming head = timings.peek();
+        if (head == null) {
+            return null;
+        }
+        if (!head.tool().equals(tool)) {
+            // Should not happen - tools are executed in the order the model requested them - but a
+            // mismatch must not corrupt every later step, so the queue is resynchronised.
+            timings.poll();
+            return null;
+        }
+        return timings.poll().ms();
+    }
+
+    private record ToolTiming(String tool, long ms) {
     }
 
     /**

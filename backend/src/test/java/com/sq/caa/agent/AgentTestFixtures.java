@@ -100,6 +100,49 @@ final class AgentTestFixtures {
         return new AnalysisTrace(assessmentId, JsonNodeFactory.instance);
     }
 
+    /**
+     * Agent tuning for the orchestrator-era tests: explicit only where a test exercises it
+     * ({@code subagentMaxSteps}, {@code subagentParallelism}), everything else at its production
+     * default. {@code maxSteps} now bounds only the closing summary conversation.
+     */
+    static AgentProperties properties(int subagentMaxSteps, int subagentParallelism) {
+        return new AgentProperties(40, subagentMaxSteps, subagentParallelism, 3, 3, 4096, 0.1, 32768,
+                1536, 10, "test-model", 2, 16, java.time.Duration.ofMinutes(5),
+                java.time.Duration.ofMinutes(10), 25);
+    }
+
+    /**
+     * Drives one full orchestrated run: the given model (usually {@link RoutedChatModel}), the
+     * given SQL answers, and no Spring context.
+     */
+    static AgentRunResult run(org.springframework.ai.chat.model.ChatModel model,
+            AgentRunContext context, com.sq.caa.sql.RuleSqlEvaluator sql, AgentProperties properties) {
+        tools.jackson.databind.json.JsonMapper mapper =
+                tools.jackson.databind.json.JsonMapper.builder().build();
+        RiskAgentTools tools = new RiskAgentTools(context, null, null, sql, mapper, 25,
+                properties.maxRuleSqlAttempts());
+        RiskAgentLoop loop = new RiskAgentLoop(model,
+                org.springframework.ai.model.tool.ToolCallingManager.builder().build(), mapper,
+                properties);
+        return loop.execute(context, tools);
+    }
+
+    /**
+     * A routed model in which every rule's subagent immediately submits its verdict and the closing
+     * conversation ends with {@code summary} - the "everything just works" skeleton a test then
+     * perturbs.
+     */
+    static RoutedChatModel coveringModel(List<RiskRule> rules, ScriptedChatModel.Turn summary) {
+        RoutedChatModel model = new RoutedChatModel();
+        for (RiskRule rule : rules) {
+            model.route(rule.getRuleId().toString(), List.of(ScriptedChatModel.calls(
+                    RiskAgentTools.EVALUATE_RULE,
+                    evaluateRule(rule, "The activity this rule's condition names."))));
+        }
+        model.summary(List.of(summary));
+        return model;
+    }
+
     static AgentRunContext context(UUID assessmentId, AnalysisTrace trace, List<RiskRule> rules) {
         return context(assessmentId, trace, rules, AnalysisProgressListener.NONE);
     }

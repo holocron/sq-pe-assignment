@@ -10,6 +10,7 @@ import com.sq.caa.repository.RiskAssessmentRepository;
 import com.sq.caa.repository.RiskRuleRepository;
 import com.sq.caa.repository.TransactionRepository;
 import com.sq.caa.repository.projection.RuleActivityStats;
+import com.sq.caa.rules.ConditionEnhancer;
 import com.sq.caa.rules.DuplicateRuleNameException;
 import com.sq.caa.rules.EvaluationBatch;
 import com.sq.caa.rules.FieldCatalog;
@@ -21,6 +22,7 @@ import com.sq.caa.rules.RuleJudgement;
 import com.sq.caa.rules.RuleJudgementException;
 import com.sq.caa.rules.RuleNotFoundException;
 import com.sq.caa.rules.RuleValidator;
+import com.sq.caa.rules.RuleValidationException;
 import com.sq.caa.rules.UnknownCustomerException;
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -73,6 +75,7 @@ public class RiskRuleService {
     private final TransactionRepository transactionRepository;
     private final CustomerRepository customerRepository;
     private final ObjectProvider<RuleJudge> ruleJudgeProvider;
+    private final ObjectProvider<ConditionEnhancer> conditionEnhancerProvider;
     private final Duration batchCacheTtl;
     private final Map<UUID, CachedBatch> batchCache = new ConcurrentHashMap<>();
 
@@ -81,12 +84,14 @@ public class RiskRuleService {
             TransactionRepository transactionRepository,
             CustomerRepository customerRepository,
             ObjectProvider<RuleJudge> ruleJudgeProvider,
+            ObjectProvider<ConditionEnhancer> conditionEnhancerProvider,
             @Value("${caa.rules.batch-cache-ttl-seconds:120}") long batchCacheTtlSeconds) {
         this.ruleRepository = ruleRepository;
         this.riskAssessmentRepository = riskAssessmentRepository;
         this.transactionRepository = transactionRepository;
         this.customerRepository = customerRepository;
         this.ruleJudgeProvider = ruleJudgeProvider;
+        this.conditionEnhancerProvider = conditionEnhancerProvider;
         this.batchCacheTtl = Duration.ofSeconds(Math.max(0, batchCacheTtlSeconds));
     }
 
@@ -212,6 +217,34 @@ public class RiskRuleService {
         }
         EvaluationBatch batch = batchFor(customerId);
         return judge.judge(draft, batch);
+    }
+
+    // ------------------------------------------------------------------
+    // Condition enhancement
+    // ------------------------------------------------------------------
+
+    /**
+     * Rewrites a draft condition into prose the agent can translate into one SQL query - one model
+     * call, nothing stored. Deliberately outside any transaction, like judgement: the call takes
+     * tens of seconds and must not hold a database connection for the duration.
+     *
+     * @throws RuleValidationException when the draft is blank - there is nothing to rewrite
+     * @throws RuleJudgementException  when the model did not answer or answered unusably
+     */
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    public ConditionEnhancer.Enhancement enhanceCondition(String condition, RuleScope appliesTo) {
+        if (condition == null || condition.isBlank()) {
+            throw new RuleValidationException("thresholdLogic",
+                    "is empty; there is no draft condition to enhance");
+        }
+        ConditionEnhancer enhancer = conditionEnhancerProvider.getIfAvailable();
+        if (enhancer == null) {
+            throw new RuleJudgementException(RuleJudgementException.Reason.UNAVAILABLE,
+                    "No condition enhancer is configured, so a rule condition cannot be "
+                            + "rewritten. Rule conditions are natural language and there is "
+                            + "nothing to rephrase them mechanically.");
+        }
+        return enhancer.enhance(condition, requireScope(appliesTo));
     }
 
     // ------------------------------------------------------------------

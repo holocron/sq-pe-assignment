@@ -9,8 +9,19 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
 import java.util.StringJoiner;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.messages.AssistantMessage;
@@ -33,40 +44,44 @@ import tools.jackson.databind.json.JsonMapper;
 import tools.jackson.databind.node.JsonNodeFactory;
 
 /**
- * The reason/act loop and the rule-coverage gate that guards its exit.
+ * The orchestrator of an analysis run: one rule subagent per applicable rule, then one closing
+ * conversation that writes the assessment over the verdict table.
+ *
+ * <h2>Why subagents</h2>
+ * <p>The run used to be a single 40-turn conversation that investigated, judged every rule and then
+ * summarised. One conversation meant one ever-growing transcript (the compactor's whole existence),
+ * one shared budget for twelve rules, and a model that had to keep the whole checklist in its head.
+ * Now each applicable rule gets its own <b>rule subagent</b>: a fresh ReAct mini-loop with the full
+ * read-only tool set plus a verdict tool scoped to that one rule
+ * ({@link RiskAgentTools#forRule}). It must end by submitting a verdict through
+ * {@code evaluate_rule}; a subagent that exhausts its step budget without one reports failure, and
+ * the orchestrator retries it once on a fresh conversation.
  *
  * <p>Spring AI 2.x does not execute tools inside {@code ChatModel.call} - tool execution moved to a
- * ChatClient advisor - so calling the model directly hands the tool calls back unexecuted and this
- * class drives the loop itself. That is what makes the gate possible: nothing between the model and
- * the database gets to decide when the analysis is over except the code below.
+ * ChatClient advisor - so calling the model directly hands the tool calls back unexecuted and the
+ * loops here drive them. That is what makes the gate possible: nothing between the model and the
+ * database gets to decide when the analysis is over except this code.
  *
- * <h2>The rule-coverage guarantee</h2>
- * <p>A rule condition is prose; the model reads it, writes the SELECT that answers it and
- * {@code evaluate_rule} runs that query. There is no engine left to quietly close a rule the model
- * skipped, so coverage is guaranteed by refusing to call such a run finished rather than by filling
- * the gap.
+ * <h2>The rule-coverage guarantee, unchanged</h2>
+ * <p>A rule condition is prose; the subagent reads it, writes the SELECT that answers it and
+ * {@code evaluate_rule} runs that query. There is no engine left to quietly close a rule, so
+ * coverage is guaranteed by refusing to call such a run finished:
  * <ol>
  *   <li>The coverage set is fixed in the {@link AgentRunContext} before the first turn.</li>
  *   <li>{@code evaluate_rule} is the only way into the evaluated set, and only a query that actually
  *       executed gets a rule in. A rejected or failed query records nothing.</li>
- *   <li>If the model tries to conclude - by calling {@code submit_final_assessment} or simply by
- *       answering without any tool call - while a rule is still unjudged, the loop does <b>not</b>
- *       exit. It records a {@code coverage_reprompt} step, appends a user message naming every
- *       outstanding rule by name and id, and continues.</li>
- *   <li>Reprompts are bounded by {@code caa.agent.max-coverage-reprompts} and turns by
- *       {@code caa.agent.max-steps}, so a stubborn model cannot burn the whole budget arguing.</li>
- *   <li>{@link #settle} then builds one outcome per rule the agent judged. If any rule is left over,
- *       {@link #execute} throws {@link AgentRunFailedException} carrying that partial result and an
- *       {@link IncompleteRuleCoverageException} naming the unjudged rules: the caller persists the
- *       run as {@code FAILED}, keeping every verdict that was obtained. A partial analysis is never
- *       reported as {@code COMPLETED}.</li>
+ *   <li>A rule whose subagent failed twice never received a verdict; {@link #settle} then builds one
+ *       outcome per rule that was judged and {@link #execute} throws {@link AgentRunFailedException}
+ *       carrying that partial result and an {@link IncompleteRuleCoverageException} naming the
+ *       unjudged rules: the caller persists the run as {@code FAILED}, keeping every verdict that
+ *       was obtained. A partial analysis is never reported as {@code COMPLETED}.</li>
  * </ol>
  *
  * <h2>Which band is recorded</h2>
  * <p>{@link #settle} sums the per-rule scores - each one a rule's weight because that rule's query
  * returned rows, or zero because it did not - and bands the total. That mechanical band is the floor.
- * The agent's own proposal is honoured only when it is <em>higher</em> and comes with a
- * justification, which is recorded beside it; anything lower is discarded here exactly as the tool
+ * The closing conversation's own proposal is honoured only when it is <em>higher</em> and comes with
+ * a justification, which is recorded beside it; anything lower is discarded here exactly as the tool
  * refuses it, so a narrative can never talk a scored breach down into a clean review.
  *
  * <p>The cost of this design is stated rather than hidden: the model writes the query afresh each
@@ -74,6 +89,15 @@ import tools.jackson.databind.node.JsonNodeFactory;
  * has run - the verdict is its row count and the score is the rule's weight, never an estimate - and
  * the coverage claim: a {@code COMPLETED} run has a verdict for every applicable rule, or it is not
  * {@code COMPLETED}.
+ *
+ * <h2>Concurrency</h2>
+ * <p>Subagents run on a per-run pool bounded by {@code caa.agent.subagent-parallelism}; the pool is
+ * shut down before {@link #execute} returns, so it never outlives the run. Shared state is either
+ * immutable (the coverage set), per-rule keyed (verdicts, SQL attempt budgets, scopes in
+ * {@link AgentRunContext}) or per-subagent (each subagent gets its own {@link RiskAgentTools}
+ * instance, its own conversation and its own {@link ConversationCompactor}). Cancellation is polled
+ * between steps of every subagent and while the orchestrator waits on the fan-out, and lands at the
+ * next step boundary.
  */
 @Component
 public class RiskAgentLoop {
@@ -85,68 +109,105 @@ public class RiskAgentLoop {
 
     private static final BigDecimal ZERO = BigDecimal.ZERO.setScale(2, RoundingMode.HALF_UP);
 
-    /** How often one run may replay a turn after the server refused the prompt as too large. */
+    /** How often one conversation may replay a turn after the server refused the prompt as too large. */
     private static final int MAX_CONTEXT_RETRIES = 3;
+
+    /** How often a failed rule subagent is re-run: once, on a fresh conversation. */
+    private static final int MAX_SUBAGENT_ATTEMPTS = 2;
+
+    /** Tools a rule subagent may call: the full read-only set plus its own verdict tool. */
+    private static final Set<String> SUBAGENT_TOOLS = Set.of(
+            RiskAgentTools.GET_CUSTOMER_PROFILE,
+            RiskAgentTools.GET_CUSTOMER_ACTIVITY_SUMMARY,
+            RiskAgentTools.LIST_TRANSACTIONS,
+            RiskAgentTools.GET_TRANSACTION_DETAILS,
+            RiskAgentTools.SEARCH_POLICY_KNOWLEDGE,
+            RiskAgentTools.EVALUATE_RULE);
 
     private final ChatModel chatModel;
     private final ToolCallingManager toolCallingManager;
     private final JsonMapper jsonMapper;
     private final AgentProperties properties;
-    private final ConversationCompactor compactor;
+    private final AgentTracer tracer;
 
+    /** Without the verbose file trace; for tests that do not exercise {@link AgentTracer}. */
     public RiskAgentLoop(ChatModel chatModel, ToolCallingManager toolCallingManager,
             JsonMapper jsonMapper, AgentProperties properties) {
+        this(chatModel, toolCallingManager, jsonMapper, properties, AgentTracer.noop());
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public RiskAgentLoop(ChatModel chatModel, ToolCallingManager toolCallingManager,
+            JsonMapper jsonMapper, AgentProperties properties, AgentTracer tracer) {
         this.chatModel = chatModel;
         this.toolCallingManager = toolCallingManager;
         this.jsonMapper = jsonMapper;
         this.properties = properties;
-        this.compactor = new ConversationCompactor(properties.promptBudgetTokens(),
-                properties.keepRecentMessages());
+        this.tracer = tracer == null ? AgentTracer.noop() : tracer;
     }
 
     /** Model id this loop will drive, recorded on the run before it starts. */
     public String modelId() {
-        ChatOptions defaults = chatModel.getOptions();
-        String configured = defaults == null ? null : defaults.getModel();
+        ChatOptions options = chatModel.getOptions();
+        if (options == null || options.getModel() == null || options.getModel().isBlank()) {
+            // getOptions() is a default interface method some wrappers leave unimplemented;
+            // getDefaultOptions() is the one OpenAiChatModel reliably fills.
+            options = chatModel.getDefaultOptions();
+        }
+        String configured = options == null ? null : options.getModel();
         return properties.modelOr(configured == null || configured.isBlank() ? FALLBACK_MODEL : configured);
     }
 
     /**
-     * Runs the whole ReAct conversation. Blocking and slow by nature - the caller must already be off
-     * the request thread.
+     * Runs the whole analysis: fans the applicable rules out to their subagents, retries the failed
+     * ones once, then has the closing conversation write the assessment over the verdict table.
+     * Blocking and slow by nature - the caller must already be off the request thread.
      *
      * @return the settled run, only ever with every applicable rule judged
-     * @throws AgentRunFailedException when the conversation broke, or when it ended with rules still
-     *                                 unjudged; {@link AgentRunFailedException#result()} carries
-     *                                 everything the agent did establish
+     * @throws AgentRunFailedException when a subagent conversation broke, or when the fan-out ended
+     *                                 with rules still unjudged; {@link AgentRunFailedException#result()}
+     *                                 carries everything the subagents did establish
      */
     public AgentRunResult execute(AgentRunContext context, RiskAgentTools tools) {
         long startedAt = System.currentTimeMillis();
         String model = modelId();
         context.trace().started(model, context.customer().getFullName(), context.ruleCount());
-        int steps;
+        tracer.runStarted(context.assessmentId(), context.customer().getFullName(), model,
+                context.ruleCount());
         try {
-            steps = converse(context, tools, model);
+            fanOut(context, tools, model);
+            if (context.coverageComplete()) {
+                // The summary conversation runs only over a full verdict table; a run with unjudged
+                // rules skips it and fails below, exactly as the old loop did.
+                concludeWithSummary(context, tools, model);
+            }
         } catch (CancellationSignal signal) {
             // Cancelled at the user's request: settle from the verdicts already obtained, exactly as
-            // a broken conversation is settled - a cancelled run keeps its work and is persisted
-            // CANCELLED, never COMPLETED and never silently dropped.
+            // a broken run is settled - a cancelled run keeps its work and is persisted CANCELLED,
+            // never COMPLETED and never silently dropped.
+            context.trace().cancelled();
             AgentRunResult partial = settle(context, context.stepsTaken(),
                     System.currentTimeMillis() - startedAt);
+            tracer.note(context.assessmentId(), "CANCELLED",
+                    "The analysis was cancelled at the user's request after " + context.stepsTaken()
+                            + " step(s); the verdicts obtained so far are kept.");
             throw new AgentRunCancelledException(partial);
         } catch (RuntimeException e) {
-            // The conversation died - but everything the agent had already submitted is still in the
-            // context, so the run is settled from it rather than thrown away. The caller marks the
-            // run FAILED with this cause and keeps the verdicts that were obtained.
+            // A conversation died - but everything the subagents had already submitted is still in
+            // the context, so the run is settled from it rather than thrown away. The caller marks
+            // the run FAILED with this cause and keeps the verdicts that were obtained.
             AgentRunResult partial = settle(context, context.stepsTaken(),
                     System.currentTimeMillis() - startedAt);
+            tracer.note(context.assessmentId(), "RUN FAILED",
+                    e.getClass().getSimpleName() + ": " + e.getMessage());
             throw new AgentRunFailedException(partial, e);
         }
-        AgentRunResult result = settle(context, steps, System.currentTimeMillis() - startedAt);
+        AgentRunResult result = settle(context, context.stepsTaken(),
+                System.currentTimeMillis() - startedAt);
         if (!result.coverageComplete()) {
-            // The gate's last line. The loop is out of turns or out of reprompts and rules are still
-            // unjudged; there is no backfill to close them, so this run must not be reported as a
-            // finished analysis.
+            // The gate's last line. Every subagent - first run and retry - is done and rules are
+            // still unjudged; there is no backfill to close them, so this run must not be reported
+            // as a finished analysis.
             log.warn("Analysis {}: {} of {} rule(s) never received a verdict; the run is recorded as "
                             + "FAILED with the {} verdict(s) it did obtain", context.assessmentId(),
                     result.unjudgedRules().size(), result.rulesTotal(), result.rulesJudged());
@@ -157,12 +218,370 @@ public class RiskAgentLoop {
     }
 
     // ------------------------------------------------------------------
-    // The loop
+    // The fan-out
     // ------------------------------------------------------------------
 
-    private int converse(AgentRunContext context, RiskAgentTools tools, String model) {
-        List<ToolCallback> callbacks = List.of(ToolCallbacks.from(tools));
-        var options = OpenAiChatOptions.builder()
+    /**
+     * Runs every applicable rule's subagent on a bounded per-run pool and waits for all of them.
+     *
+     * <p>The wait polls in slices rather than blocking on one future at a time so a cancellation
+     * lands promptly - within a slice of being requested - instead of after the slowest subagent.
+     * The pool is shut down on the way out, cancelled or not: it must never outlive the run.
+     */
+    private void fanOut(AgentRunContext context, RiskAgentTools tools, String model) {
+        List<RiskRule> rules = context.rules();
+        if (rules.isEmpty()) {
+            return;
+        }
+        int parallelism = Math.min(properties.subagentParallelism(), rules.size());
+        ExecutorService pool = Executors.newFixedThreadPool(parallelism, new SubagentThreadFactory());
+        // Worker ids identify the pool slot in the trace; they are recycled as subagents finish.
+        Queue<Integer> freeWorkers = new ConcurrentLinkedQueue<>();
+        for (int slot = 1; slot <= parallelism; slot++) {
+            freeWorkers.add(slot);
+        }
+        try {
+            List<Future<?>> futures = new ArrayList<>(rules.size());
+            for (RiskRule rule : rules) {
+                futures.add(pool.submit(() -> runWithRetry(context, tools, rule, model, freeWorkers)));
+            }
+            for (Future<?> future : futures) {
+                await(context, future, futures);
+            }
+        } finally {
+            pool.shutdownNow();
+            try {
+                if (!pool.awaitTermination(10, TimeUnit.SECONDS)) {
+                    log.warn("Analysis {}: subagent pool did not stop within 10 seconds",
+                            context.assessmentId());
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /** Waits on one subagent task, aborting the whole fan-out promptly when cancellation lands. */
+    private void await(AgentRunContext context, Future<?> future, List<Future<?>> futures) {
+        while (true) {
+            if (context.trace().isCancellationRequested()) {
+                futures.forEach(task -> task.cancel(true));
+                throw new CancellationSignal();
+            }
+            try {
+                future.get(100, TimeUnit.MILLISECONDS);
+                return;
+            } catch (TimeoutException e) {
+                // Not done yet; poll again.
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new CancellationSignal();
+            } catch (ExecutionException e) {
+                if (e.getCause() instanceof CancellationSignal signal) {
+                    throw signal;
+                }
+                if (e.getCause() instanceof RuntimeException runtime) {
+                    throw runtime;
+                }
+                throw new IllegalStateException(e.getCause());
+            }
+        }
+    }
+
+    /**
+     * One rule's subagent, with the orchestrator's retry policy around it: a subagent that ends
+     * without a verdict is re-run once, on a fresh conversation, and the retry is announced in both
+     * traces.
+     */
+    private void runWithRetry(AgentRunContext context, RiskAgentTools tools, RiskRule rule,
+            String model, Queue<Integer> freeWorkers) {
+        Integer worker = freeWorkers.poll();
+        if (worker == null) {
+            worker = 0; // cannot happen - the pool has one slot per id - but never break a run on it
+        }
+        try {
+            for (int attempt = 1; attempt <= MAX_SUBAGENT_ATTEMPTS; attempt++) {
+                SubagentOutcome outcome = runSubagent(context, tools, rule, worker, attempt, model);
+                if (outcome.judged()) {
+                    return;
+                }
+                if (context.trace().isCancellationRequested()) {
+                    throw new CancellationSignal();
+                }
+                if (attempt < MAX_SUBAGENT_ATTEMPTS) {
+                    log.warn("Analysis {}: the subagent for rule \"{}\" ended without a verdict; "
+                                    + "retrying once with a fresh conversation",
+                            context.assessmentId(), displayName(rule));
+                    context.trace().reprompt("The subagent for rule \"" + displayName(rule)
+                            + "\" exhausted its step budget without submitting a verdict; the "
+                            + "orchestrator is retrying it once with a fresh conversation.");
+                    tracer.note(context.assessmentId(), "SUBAGENT RETRY",
+                            "Rule \"" + displayName(rule) + "\": first subagent failed without a "
+                                    + "verdict; retrying with a fresh conversation.");
+                }
+            }
+        } finally {
+            freeWorkers.offer(worker);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // One rule subagent's mini-loop
+    // ------------------------------------------------------------------
+
+    private record SubagentOutcome(boolean judged) {
+    }
+
+    /**
+     * The ReAct mini-loop of one rule subagent.
+     *
+     * <p>Fresh conversation, own step budget ({@code caa.agent.subagent-max-steps}), the full
+     * read-only tool set plus a verdict tool scoped to {@code rule}. The loop ends the moment the
+     * rule has a recorded verdict; exhausting the budget without one is a failure the orchestrator
+     * retries once. Cancellation is polled between turns and aborts immediately.
+     */
+    private SubagentOutcome runSubagent(AgentRunContext context, RiskAgentTools sharedTools,
+            RiskRule rule, int worker, int attempt, String model) {
+        long startedAt = System.currentTimeMillis();
+        String ruleName = displayName(rule);
+        context.trace().subagentStart(rule.getRuleId(), ruleName, worker, attempt);
+        tracer.subagentStarted(context.assessmentId(), ruleName, worker, attempt);
+
+        int steps = 0;
+        int contextRetries = 0;
+        int verdictReprompts = 0;
+        RiskAgentTools tools = sharedTools.forRule(rule);
+        List<ToolCallback> callbacks = callbacksFor(tools, SUBAGENT_TOOLS);
+        OpenAiChatOptions options = options(callbacks, model);
+        ConversationCompactor compactor =
+                new ConversationCompactor(properties.promptBudgetTokens(), properties.keepRecentMessages());
+
+        List<Message> history = new ArrayList<>();
+        history.add(new SystemMessage(AgentPrompts.subagentSystem()));
+        history.add(new UserMessage(AgentPrompts.subagentTask(context.customer(), rule)));
+
+        while (steps < properties.subagentMaxSteps()) {
+            // The cancellation flag is polled between turns, so a cancel lands at the next step
+            // boundary rather than inside a model call or half-way through a tool batch.
+            if (context.trace().isCancellationRequested()) {
+                log.info("Analysis {}: cancellation requested; subagent for \"{}\" aborts after {} "
+                        + "step(s)", context.assessmentId(), ruleName, steps);
+                throw new CancellationSignal();
+            }
+            // The schemas ride along with every request, so they are part of the budget, and the
+            // budget is re-derived each turn because calibration keeps moving the estimate.
+            history = fitToContext(context, history, compactor.estimateTools(callbacks), compactor);
+            Prompt prompt = new Prompt(history, options);
+            int estimated = compactor.estimate(history) + compactor.estimateTools(callbacks);
+            // Counted before the call, not after: a turn the model server refuses is still a turn,
+            // and a failed run must report how far it actually got.
+            steps++;
+            context.recordStep();
+            ChatResponse response;
+            try {
+                response = chatModel.call(prompt);
+            } catch (RuntimeException e) {
+                // A context overflow is recoverable: the transcript is the only thing that grew, so
+                // tighten the estimator and replay the turn instead of failing the subagent.
+                if (isContextOverflow(e) && contextRetries++ < MAX_CONTEXT_RETRIES
+                        && compactor.tighten()) {
+                    log.warn("Analysis {}: the model server rejected a subagent prompt as too large; "
+                            + "compacting harder and retrying the turn", context.assessmentId(), e);
+                    context.trace().reprompt("The model server refused the prompt as too large for "
+                            + "its context window; the transcript was compacted further and the turn "
+                            + "retried.");
+                    tracer.note(context.assessmentId(), "CONTEXT RETRY",
+                            "The prompt was refused as too large; compacted further and retried.");
+                    continue;
+                }
+                // The conversation broke. The subagent reports failure; the retry policy is the
+                // orchestrator's, not this loop's.
+                log.warn("Analysis {}: the subagent for rule \"{}\" died after {} step(s)",
+                        context.assessmentId(), ruleName, steps, e);
+                break;
+            }
+            calibrate(context, estimated, response, compactor);
+
+            AssistantMessage assistant = response.getResult() == null
+                    ? null
+                    : response.getResult().getOutput();
+            String text = assistant == null ? null : assistant.getText();
+
+            if (response.hasToolCalls()) {
+                if (hasText(text)) {
+                    context.trace().assistant(text);
+                    tracer.assistant(context.assessmentId(), text);
+                }
+                ToolExecutionResult execution = toolCallingManager.executeToolCalls(prompt, response);
+                List<Message> updated = new ArrayList<>(execution.conversationHistory());
+                recordToolCalls(context, tools, assistant, updated, ruleName);
+                history = updated;
+                if (context.isEvaluated(rule.getRuleId())) {
+                    break;
+                }
+                continue;
+            }
+
+            // No tool calls. Without a recorded verdict the subagent is not finished - the verdict
+            // is the whole point of its existence - so it is told so, a bounded number of times.
+            if (hasText(text)) {
+                context.trace().assistant(text);
+                tracer.assistant(context.assessmentId(), text);
+            }
+            if (context.isEvaluated(rule.getRuleId())) {
+                break;
+            }
+            if (++verdictReprompts > properties.maxCoverageReprompts()) {
+                break;
+            }
+            if (assistant != null) {
+                history.add(assistant);
+            }
+            history.add(new UserMessage(hasText(text)
+                    ? AgentPrompts.subagentVerdictReprompt(rule)
+                    : AgentPrompts.emptyTurnReprompt()));
+        }
+
+        AgentRuleVerdict verdict = context.verdict(rule.getRuleId());
+        long durationMs = System.currentTimeMillis() - startedAt;
+        String state = verdict == null ? "failed" : verdict.triggered() ? "triggered" : "not_triggered";
+        context.trace().subagentEnd(rule.getRuleId(), ruleName, worker, attempt, state,
+                verdict == null ? null : verdict.score(), steps, durationMs);
+        tracer.subagentEnded(context.assessmentId(), ruleName, worker, attempt, state,
+                verdict == null ? null : verdict.score().toPlainString(), steps, durationMs);
+        return new SubagentOutcome(verdict != null);
+    }
+
+    // ------------------------------------------------------------------
+    // The closing summary conversation
+    // ------------------------------------------------------------------
+
+    /**
+     * The orchestrator's one conversation: given the full verdict table, write the summary, the
+     * recommendations and the risk level - through {@code submit_final_assessment}, or as prose,
+     * accepted under the same rule as always (the mechanical band is the floor).
+     *
+     * <p>Runs only at full coverage. If the model never concludes, {@link #settle} generates the
+     * narrative from the verdicts themselves, exactly as before.
+     */
+    private void concludeWithSummary(AgentRunContext context, RiskAgentTools tools, String model) {
+        List<ToolCallback> callbacks =
+                callbacksFor(tools, Set.of(RiskAgentTools.SUBMIT_FINAL_ASSESSMENT));
+        OpenAiChatOptions options = options(callbacks, model);
+        ConversationCompactor compactor =
+                new ConversationCompactor(properties.promptBudgetTokens(), properties.keepRecentMessages());
+
+        List<Message> history = new ArrayList<>();
+        history.add(new SystemMessage(AgentPrompts.summarySystem()));
+        history.add(new UserMessage(AgentPrompts.summaryTask(context.customer(), context.rules(),
+                context::verdict, context.totalScore(), context.mechanicalRiskLevel())));
+
+        int maxTurns = Math.min(properties.maxSteps(), 2 + properties.maxCoverageReprompts());
+        int steps = 0;
+        int contextRetries = 0;
+        int conclusionReprompts = 0;
+        while (steps < maxTurns) {
+            if (context.trace().isCancellationRequested()) {
+                throw new CancellationSignal();
+            }
+            history = fitToContext(context, history, compactor.estimateTools(callbacks), compactor);
+            Prompt prompt = new Prompt(history, options);
+            int estimated = compactor.estimate(history) + compactor.estimateTools(callbacks);
+            steps++;
+            context.recordStep();
+            ChatResponse response;
+            try {
+                response = chatModel.call(prompt);
+            } catch (RuntimeException e) {
+                if (isContextOverflow(e) && contextRetries++ < MAX_CONTEXT_RETRIES
+                        && compactor.tighten()) {
+                    context.trace().reprompt("The model server refused the prompt as too large for "
+                            + "its context window; the transcript was compacted further and the turn "
+                            + "retried.");
+                    tracer.note(context.assessmentId(), "CONTEXT RETRY",
+                            "The prompt was refused as too large; compacted further and retried.");
+                    continue;
+                }
+                throw e;
+            }
+            calibrate(context, estimated, response, compactor);
+
+            AssistantMessage assistant = response.getResult() == null
+                    ? null
+                    : response.getResult().getOutput();
+            String text = assistant == null ? null : assistant.getText();
+
+            if (response.hasToolCalls()) {
+                if (hasText(text)) {
+                    context.trace().assistant(text);
+                    tracer.assistant(context.assessmentId(), text);
+                }
+                ToolExecutionResult execution = toolCallingManager.executeToolCalls(prompt, response);
+                List<Message> updated = new ArrayList<>(execution.conversationHistory());
+                recordToolCalls(context, tools, assistant, updated, null);
+                history = updated;
+                if (context.consumeConclusionRejected()) {
+                    // Full coverage is a precondition of this phase, so the gate should never fire
+                    // here; if it does, name what is missing and let the run fail honestly below.
+                    context.trace().reprompt("The final assessment was rejected with rules still "
+                            + "open; the run will be settled from the verdicts on record.");
+                    return;
+                }
+                if (context.isConcluded()) {
+                    return;
+                }
+                continue;
+            }
+
+            // No tool calls: the model considers itself finished. A parseable written assessment is
+            // accepted exactly as in the old loop - coverage is complete, which is the only
+            // condition under which this phase runs at all.
+            if (hasText(text)) {
+                context.trace().assistant(text);
+                tracer.assistant(context.assessmentId(), text);
+            }
+            FinalAssessment written = FinalAssessmentParser.parse(text, jsonMapper);
+            if (written != null) {
+                context.conclude(written);
+                context.trace().proseFinal(written.riskLevel().name(), written.summary());
+                log.info("Analysis {}: the closing assessment arrived as prose and was accepted",
+                        context.assessmentId());
+                return;
+            }
+            if (++conclusionReprompts > properties.maxCoverageReprompts()) {
+                context.trace().reprompt("The model stopped without submitting an assessment; the "
+                        + "summary is generated from the verdicts themselves.");
+                return;
+            }
+            context.trace().reprompt("No assessment was submitted; asking the model to conclude.");
+            if (assistant != null) {
+                history.add(assistant);
+            }
+            history.add(new UserMessage(hasText(text)
+                    ? AgentPrompts.conclusionReprompt()
+                    : AgentPrompts.emptyTurnReprompt()));
+        }
+        context.trace().reprompt("The closing conversation exhausted its turns without an "
+                + "assessment; the summary is generated from the verdicts themselves.");
+    }
+
+    // ------------------------------------------------------------------
+    // Shared loop machinery
+    // ------------------------------------------------------------------
+
+    /** The tool callbacks of {@code tools} restricted to the named tools. */
+    private static List<ToolCallback> callbacksFor(RiskAgentTools tools, Set<String> names) {
+        List<ToolCallback> callbacks = new ArrayList<>();
+        for (ToolCallback callback : ToolCallbacks.from(tools)) {
+            if (names.contains(callback.getToolDefinition().name())) {
+                callbacks.add(callback);
+            }
+        }
+        return List.copyOf(callbacks);
+    }
+
+    private OpenAiChatOptions options(List<ToolCallback> callbacks, String model) {
+        return OpenAiChatOptions.builder()
                 // Must be the OpenAI options builder: OpenAiChatModel casts the prompt options to its
                 // own type, and the generic ToolCallingChatOptions builder trips a ClassCastException
                 // at call time.
@@ -179,168 +598,17 @@ public class RiskAgentLoop {
                 .timeout(properties.requestTimeout())
                 .maxRetries(1)
                 .build();
-
-        List<Message> history = new ArrayList<>();
-        history.add(new SystemMessage(AgentPrompts.system()));
-        history.add(new UserMessage(AgentPrompts.task(context.customer(), context.rules())));
-
-        int steps = 0;
-        int coverageReprompts = 0;
-        int conclusionReprompts = 0;
-        int contextRetries = 0;
-
-        while (steps < properties.maxSteps()) {
-            // The cancellation flag is polled between turns, so a cancel lands at the next step
-            // boundary rather than inside a model call or half-way through a tool batch.
-            if (context.trace().isCancellationRequested()) {
-                log.info("Analysis {}: cancellation requested; aborting after {} step(s)",
-                        context.assessmentId(), steps);
-                context.trace().cancelled();
-                throw new CancellationSignal();
-            }
-            // The schemas ride along with every request, so they are part of the budget, and the
-            // budget is re-derived each turn because calibration keeps moving the estimate.
-            history = fitToContext(context, history, compactor.estimateTools(callbacks));
-            Prompt prompt = new Prompt(history, options);
-            int estimated = compactor.estimate(history) + compactor.estimateTools(callbacks);
-            // Counted before the call, not after: a turn the model server refuses is still a turn,
-            // and a failed run must report how far it actually got.
-            steps++;
-            context.recordStep();
-            ChatResponse response;
-            try {
-                response = chatModel.call(prompt);
-            } catch (RuntimeException e) {
-                // A context overflow is recoverable: the transcript is the only thing that grew, so
-                // tighten the estimator and replay the turn against a harder-compacted history
-                // instead of losing the run. Anything else is a real failure.
-                if (isContextOverflow(e) && contextRetries++ < MAX_CONTEXT_RETRIES
-                        && compactor.tighten()) {
-                    log.warn("Analysis {}: the model server rejected the prompt as too large; "
-                            + "compacting harder and retrying the turn", context.assessmentId(), e);
-                    context.trace().reprompt("The model server refused the prompt as too large for "
-                            + "its context window; the transcript was compacted further and the turn "
-                            + "retried.");
-                    continue;
-                }
-                throw e;
-            }
-            calibrate(context, estimated, response);
-
-            AssistantMessage assistant = response.getResult() == null
-                    ? null
-                    : response.getResult().getOutput();
-            String text = assistant == null ? null : assistant.getText();
-
-            if (response.hasToolCalls()) {
-                if (hasText(text)) {
-                    context.trace().assistant(text);
-                }
-                ToolExecutionResult execution = toolCallingManager.executeToolCalls(prompt, response);
-                List<Message> updated = new ArrayList<>(execution.conversationHistory());
-                recordToolCalls(context, tools, assistant, updated);
-                history = updated;
-
-                if (context.consumeConclusionRejected()) {
-                    // The gate fired inside submit_final_assessment, which already recorded the
-                    // coverage_reprompt step. Name the outstanding rules and keep going.
-                    List<RiskRule> stillMissing = context.missingRules();
-                    if (stillMissing.isEmpty()) {
-                        // A later tool call in the same batch closed the coverage set - the model
-                        // emitted [submit_final_assessment, evaluate_rule] in one turn.
-                        // Telling it that "0 rule(s) still have no verdict" would be a lie and would
-                        // burn a coverage reprompt on a run that is now ready to conclude; ask it for
-                        // the conclusion instead.
-                        if (++conclusionReprompts > properties.maxCoverageReprompts()) {
-                            context.trace().reprompt("The model kept concluding before its own last "
-                                    + "verdict landed; every rule has a verdict, so the summary is "
-                                    + "generated from the verdicts themselves.");
-                            break;
-                        }
-                        context.trace().reprompt("The final assessment was rejected because a rule was "
-                                + "still open when it arrived, but the same turn closed the coverage "
-                                + "set. Asking the model to submit the assessment again.");
-                        history.add(new UserMessage(AgentPrompts.conclusionReprompt()));
-                        continue;
-                    }
-                    if (++coverageReprompts > properties.maxCoverageReprompts()) {
-                        logExhausted(context);
-                        break;
-                    }
-                    history.add(new UserMessage(AgentPrompts.coverageReprompt(stillMissing)));
-                    continue;
-                }
-                if (context.isConcluded()) {
-                    break;
-                }
-                continue;
-            }
-
-            // No tool calls: the model considers itself finished.
-            if (hasText(text)) {
-                context.trace().assistant(text);
-            }
-            List<RiskRule> missing = context.missingRules();
-            if (!missing.isEmpty()) {
-                context.trace().coverageReprompt(
-                        missing.stream().map(rule -> rule.getRuleId().toString()).toList(),
-                        missing.stream().map(RiskAgentLoop::displayName).toList());
-                if (++coverageReprompts > properties.maxCoverageReprompts()) {
-                    logExhausted(context);
-                    break;
-                }
-                if (assistant != null) {
-                    history.add(assistant);
-                }
-                history.add(new UserMessage(AgentPrompts.coverageReprompt(missing)));
-                continue;
-            }
-            if (!context.isConcluded()) {
-                // Coverage is complete at this point - the block above returned otherwise - so a
-                // conclusion the model wrote as prose instead of calling the tool is a formatting
-                // failure, not a missing analysis. Observed live: the model printed the exact JSON
-                // the tool wanted inside a paragraph, and the loop paid two more round trips of an
-                // 8m36s run to get the same answer through the tool. Accept it, and record in the
-                // trace that it arrived as prose.
-                FinalAssessment written = FinalAssessmentParser.parse(text, jsonMapper);
-                if (written != null) {
-                    context.conclude(written);
-                    context.trace().proseFinal(written.riskLevel().name(), written.summary());
-                    log.info("Analysis {}: the model wrote its final assessment as prose; every rule "
-                            + "already had a verdict, so it was accepted without another round trip",
-                            context.assessmentId());
-                    break;
-                }
-                if (++conclusionReprompts > properties.maxCoverageReprompts()) {
-                    context.trace().reprompt("The model stopped without submitting an assessment; "
-                            + "every rule has a verdict, so the summary is generated from the "
-                            + "verdicts themselves.");
-                    break;
-                }
-                context.trace().reprompt("Every rule has a verdict but no assessment was submitted; "
-                        + "asking the model to conclude.");
-                if (assistant != null) {
-                    history.add(assistant);
-                }
-                history.add(new UserMessage(hasText(text)
-                        ? AgentPrompts.conclusionReprompt()
-                        : AgentPrompts.emptyTurnReprompt()));
-                continue;
-            }
-            break;
-        }
-        return steps;
     }
 
     /**
      * Compacts the transcript when it is about to overflow the model server's context window.
      *
-     * <p>Without this the loop dies mid-run: a full analysis is around thirty turns, each appending
-     * an assistant message and a page of tool output, and the request is refused outright once the
-     * window is exceeded. Compaction is logged and traced, because a reviewer reading the transcript
-     * must be able to see that the model was working from an abridged history.
+     * <p>Compaction is per conversation - each subagent owns its {@link ConversationCompactor} - and
+     * is logged and traced, because a reviewer reading the transcript must be able to see that the
+     * model was working from an abridged history.
      */
-    private List<Message> fitToContext(AgentRunContext context, List<Message> history, int toolTokens) {
+    private List<Message> fitToContext(AgentRunContext context, List<Message> history, int toolTokens,
+            ConversationCompactor compactor) {
         List<Message> compacted = compactor.compact(history, toolTokens);
         if (compacted == history) {
             return history;
@@ -365,7 +633,8 @@ public class RiskAgentLoop {
      * optimistic about it is what kills a run. Measuring the error on every turn turns a guess into
      * a controlled one.
      */
-    private void calibrate(AgentRunContext context, int estimated, ChatResponse response) {
+    private void calibrate(AgentRunContext context, int estimated, ChatResponse response,
+            ConversationCompactor compactor) {
         Integer actual = response == null || response.getMetadata() == null
                 || response.getMetadata().getUsage() == null
                         ? null
@@ -401,21 +670,17 @@ public class RiskAgentLoop {
         return false;
     }
 
-    private void logExhausted(AgentRunContext context) {
-        log.warn("Analysis {}: coverage reprompt budget exhausted with {} rule(s) still unjudged; the "
-                        + "run will be recorded as failed", context.assessmentId(),
-                context.missingRules().size());
-    }
-
     /**
      * Turns one round of executed tool calls into {@code tool_call} trace steps.
      *
      * <p>Each step takes the note the tool left for it - the rule it judged and the verdict, the
      * transaction it opened, the query it ran - so a transcript of twelve rules reads as twelve
-     * named verdicts instead of two dozen rows all labelled "Submit rule verdict".
+     * named verdicts instead of two dozen rows all labelled "Submit rule verdict". Calls made inside
+     * a rule subagent are attributed to it ({@code ruleName} on the step, and the note/timing queues
+     * are read from that subagent's own tool instance, never a shared one).
      */
     private void recordToolCalls(AgentRunContext context, RiskAgentTools tools,
-            AssistantMessage assistant, List<Message> conversation) {
+            AssistantMessage assistant, List<Message> conversation, String ruleName) {
         if (assistant == null || assistant.getToolCalls() == null) {
             return;
         }
@@ -428,9 +693,26 @@ public class RiskAgentLoop {
             }
         }
         for (AssistantMessage.ToolCall call : assistant.getToolCalls()) {
-            Long ms = context.takeTiming(call.name());
-            context.trace().toolCall(call.name(), readJson(call.arguments()), results.get(call.id()),
-                    ms == null ? 0L : ms, tools.takeNote(call.name()));
+            Long ms = tools.takeTiming(call.name());
+            JsonNode arguments = readJson(call.arguments());
+            String result = results.get(call.id());
+            context.trace().toolCall(call.name(), arguments, result,
+                    ms == null ? 0L : ms, tools.takeNote(call.name()), ruleName);
+            // The file trace gets the untruncated pair: pretty-printed arguments and the FULL
+            // result, which is where the SQL behind every evaluate_rule verdict lives.
+            tracer.toolCall(context.assessmentId(), call.name(), ruleName, pretty(arguments), result,
+                    ms == null ? 0L : ms);
+        }
+    }
+
+    private String pretty(JsonNode node) {
+        if (node == null) {
+            return "{}";
+        }
+        try {
+            return jsonMapper.writerWithDefaultPrettyPrinter().writeValueAsString(node);
+        } catch (RuntimeException e) {
+            return node.toString();
         }
     }
 
@@ -450,8 +732,9 @@ public class RiskAgentLoop {
     // ------------------------------------------------------------------
 
     /**
-     * Turns the agent's verdicts into the run's result: one {@link RuleOutcome} per rule it judged,
-     * the total score, the band that is actually recorded, and the list of rules it never judged.
+     * Turns the subagents' verdicts into the run's result: one {@link RuleOutcome} per rule they
+     * judged, the total score, the band that is actually recorded, and the list of rules never
+     * judged.
      *
      * <p>Nothing is invented here. A rule with no verdict produces no outcome and therefore no
      * {@code risk_assessments} row - writing "not triggered, 0.00" for a rule nobody looked at would
@@ -463,7 +746,7 @@ public class RiskAgentLoop {
      * discretionary move the agent has - an escalation above the mechanical band, taken only when it
      * is upwards and justified.
      *
-     * <p>Called after every loop, and on its own when the conversation broke part-way.
+     * <p>Called after every fan-out, and on its own when the run broke part-way.
      */
     public AgentRunResult settle(AgentRunContext context, int steps, long durationMs) {
         List<RuleOutcome> outcomes = new ArrayList<>(context.ruleCount());
@@ -533,6 +816,8 @@ public class RiskAgentLoop {
 
         context.trace().finalStep(recorded.name(), mechanical.name(), justification, summary, total,
                 context.ruleCount(), unjudged.isEmpty());
+        tracer.finalAssessment(context.assessmentId(), recorded.name(), mechanical.name(),
+                justification, total.toPlainString(), summary, recommendations, unjudged.isEmpty());
 
         return new AgentRunResult(
                 context.assessmentId(),
@@ -617,10 +902,23 @@ public class RiskAgentLoop {
         };
     }
 
-    /** Internal control flow: the user asked to cancel; unwind out of {@link #converse}. */
+    /** Internal control flow: the user asked to cancel; unwind out of the fan-out or a subagent. */
     private static final class CancellationSignal extends RuntimeException {
         private CancellationSignal() {
             super(null, null, false, false);
+        }
+    }
+
+    /** Daemon threads the per-run subagent pool executes on. */
+    private static final class SubagentThreadFactory implements ThreadFactory {
+
+        private final AtomicInteger counter = new AtomicInteger();
+
+        @Override
+        public Thread newThread(Runnable runnable) {
+            Thread thread = new Thread(runnable, "risk-subagent-" + counter.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
         }
     }
 

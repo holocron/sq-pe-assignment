@@ -13,6 +13,8 @@ import com.sq.caa.security.SecurityRoles;
 import com.sq.caa.service.RiskRuleService;
 import com.sq.caa.web.dto.RuleDtos.FieldCatalogEntry;
 import com.sq.caa.web.dto.RuleDtos.RiskRuleDto;
+import com.sq.caa.web.dto.RuleDtos.RuleEnhanceRequest;
+import com.sq.caa.web.dto.RuleDtos.RuleEnhanceResponse;
 import com.sq.caa.web.dto.RuleDtos.RuleTestRequest;
 import com.sq.caa.web.dto.RuleDtos.RuleTestResponse;
 import com.sq.caa.web.dto.RuleDtos.RuleUpsertRequest;
@@ -133,6 +135,21 @@ public class RuleController {
                         ? "Draft rule" : request.ruleName().trim(),
                 request.appliesTo(), request.thresholdLogic(), request.weight());
         return RuleTestResponse.from(riskRuleService.judgeRule(draft, request.customerId()));
+    }
+
+    /**
+     * Rewrites a draft condition into prose the agent can translate into one SQL query.
+     *
+     * <p>Synchronous and slow by nature, like judging: one model call bounded by
+     * {@code caa.rules.enhance.timeout-seconds}. Nothing is stored - the returned text is a
+     * suggestion the admin keeps by saving it as the rule's condition, where it goes through the
+     * same validation as anything typed by hand.
+     */
+    @PostMapping("/enhance")
+    @PreAuthorize(SecurityRoles.IS_ADMIN)
+    public RuleEnhanceResponse enhance(@Valid @RequestBody RuleEnhanceRequest request) {
+        return RuleEnhanceResponse.from(
+                riskRuleService.enhanceCondition(request.thresholdLogic(), request.appliesTo()));
     }
 
     // ------------------------------------------------------------------

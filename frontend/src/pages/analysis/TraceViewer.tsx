@@ -21,6 +21,10 @@
  * or errored on is rendered as a failure — danger marker, its reason on the face
  * of the row — since a retry that looked like a success would tell a reviewer
  * that a rule was measured when it never was.
+ *
+ * Under the orchestrator architecture, `subagent` steps mark where each
+ * per-rule worker starts and what verdict it returned, and its tool calls
+ * carry a `ruleName` chip so the interleaved timeline stays attributable.
  */
 import { ArrowDown, ChevronRight, ClipboardCheck, Radio, TriangleAlert, WifiOff } from 'lucide-react'
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
@@ -33,7 +37,7 @@ import { RiskBadge } from '../../components/ui/RiskBadge'
 import { Skeleton } from '../../components/ui/Skeleton'
 import { Spinner } from '../../components/ui/Spinner'
 import { cn } from '../../lib/cn'
-import { formatDuration } from '../../lib/format'
+import { formatAmount, formatDuration } from '../../lib/format'
 import { SqlBlock } from './SqlBlock'
 import { sqlFailure } from './sql'
 import {
@@ -82,6 +86,7 @@ const CAPTION = 'text-2xs font-semibold tracking-caption text-muted uppercase'
  */
 const STEP_TYPE_FILTER_LABELS: Record<TraceStep['type'], string> = {
   tool_call: 'Tool calls',
+  subagent: 'Rule subagents',
   assistant: 'Reasoning',
   coverage_reprompt: 'Coverage reprompts',
   coverage_failed: 'Coverage failures',
@@ -185,6 +190,14 @@ function TraceStepItem({
         <code className="hidden truncate rounded-xxs border border-border bg-surface-2 px-1.5 py-0.5 font-mono text-2xs text-muted sm:inline">
           {step.tool}
         </code>
+      ) : null}
+      {/* A call made inside a rule subagent says so, wherever it lands on the
+          timeline — parallel workers interleave, so proximity alone cannot.
+          Skipped when the subject already names the same rule (verdict rows). */}
+      {step.type === 'tool_call' && step.ruleName && step.ruleName !== identity.subject ? (
+        <Badge tone="info" className="shrink-0" title={`Made by the rule subagent for ${step.ruleName}`}>
+          {step.ruleName}
+        </Badge>
       ) : null}
       {/* A refused or errored query decided nothing, so the row says that
           instead of an outcome — the two must never be confusable. */}
@@ -300,6 +313,58 @@ function TraceStepItem({
                 </p>
               )}
             </StepSection>
+          </div>
+        ) : null}
+
+        {step.type === 'subagent' ? (
+          <div
+            className={cn(
+              'mt-1.5 flex flex-wrap items-center gap-2 rounded-xs border px-2.5 py-2',
+              step.phase === 'end' && step.verdict === 'failed'
+                ? 'border-danger/40 border-l-2 border-l-danger bg-danger-soft/50'
+                : 'border-info/40 border-l-2 border-l-info bg-info-soft/40',
+            )}
+          >
+            <span className="text-xs text-muted">
+              {step.phase === 'start' ? 'Rule subagent started:' : 'Rule subagent finished:'}
+            </span>
+            <span className="text-sm font-medium text-fg">{step.ruleName || step.ruleId}</span>
+            <Badge tone="neutral">worker {step.worker}</Badge>
+            {step.attempt !== undefined && step.attempt > 1 ? (
+              <Badge tone="warning">attempt {step.attempt}</Badge>
+            ) : null}
+            {step.phase === 'end' && step.verdict ? (
+              <Badge
+                tone={
+                  step.verdict === 'failed'
+                    ? 'danger'
+                    : step.verdict === 'triggered'
+                      ? 'accent'
+                      : 'neutral'
+                }
+                icon={
+                  step.verdict === 'failed' ? (
+                    <TriangleAlert aria-hidden="true" className="size-3" />
+                  ) : undefined
+                }
+              >
+                {step.verdict === 'triggered'
+                  ? `triggered${typeof step.score === 'number' ? ` +${formatAmount(step.score)}` : ''}`
+                  : step.verdict === 'failed'
+                    ? 'failed'
+                    : 'not triggered'}
+              </Badge>
+            ) : null}
+            {step.phase === 'end' && typeof step.stepsUsed === 'number' ? (
+              <Badge tone="neutral">
+                {step.stepsUsed} {step.stepsUsed === 1 ? 'step' : 'steps'}
+              </Badge>
+            ) : null}
+            {step.phase === 'end' && typeof step.durationMs === 'number' ? (
+              <span className="numeric text-2xs text-subtle">
+                {formatDuration(step.durationMs)}
+              </span>
+            ) : null}
           </div>
         ) : null}
 

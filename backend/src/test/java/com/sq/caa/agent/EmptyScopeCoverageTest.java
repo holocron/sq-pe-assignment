@@ -80,16 +80,18 @@ class EmptyScopeCoverageTest {
         AnalysisTrace trace = AgentTestFixtures.trace(assessmentId);
         AgentRunContext context = AgentTestFixtures.contextOver(assessmentId, trace, rules, List.of());
 
-        ScriptedChatModel model = new ScriptedChatModel(List.of(
-                calls(RiskAgentTools.LIST_TRANSACTIONS, "{}"),
-                calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(dormantAccount,
-                        "SELECT t.transaction_id FROM tx t WHERE t.amount > 100000",
-                        "Any transaction of this customer above 100,000.")),
-                calls(RiskAgentTools.SUBMIT_FINAL_ASSESSMENT, """
+        RoutedChatModel model = new RoutedChatModel()
+                .route(dormantAccount.getRuleId().toString(), List.of(
+                        calls(RiskAgentTools.LIST_TRANSACTIONS, "{}"),
+                        calls(RiskAgentTools.EVALUATE_RULE, AgentTestFixtures.evaluateRule(dormantAccount,
+                                "SELECT t.transaction_id FROM tx t WHERE t.amount > 100000",
+                                "Any transaction of this customer above 100,000."))))
+                .summary(List.of(calls(RiskAgentTools.SUBMIT_FINAL_ASSESSMENT, """
                         {"risk_level":"LOW","summary":"No activity on file.",\
                         "recommendations":"Schedule a periodic review."}""")));
 
-        AgentRunResult result = run(model, context, 40);
+        AgentRunResult result = AgentTestFixtures.run(model, context, new StubRuleSqlEvaluator(),
+                AgentTestFixtures.properties(12, 1));
 
         // The run finished normally.
         assertEquals(1, result.rulesTotal());
@@ -137,16 +139,17 @@ class EmptyScopeCoverageTest {
         AgentRunContext context = AgentTestFixtures.contextOver(assessmentId, trace, rules, List.of());
 
         // "There is nothing to look at, so there is nothing to say" is exactly the reasoning the
-        // coverage guarantee exists to refuse.
-        ScriptedChatModel model = new ScriptedChatModel(List.of(
-                calls(RiskAgentTools.LIST_TRANSACTIONS, "{}"),
-                says("This customer has no activity, so there is nothing to assess."),
-                says("As I said, nothing to assess."),
-                says("Nothing to assess."),
-                says("Nothing to assess.")));
+        // coverage guarantee exists to refuse - on the first subagent and on its retry alike.
+        RoutedChatModel model = new RoutedChatModel()
+                .route(dormantAccount.getRuleId().toString(), List.of(
+                        calls(RiskAgentTools.LIST_TRANSACTIONS, "{}"),
+                        says("This customer has no activity, so there is nothing to assess."),
+                        says("As I said, nothing to assess."),
+                        says("Retry: still nothing to assess.")));
 
-        AgentRunFailedException failure =
-                assertThrows(AgentRunFailedException.class, () -> run(model, context, 40));
+        AgentRunFailedException failure = assertThrows(AgentRunFailedException.class,
+                () -> AgentTestFixtures.run(model, context, new StubRuleSqlEvaluator(),
+                        AgentTestFixtures.properties(3, 1)));
         AgentRunResult result = failure.result();
 
         assertInstanceOf(IncompleteRuleCoverageException.class, failure.getCause());
@@ -211,15 +214,4 @@ class EmptyScopeCoverageTest {
     }
 
     // ------------------------------------------------------------------
-
-    private AgentRunResult run(ScriptedChatModel model, AgentRunContext context, int maxSteps) {
-        AgentProperties properties = new AgentProperties(maxSteps, MAX_COVERAGE_REPROMPTS, 3, 4096,
-                0.1, 32768, 1536, 10, "test-model", 2, 16, Duration.ofMinutes(5),
-                Duration.ofMinutes(10), 25);
-        RiskAgentTools tools = new RiskAgentTools(context, null, null, new StubRuleSqlEvaluator(),
-                jsonMapper, 25, 3);
-        RiskAgentLoop loop = new RiskAgentLoop(model, ToolCallingManager.builder().build(), jsonMapper,
-                properties);
-        return loop.execute(context, tools);
-    }
 }
