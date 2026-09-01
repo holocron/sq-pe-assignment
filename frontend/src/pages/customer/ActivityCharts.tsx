@@ -3,11 +3,12 @@ import { ChartNoAxesColumn, LineChart as LineChartIcon } from 'lucide-react'
 import { useMemo } from 'react'
 import {
   Area,
-  AreaChart,
   Bar,
   BarChart,
   CartesianGrid,
   Cell,
+  ComposedChart,
+  Line,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -91,11 +92,21 @@ export interface ActivityTimelineCardProps {
 
 interface TimelinePoint {
   day: string
+  card: number
+  payment: number
+  crypto: number
+  /** Sum of the three type buckets — the same total the old single series drew. */
   amount: number
   count: number
 }
 
-/** Daily transaction volume for the last 30 days, bucketed client-side. */
+/**
+ * Daily transaction volume for the last 30 days, bucketed client-side. Each day
+ * is split by activity type (stacked areas, so a burst of one kind reads at a
+ * glance and quick type conversions show as one band shrinking into another);
+ * the top line traces the daily total, so the old single-series reading is
+ * still there.
+ */
 export function ActivityTimelineCard({ customerId, currencies }: ActivityTimelineCardProps) {
   const from = useMemo(() => startOfDay(subDays(new Date(), TIMELINE_DAYS - 1)), [])
   const query = useCustomerActivity(customerId, {
@@ -109,13 +120,15 @@ export function ActivityTimelineCard({ customerId, currencies }: ActivityTimelin
     const buckets = new Map<string, TimelinePoint>()
     for (const day of eachDayOfInterval({ start: from, end: new Date() })) {
       const key = format(day, 'yyyy-MM-dd')
-      buckets.set(key, { day: key, amount: 0, count: 0 })
+      buckets.set(key, { day: key, card: 0, payment: 0, crypto: 0, amount: 0, count: 0 })
     }
     for (const transaction of transactions ?? []) {
       const created = parseISO(transaction.createdAt)
       if (Number.isNaN(created.getTime())) continue
       const bucket = buckets.get(format(created, 'yyyy-MM-dd'))
       if (!bucket) continue
+      const key = transaction.activityType.toLowerCase() as 'card' | 'payment' | 'crypto'
+      bucket[key] += transaction.amount
       bucket.amount += transaction.amount
       bucket.count += 1
     }
@@ -139,7 +152,7 @@ export function ActivityTimelineCard({ customerId, currencies }: ActivityTimelin
       >
         <CardTitle>Daily volume — last {TIMELINE_DAYS} days</CardTitle>
         <p className="mt-0.5 text-xs text-muted">
-          Amount transacted per day
+          Amount transacted per day, stacked by activity type; the line is the daily total
           {currencies.length > 1 ? `, summed across ${currencies.join(', ')}` : ''}.
           {truncated ? ` Based on the first ${TIMELINE_FETCH_SIZE} transactions in the window.` : ''}
         </p>
@@ -163,65 +176,114 @@ export function ActivityTimelineCard({ customerId, currencies }: ActivityTimelin
             description="Older activity is still available in the tables below."
           />
         ) : (
-          <div className="h-56 w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                <defs>
-                  <linearGradient id="activity-volume" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="var(--color-accent)" stopOpacity={0.28} />
-                    <stop offset="100%" stopColor="var(--color-accent)" stopOpacity={0.02} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid vertical={false} stroke={GRID_STROKE} strokeDasharray="3 3" />
-                <XAxis
-                  dataKey="day"
-                  tick={AXIS_TICK}
-                  tickLine={false}
-                  axisLine={AXIS_LINE}
-                  minTickGap={24}
-                  tickFormatter={(value: string) => format(parseISO(value), 'd MMM')}
-                />
-                <YAxis
-                  tick={AXIS_TICK}
-                  tickLine={false}
-                  axisLine={false}
-                  width={56}
-                  tickFormatter={(value: number) => formatCompactNumber(value)}
-                />
-                <Tooltip
-                  cursor={{ stroke: 'var(--color-border-strong)', strokeWidth: 1 }}
-                  wrapperStyle={TOOLTIP_WRAPPER}
-                  content={({ active, payload }) => {
-                    const point = active ? (payload?.[0]?.payload as TimelinePoint | undefined) : undefined
-                    if (!point) return null
-                    return (
-                      <ChartTooltip
-                        title={formatDate(point.day)}
-                        rows={[
-                          ['Amount', moneyLabel(point.amount, currencies)],
-                          ['Transactions', formatNumber(point.count)],
-                        ]}
-                      />
-                    )
-                  }}
-                />
-                <Area
-                  type="monotone"
-                  dataKey="amount"
-                  stroke="var(--color-accent)"
-                  strokeWidth={1.75}
-                  fill="url(#activity-volume)"
-                  activeDot={{
-                    r: 3,
-                    fill: 'var(--color-accent)',
-                    stroke: 'var(--color-surface)',
-                    strokeWidth: 2,
-                  }}
-                  isAnimationActive={false}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
+          <>
+            <div className="h-56 w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <ComposedChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                  <CartesianGrid vertical={false} stroke={GRID_STROKE} strokeDasharray="3 3" />
+                  <XAxis
+                    dataKey="day"
+                    tick={AXIS_TICK}
+                    tickLine={false}
+                    axisLine={AXIS_LINE}
+                    minTickGap={24}
+                    tickFormatter={(value: string) => format(parseISO(value), 'd MMM')}
+                  />
+                  <YAxis
+                    tick={AXIS_TICK}
+                    tickLine={false}
+                    axisLine={false}
+                    width={56}
+                    tickFormatter={(value: number) => formatCompactNumber(value)}
+                  />
+                  <Tooltip
+                    cursor={{ stroke: 'var(--color-border-strong)', strokeWidth: 1 }}
+                    wrapperStyle={TOOLTIP_WRAPPER}
+                    content={({ active, payload }) => {
+                      const point = active
+                        ? (payload?.[0]?.payload as TimelinePoint | undefined)
+                        : undefined
+                      if (!point) return null
+                      return (
+                        <ChartTooltip
+                          title={formatDate(point.day)}
+                          rows={[
+                            ['Card', moneyLabel(point.card, currencies)],
+                            ['Payment', moneyLabel(point.payment, currencies)],
+                            ['Crypto', moneyLabel(point.crypto, currencies)],
+                            ['Total', moneyLabel(point.amount, currencies)],
+                            ['Transactions', formatNumber(point.count)],
+                          ]}
+                        />
+                      )
+                    }}
+                  />
+                  {/* Stacked: the top edge of the pile is the daily total, which
+                      the Line then traces explicitly. */}
+                  <Area
+                    type="monotone"
+                    dataKey="card"
+                    stackId="volume"
+                    stroke={TYPE_COLORS.CARD}
+                    strokeWidth={1}
+                    fill={TYPE_COLORS.CARD}
+                    fillOpacity={0.55}
+                    isAnimationActive={false}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="payment"
+                    stackId="volume"
+                    stroke={TYPE_COLORS.PAYMENT}
+                    strokeWidth={1}
+                    fill={TYPE_COLORS.PAYMENT}
+                    fillOpacity={0.55}
+                    isAnimationActive={false}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="crypto"
+                    stackId="volume"
+                    stroke={TYPE_COLORS.CRYPTO}
+                    strokeWidth={1}
+                    fill={TYPE_COLORS.CRYPTO}
+                    fillOpacity={0.55}
+                    isAnimationActive={false}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="amount"
+                    stroke="var(--color-fg)"
+                    strokeWidth={1.5}
+                    dot={false}
+                    activeDot={{
+                      r: 3,
+                      fill: 'var(--color-fg)',
+                      stroke: 'var(--color-surface)',
+                      strokeWidth: 2,
+                    }}
+                    isAnimationActive={false}
+                  />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+
+            <ul className="mt-3 flex flex-wrap gap-x-5 gap-y-1.5 border-t border-border pt-2.5">
+              {(['CARD', 'PAYMENT', 'CRYPTO'] as ActivityType[]).map((type) => (
+                <li key={type} className="flex items-center gap-1.5 text-2xs text-muted">
+                  <span
+                    aria-hidden="true"
+                    className={cn('size-2 rounded-xxs', TYPE_SWATCHES[type])}
+                  />
+                  {ACTIVITY_TYPE_LABELS[type]}
+                </li>
+              ))}
+              <li className="flex items-center gap-1.5 text-2xs text-muted">
+                <span aria-hidden="true" className="h-0.5 w-3 rounded-xxs bg-fg" />
+                Total
+              </li>
+            </ul>
+          </>
         )}
       </CardContent>
     </Card>
