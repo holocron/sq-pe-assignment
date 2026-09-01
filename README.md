@@ -148,8 +148,19 @@ npm run dev                    # http://localhost:5173, proxies /api to :8080
 ### Resetting
 
 ```bash
-./scripts/db-reset.sh          # drop + recreate the schema; next backend start re-seeds
+./scripts/demo-reset.sh        # clear analysis history only - safe while the backend is running
+./scripts/db-reset.sh          # full wipe - STOP the backend first; next start re-seeds
 ```
+
+`demo-reset.sh` truncates `analysis_runs` and `risk_assessments` so a demo starts from a clean
+dashboard. It keeps the seed, your rules, the knowledge base and the logins, so there is no restart
+and no re-embedding. It refuses to run while an analysis is still `RUNNING` (pass `--force` to
+override) because truncating underneath a live run strands the worker.
+
+`db-reset.sh` is the full slate: it drops the schema, and the **next backend start** replays the
+migrations, the seed and the knowledge-base bootstrap. Stop the backend before running it - against
+a live instance the migrations reapply but the knowledge bootstrap does not (it only fires at
+startup), leaving RAG silently empty.
 
 ---
 
