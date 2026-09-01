@@ -373,49 +373,81 @@ describe('condition editor', () => {
     )
     expect(screen.getByRole('button', { name: 'Create rule' })).toBeDisabled()
   })
-
-  it('coaches the author until the condition is judgeable', async () => {
-    renderRulesPage()
-    await openNewRuleEditor()
-
-    const checklist = screen.getByText('A condition the agent can judge').closest('ul')
-    expect(checklist).not.toBeNull()
-    expect(within(checklist as HTMLElement).getAllByText(/not yet/)).toHaveLength(3)
-
-    typeCondition(
-      'Triggered when agg.tx_count_24h reaches 8 or more within any rolling 24 hours.',
-    )
-    expect(within(checklist as HTMLElement).queryByText(/not yet/)).not.toBeInTheDocument()
-  })
 })
 
 /* -------------------------------------------------------------------------- */
-/* Starter templates                                                           */
+/* Condition enhancer                                                          */
 /* -------------------------------------------------------------------------- */
 
-describe('condition token preview', () => {
-  it('echoes the catalog fields and thresholds the condition names as chips', async () => {
+describe('condition enhancer (wand)', () => {
+  const REWRITTEN =
+    'Triggered when the customer makes three or more payments, each between 8 000 and 9 999.99, within any rolling 24 hours.'
+
+  it('stays disabled until there is a draft worth improving', async () => {
     renderRulesPage()
     await openNewRuleEditor()
 
-    typeCondition(
-      'Triggered when the amount exceeds 10 000 within any rolling 24 hours for a card payment.',
-    )
+    /* Improving text that already fails the blocking validation would only
+       produce better-formatted invalid prose. */
+    expect(screen.getByRole('button', { name: 'Enhance' })).toBeDisabled()
 
-    const detected = await screen.findByLabelText('Fields and thresholds named in the condition')
-    /* `amount` resolves to its catalog label; thresholds are echoed as written. */
-    expect(within(detected).getByText('Amount')).toBeInTheDocument()
-    expect(within(detected).getByText('10 000')).toBeInTheDocument()
-    expect(within(detected).getByText('24')).toBeInTheDocument()
+    typeCondition(VALID_CONDITION)
+    expect(screen.getByRole('button', { name: 'Enhance' })).toBeEnabled()
   })
 
-  it('shows no chips until the condition names anything', async () => {
+  it('sends the draft with its scope and replaces the condition with the rewrite', async () => {
     renderRulesPage()
     await openNewRuleEditor()
+    typeCondition(VALID_CONDITION)
 
-    expect(
-      screen.queryByLabelText('Fields and thresholds named in the condition'),
-    ).not.toBeInTheDocument()
+    mockPost.mockResolvedValue({
+      condition: REWRITTEN,
+      model: 'gpt-oss-120b',
+      durationMs: 1200,
+    } as never)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Enhance' }))
+
+    await waitFor(() => expect(conditionBox().value).toBe(REWRITTEN))
+    expect(mockPost).toHaveBeenCalledWith(
+      '/rules/enhance',
+      { thresholdLogic: VALID_CONDITION, appliesTo: 'ALL' },
+      expect.anything(),
+    )
+  })
+
+  it('leaves the author draft untouched when the model call fails', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+    typeCondition(VALID_CONDITION)
+
+    mockPost.mockRejectedValue(
+      new ApiError({
+        status: 0,
+        title: 'Request timed out',
+        detail: 'The backend did not respond.',
+      }),
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Enhance' }))
+
+    expect(await screen.findByText('Enhancement failed')).toBeInTheDocument()
+    /* Losing an author's wording to a failed model call would be worse than
+       never offering the wand at all. */
+    expect(conditionBox().value).toBe(VALID_CONDITION)
+  })
+
+  it('does not wipe the draft when the model returns nothing', async () => {
+    renderRulesPage()
+    await openNewRuleEditor()
+    typeCondition(VALID_CONDITION)
+
+    mockPost.mockResolvedValue({ condition: '', model: null, durationMs: 0 } as never)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Enhance' }))
+
+    expect(await screen.findByText('Enhancement returned nothing')).toBeInTheDocument()
+    expect(conditionBox().value).toBe(VALID_CONDITION)
   })
 })
 
